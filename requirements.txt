@@ -1,0 +1,11 @@
+torch
+torchvision
+torchaudio
+snntorch
+mne
+scipy
+scikit-learn
+matplotlib
+seaborn
+braindecode
+moabb

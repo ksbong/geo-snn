@@ -125,25 +125,22 @@ def extract_robust_features_batch(X_array):
     return torch.stack([normalize_feature(r), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
-# [2] GeoEEG-SNN 모델 (극약 처방 적용)
+# [2] GeoEEG-SNN 모델
 # ==========================================
 class GDLIF(nn.Module):
     def __init__(self, channels=64, v_base=1.0):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(0.1)) # 피처 영향도 축소
+        self.alpha = nn.Parameter(torch.tensor(0.1))
         self.gamma = nn.Parameter(torch.tensor(0.1)) 
         self.v_base = v_base
         self.beta_base_logit = nn.Parameter(torch.tensor(2.0)) 
         self.spike_grad = surrogate.fast_sigmoid(slope=25)
 
     def forward(self, x_t, m_prev, curv_t, tang_t):
-        # 🚨 극약 처방 1: Clamping으로 피처 폭주 방지
         tang_c = torch.clamp(tang_t, min=-2.0, max=2.0)
         curv_c = torch.clamp(curv_t, min=-2.0, max=2.0)
-        
         v_th = torch.clamp(self.v_base + self.alpha * tang_c, min=0.1) 
         beta = torch.sigmoid(self.beta_base_logit - self.gamma * curv_c)
-        
         m_next = beta * m_prev + x_t
         spike = self.spike_grad(m_next - v_th)
         m_next = m_next - spike * v_th
@@ -183,7 +180,8 @@ class GeoEEGSNN(nn.Module):
             nn.ReLU(),
             nn.AvgPool1d(8)
         )
-        self.dropout = nn.Dropout(0.4)
+        # 🚨 수정: 드롭아웃 대폭 상향 (0.4 -> 0.6)
+        self.dropout = nn.Dropout(0.6)
         self.lif = GDLIF(channels=in_channels)
         self.fc = nn.Linear(in_channels, num_classes)
 
@@ -208,15 +206,16 @@ class GeoEEGSNN(nn.Module):
         return self.fc(out_features)
 
 # ==========================================
-# [3] 검증 로직 (Scheduler & Clipping 적용)
+# [3] 검증 로직 (규제 대폭 강화)
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
-    train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=64, shuffle=True)
-    test_dl = DataLoader(TensorDataset(X_test, Y_test), batch_size=64, shuffle=False)
+    # 🚨 수정: 배치 사이즈 상향 (64 -> 128)
+    train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
+    test_dl = DataLoader(TensorDataset(X_test, Y_test), batch_size=128, shuffle=False)
 
     model = GeoEEGSNN().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=1e-4)
-    # 🚨 극약 처방 2: 학습률 서서히 줄이기
+    # 🚨 수정: 가중치 감쇄 대폭 상향 (1e-4 -> 1e-2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=150)
     criterion = nn.CrossEntropyLoss()
     
@@ -230,11 +229,15 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         train_loss = 0
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
+            
+            # 🚨 극약 처방: 입력 노이즈 주입 (Gaussian Noise)
+            noise = torch.randn_like(xb) * 0.01
+            xb = xb + noise
+            
             optimizer.zero_grad()
             out = model(xb)
             loss = criterion(out, yb)
             loss.backward()
-            # 🚨 극약 처방 3: 그래디언트 폭주 방지
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
@@ -277,19 +280,22 @@ def run_sstl(model_state, subject_X, subject_Y):
         X_tr, Y_tr = subject_X[train_idx], subject_Y[train_idx]
         X_te, Y_te = subject_X[test_idx], subject_Y[test_idx]
         
-        train_dl = DataLoader(TensorDataset(X_tr, Y_tr), batch_size=8, shuffle=True)
-        test_dl = DataLoader(TensorDataset(X_te, Y_te), batch_size=8, shuffle=False)
+        train_dl = DataLoader(TensorDataset(X_tr, Y_tr), batch_size=16, shuffle=True)
+        test_dl = DataLoader(TensorDataset(X_te, Y_te), batch_size=16, shuffle=False)
         
         model = GeoEEGSNN().to(device)
         model.load_state_dict(model_state)
         
+        # SSTL에서도 드롭아웃 활성화
+        model.dropout.train() 
+        
         for param in model.parameters(): param.requires_grad = False
         for param in model.fc.parameters(): param.requires_grad = True
             
-        optimizer = torch.optim.AdamW(model.fc.parameters(), lr=0.001)
+        optimizer = torch.optim.AdamW(model.fc.parameters(), lr=0.001, weight_decay=1e-3)
         criterion = nn.CrossEntropyLoss()
         
-        for _ in range(10): # SSTL 에포크 약간 증가
+        for _ in range(15): # SSTL 에포크 약간 증가
             model.train()
             for xb, yb in train_dl:
                 xb, yb = xb.to(device), yb.to(device)
@@ -310,7 +316,45 @@ def run_sstl(model_state, subject_X, subject_Y):
         
     return np.mean(fold_accs)
 
-# ... (plot_paper_figures 함수는 이전과 동일) ...
+def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels):
+    sns.set_theme(style="whitegrid")
+    pastel_colors = sns.color_palette("pastel")
+
+    fig, ax1 = plt.subplots(figsize=(7, 5))
+    ax2 = ax1.twinx()
+    ax1.plot(hist_loss, color=pastel_colors[0], linewidth=2.5, label='Global Train Loss')
+    ax2.plot(hist_acc, color=pastel_colors[1], linewidth=2.5, linestyle='-', label='Global Test Acc')
+    ax1.set_xlabel('Epochs', fontweight='bold')
+    ax1.set_ylabel('Loss', color=pastel_colors[0], fontweight='bold')
+    ax2.set_ylabel('Accuracy (%)', color=pastel_colors[1], fontweight='bold')
+    plt.title('Global Training Dynamics', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Learning_Curve.pdf'), dpi=300)
+    plt.close()
+
+    cm = confusion_matrix(labels, preds, normalize='true')
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', 
+                xticklabels=['Left', 'Right', 'Rest', 'Feet'], 
+                yticklabels=['Left', 'Right', 'Rest', 'Feet'])
+    plt.ylabel('True Class', fontweight='bold')
+    plt.xlabel('Predicted Class', fontweight='bold')
+    plt.title('Global Test Confusion Matrix', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Confusion_Matrix.pdf'), dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(5, 5))
+    bars = plt.bar(['Global Training', 'SSTL (Transfer)'], [global_acc, sstl_acc], color=[pastel_colors[2], pastel_colors[3]])
+    plt.ylim(0, 100)
+    plt.ylabel('Average Accuracy (%)', fontweight='bold')
+    plt.title('Performance Comparison', fontweight='bold')
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 1, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Bar_Chart.pdf'), dpi=300)
+    plt.close()
 
 def main():
     logging.info("🚀 [STAGE 1] Loading PhysioNet Data & Extracting Geometric Features...")
@@ -346,12 +390,30 @@ def main():
         X_test = torch.cat([subject_features[s] for s in test_subs])
         Y_test = torch.cat([subject_labels[s] for s in test_subs])
         
-        logging.info(f"🌍 Global Training (Fold {fold+1}) | Train: {len(train_subs)} subs, Test: {len(test_subs)} subs")
+        logging.info(f"🌍 Global Training (Fold 1) | Train: {len(train_subs)} subs, Test: {len(test_subs)} subs")
         g_acc, g_model, h_loss, h_acc, preds, labels = run_global_training(X_train, Y_train, X_test, Y_test)
         fold_global_accs.append(g_acc)
-        logging.info(f"🏆 Fold {fold+1} Global Best Acc: {g_acc:.2f}%")
+        logging.info(f"🏆 Fold 1 Global Best Acc: {g_acc:.2f}%")
         
-        # ... (SSTL 로직 동일) ...
+        logging.info(f"🎯 Starting Subject-Specific Transfer Learning (SSTL) for {len(test_subs)} Test Subjects...")
+        sstl_accs_for_this_fold = []
+        for s in test_subs:
+            sub_X = subject_features[s]
+            sub_Y = subject_labels[s]
+            s_acc = run_sstl(g_model, sub_X, sub_Y)
+            sstl_accs_for_this_fold.append(s_acc)
+            
+        mean_sstl = np.mean(sstl_accs_for_this_fold)
+        fold_sstl_accs.append(mean_sstl)
+        logging.info(f"🚀 Fold 1 Mean SSTL Acc: {mean_sstl:.2f}%")
+        
+        logging.info("[STAGE 3] Generating Publication Figures...")
+        plot_paper_figures(g_acc, mean_sstl, h_loss, h_acc, preds, labels)
+
+    final_g_acc = np.mean(fold_global_accs)
+    final_s_acc = np.mean(fold_sstl_accs)
+    logging.info(f"\n🎉 FINAL RESULTS | Global Acc: {final_g_acc:.2f}% | SSTL Acc: {final_s_acc:.2f}%")
+    logging.info(f"✅ All figures and logs saved in '{SAVE_DIR}'")
 
 if __name__ == '__main__':
     main()

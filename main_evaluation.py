@@ -131,15 +131,21 @@ def extract_robust_features_batch(X_array):
 class GDLIF(nn.Module):
     def __init__(self, channels=64, v_base=1.0):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(0.5))  
-        self.gamma = nn.Parameter(torch.tensor(0.5))  
+        self.alpha = nn.Parameter(torch.tensor(0.1)) # 초기값 대폭 축소 (0.5 -> 0.1)
+        self.gamma = nn.Parameter(torch.tensor(0.1)) # 초기값 대폭 축소
         self.v_base = v_base
-        self.beta_base_logit = nn.Parameter(torch.tensor(1.0)) 
+        self.beta_base_logit = nn.Parameter(torch.tensor(2.0)) # 기본 beta를 약 0.88로 시작
         self.spike_grad = surrogate.fast_sigmoid(slope=25)
 
     def forward(self, x_t, m_prev, curv_t, tang_t):
-        v_th = self.v_base + self.alpha * tang_t
-        beta = torch.sigmoid(self.beta_base_logit - self.gamma * curv_t)
+        # 🚨 극약 처방 1: 기하학 피처가 비정상적으로 커지는 것을 강제 컷(Clamping)
+        tang_c = torch.clamp(tang_t, min=-2.0, max=2.0)
+        curv_c = torch.clamp(curv_t, min=-2.0, max=2.0)
+        
+        # 🚨 극약 처방 2: 임계값이 절대 0.1 이하로 안 내려가게 방어
+        v_th = torch.clamp(self.v_base + self.alpha * tang_c, min=0.1) 
+        beta = torch.sigmoid(self.beta_base_logit - self.gamma * curv_c)
+        
         m_next = beta * m_prev + x_t
         spike = self.spike_grad(m_next - v_th)
         m_next = m_next - spike * v_th

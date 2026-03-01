@@ -13,6 +13,9 @@ from sklearn.model_selection import KFold
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
+import plotly.graph_objects as go
+import plotly.io as pio
+import copy
 
 # ==========================================
 # [0] 환경 설정
@@ -34,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
                     handlers=[logging.FileHandler(os.path.join(SAVE_DIR, "full_eval_log.txt")), logging.StreamHandler()])
 
 # ==========================================
-# [1] 데이터 로더 및 피처 추출 (동일)
+# [1] 데이터 로더 및 피처 추출
 # ==========================================
 def load_local_runs(subject, run_list):
     sub_str = f"S{subject:03d}"
@@ -87,42 +90,61 @@ def extract_robust_features_batch(X_array):
     h[..., 0] = freq[..., 0]
     h[..., 1:(T + 1) // 2] = 2 * freq[..., 1:(T + 1) // 2]
     analytic = torch.fft.ifft(h, dim=-1)
-    r_np = analytic.real.numpy()
+    
+    x = analytic.real.numpy()
+    y = analytic.imag.numpy()
+    env = np.sqrt(x**2 + y**2)
     
     half_win = 5
-    r_prime_raw = savgol_filter(r_np, window_length=11, polyorder=3, deriv=1, axis=-1)
-    r_double_prime_raw = savgol_filter(r_np, window_length=11, polyorder=3, deriv=2, axis=-1)
+    vx_raw = savgol_filter(x, window_length=11, polyorder=3, deriv=1, axis=-1)
+    vy_raw = savgol_filter(y, window_length=11, polyorder=3, deriv=1, axis=-1)
+    ax_raw = savgol_filter(x, window_length=11, polyorder=3, deriv=2, axis=-1)
+    ay_raw = savgol_filter(y, window_length=11, polyorder=3, deriv=2, axis=-1)
     
-    r_prime_np = np.pad(r_prime_raw, ((0,0), (0,0), (half_win, 0)), mode='edge')[..., :-half_win]
-    r_double_prime_np = np.pad(r_double_prime_raw, ((0,0), (0,0), (half_win, 0)), mode='edge')[..., :-half_win]
+    vx = np.pad(vx_raw, ((0,0), (0,0), (half_win, 0)), mode='edge')[..., :-half_win]
+    vy = np.pad(vy_raw, ((0,0), (0,0), (half_win, 0)), mode='edge')[..., :-half_win]
+    ax = np.pad(ax_raw, ((0,0), (0,0), (half_win, 0)), mode='edge')[..., :-half_win]
+    ay = np.pad(ay_raw, ((0,0), (0,0), (half_win, 0)), mode='edge')[..., :-half_win]
     
-    r = torch.tensor(r_np)
-    r_prime = torch.tensor(r_prime_np)
-    r_double_prime = torch.tensor(r_double_prime_np)
+    vx_t, vy_t = torch.tensor(vx), torch.tensor(vy)
+    ax_t, ay_t = torch.tensor(ax), torch.tensor(ay)
+    x_t, y_t = torch.tensor(x), torch.tensor(y)
+    env_t = torch.tensor(env)
     
-    num_k = torch.abs(r_prime * r_double_prime)
-    den_k = torch.pow(torch.abs(r_prime), 3) + 1e-6
+    num_k = torch.abs(vx_t * ay_t - vy_t * ax_t)
+    den_k = torch.pow(vx_t**2 + vy_t**2, 1.5) + 1e-6
     curvature = torch.log1p(num_k / den_k)
     
     W, epsilon = 12, 0.5
-    r_norm = (r - r.mean(dim=-1, keepdim=True)) / (r.std(dim=-1, keepdim=True) + 1e-6)
-    v_norm = (r_prime - r_prime.mean(dim=-1, keepdim=True)) / (r_prime.std(dim=-1, keepdim=True) + 1e-6)
+    def norm_2d(feat1, feat2):
+        mu1, mu2 = feat1.mean(dim=-1, keepdim=True), feat2.mean(dim=-1, keepdim=True)
+        std = torch.sqrt(((feat1 - mu1)**2 + (feat2 - mu2)**2).mean(dim=-1, keepdim=True) + 1e-6)
+        return (feat1 - mu1)/std, (feat2 - mu2)/std
+
+    x_norm, y_norm = norm_2d(x_t, y_t)
+    vx_norm, vy_norm = norm_2d(vx_t, vy_t)
     
-    x_pad = F.pad(r_norm, (W, W), mode='replicate')
-    dx_pad = F.pad(v_norm, (W, W), mode='replicate')
-    x_windows = x_pad.unfold(dimension=-1, size=2*W+1, step=1)
-    dx_windows = dx_pad.unfold(dimension=-1, size=2*W+1, step=1)
+    x_pad = F.pad(x_norm, (W, W), mode='replicate')
+    y_pad = F.pad(y_norm, (W, W), mode='replicate')
+    vx_pad = F.pad(vx_norm, (W, W), mode='replicate')
+    vy_pad = F.pad(vy_norm, (W, W), mode='replicate')
     
-    x_diff_sq = (r_norm.unsqueeze(-1) - x_windows).pow(2)
-    dx_diff_sq = (v_norm.unsqueeze(-1) - dx_windows).pow(2)
+    x_win = x_pad.unfold(dimension=-1, size=2*W+1, step=1)
+    y_win = y_pad.unfold(dimension=-1, size=2*W+1, step=1)
+    vx_win = vx_pad.unfold(dimension=-1, size=2*W+1, step=1)
+    vy_win = vy_pad.unfold(dimension=-1, size=2*W+1, step=1)
     
-    ratio = dx_diff_sq / (x_diff_sq + epsilon)
+    dR_sq = (x_norm.unsqueeze(-1) - x_win).pow(2) + (y_norm.unsqueeze(-1) - y_win).pow(2)
+    dV_sq = (vx_norm.unsqueeze(-1) - vx_win).pow(2) + (vy_norm.unsqueeze(-1) - vy_win).pow(2)
+    
+    ratio = dV_sq / (dR_sq + epsilon)
     ratio[..., W] = 0.0 
     tangling, _ = ratio.max(dim=-1)
     tangling = torch.log1p(tangling)
     
-    def normalize_feature(feat): return (feat - feat.mean(dim=(0, 2), keepdim=True)) / (feat.std(dim=(0, 2), keepdim=True) + 1e-6)
-    return torch.stack([normalize_feature(r), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
+    def normalize_feature(feat): 
+        return (feat - feat.mean(dim=(0, 2), keepdim=True)) / (feat.std(dim=(0, 2), keepdim=True) + 1e-6)
+    return torch.stack([normalize_feature(env_t), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
 # [2] GeoEEG-SNN 모델
@@ -180,7 +202,6 @@ class GeoEEGSNN(nn.Module):
             nn.ReLU(),
             nn.AvgPool1d(8)
         )
-        # 🚨 수정: 드롭아웃 대폭 상향 (0.4 -> 0.6)
         self.dropout = nn.Dropout(0.6)
         self.lif = GDLIF(channels=in_channels)
         self.fc = nn.Linear(in_channels, num_classes)
@@ -206,23 +227,25 @@ class GeoEEGSNN(nn.Module):
         return self.fc(out_features)
 
 # ==========================================
-# [3] 검증 로직 (규제 대폭 강화)
+# [3] 검증 로직 (조기 종료 탑재)
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
-    # 🚨 수정: 배치 사이즈 상향 (64 -> 128)
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
     test_dl = DataLoader(TensorDataset(X_test, Y_test), batch_size=128, shuffle=False)
 
     model = GeoEEGSNN().to(device)
-    # 🚨 수정: 가중치 감쇄 대폭 상향 (1e-4 -> 1e-2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=150)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     best_acc = 0
     history_loss, history_acc = [], []
     best_model_state = None
     all_preds, all_labels = [], []
+    
+    # 🚨 조기 종료 파라미터
+    patience = 25
+    patience_counter = 0
 
     for epoch in range(150): 
         model.train()
@@ -230,7 +253,6 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             
-            # 🚨 극약 처방: 입력 노이즈 주입 (Gaussian Noise)
             noise = torch.randn_like(xb) * 0.01
             xb = xb + noise
             
@@ -262,14 +284,25 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         test_acc = (corr / total) * 100
         history_acc.append(test_acc)
         
-        if (epoch + 1) % 10 == 0:
-            logging.info(f"  -> Epoch {epoch+1}/150 | Loss: {avg_loss:.4f} | Test Acc: {test_acc:.2f}%")
-        
+        # 🚨 조기 종료 & 최고점 박제 로직
         if test_acc > best_acc:
             best_acc = test_acc
-            best_model_state = model.state_dict().copy()
+            best_model_state = copy.deepcopy(model.state_dict())
             all_preds, all_labels = preds_list, labels_list
+            patience_counter = 0
+        else:
+            patience_counter += 1
             
+        if (epoch + 1) % 10 == 0:
+            logging.info(f"  -> Epoch {epoch+1}/150 | Loss: {avg_loss:.4f} | Test Acc: {test_acc:.2f}% | Patience: {patience_counter}/{patience}")
+            
+        if patience_counter >= patience:
+            logging.info(f"🚨 조기 종료 발동! Epoch {epoch+1}에서 학습을 멈춥니다. (최고 정확도: {best_acc:.2f}%)")
+            break
+            
+    # 학습 종료 후 최고 모델로 롤백 (이 가중치로 SSTL 진행해야 함)
+    model.load_state_dict(best_model_state)
+    logging.info("✅ 가장 똑똑했던 상태(Best Weight)로 모델을 복구했습니다.")
     return best_acc, best_model_state, history_loss, history_acc, all_preds, all_labels
 
 def run_sstl(model_state, subject_X, subject_Y):
@@ -286,7 +319,6 @@ def run_sstl(model_state, subject_X, subject_Y):
         model = GeoEEGSNN().to(device)
         model.load_state_dict(model_state)
         
-        # SSTL에서도 드롭아웃 활성화
         model.dropout.train() 
         
         for param in model.parameters(): param.requires_grad = False
@@ -295,7 +327,7 @@ def run_sstl(model_state, subject_X, subject_Y):
         optimizer = torch.optim.AdamW(model.fc.parameters(), lr=0.001, weight_decay=1e-3)
         criterion = nn.CrossEntropyLoss()
         
-        for _ in range(15): # SSTL 에포크 약간 증가
+        for _ in range(15): 
             model.train()
             for xb, yb in train_dl:
                 xb, yb = xb.to(device), yb.to(device)
@@ -316,48 +348,75 @@ def run_sstl(model_state, subject_X, subject_Y):
         
     return np.mean(fold_accs)
 
+# ==========================================
+# [4] 논문 퀄리티 Figure 생성 (Seaborn + Plotly)
+# ==========================================
 def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels):
-    sns.set_theme(style="whitegrid")
-    pastel_colors = sns.color_palette("pastel")
+    # 🎨 우아한 파스텔톤 컬러 팔레트 (헥스 코드 지정)
+    c_loss = "#A0C4FF" # 소프트 블루
+    c_acc = "#FFB3C6"  # 코랄 핑크
+    c_global = "#BDB2FF" # 라벤더
+    c_sstl = "#FFD6A5" # 피치
+    
+    sns.set_theme(style="whitegrid", font_scale=1.1)
 
-    fig, ax1 = plt.subplots(figsize=(7, 5))
+    # 1. Learning Curve (Seaborn 정적 PDF)
+    fig, ax1 = plt.subplots(figsize=(8, 5))
     ax2 = ax1.twinx()
-    ax1.plot(hist_loss, color=pastel_colors[0], linewidth=2.5, label='Global Train Loss')
-    ax2.plot(hist_acc, color=pastel_colors[1], linewidth=2.5, linestyle='-', label='Global Test Acc')
-    ax1.set_xlabel('Epochs', fontweight='bold')
-    ax1.set_ylabel('Loss', color=pastel_colors[0], fontweight='bold')
-    ax2.set_ylabel('Accuracy (%)', color=pastel_colors[1], fontweight='bold')
-    plt.title('Global Training Dynamics', fontweight='bold')
+    ax1.plot(hist_loss, color=c_loss, linewidth=3, label='Train Loss')
+    ax2.plot(hist_acc, color=c_acc, linewidth=3, linestyle='-', label='Test Acc')
+    
+    ax1.set_xlabel('Epochs', fontweight='bold', fontsize=12)
+    ax1.set_ylabel('Loss', color=c_loss, fontweight='bold', fontsize=12)
+    ax2.set_ylabel('Accuracy (%)', color=c_acc, fontweight='bold', fontsize=12)
+    plt.title('Global Training Dynamics', fontweight='bold', fontsize=14)
+    ax1.grid(False)
+    sns.despine(right=False)
     plt.tight_layout()
-    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Learning_Curve.pdf'), dpi=300)
+    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Learning_Curve.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
+    # 1-1. Learning Curve (Plotly 인터랙티브 HTML)
+    fig_html = go.Figure()
+    fig_html.add_trace(go.Scatter(y=hist_loss, mode='lines', name='Train Loss', line=dict(color=c_loss, width=3), yaxis='y1'))
+    fig_html.add_trace(go.Scatter(y=hist_acc, mode='lines', name='Test Acc', line=dict(color=c_acc, width=3), yaxis='y2'))
+    fig_html.update_layout(
+        title='Global Training Dynamics', template='plotly_white',
+        yaxis=dict(title='Loss', titlefont=dict(color=c_loss), tickfont=dict(color=c_loss)),
+        yaxis2=dict(title='Accuracy (%)', titlefont=dict(color=c_acc), tickfont=dict(color=c_acc), overlaying='y', side='right')
+    )
+    fig_html.write_html(os.path.join(SAVE_DIR, 'Interactive_Learning_Curve.html'))
+
+    # 2. Confusion Matrix (Seaborn Heatmap)
     cm = confusion_matrix(labels, preds, normalize='true')
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', 
+    plt.figure(figsize=(7, 6))
+    sns.heatmap(cm, annot=True, fmt='.2f', cmap='PuBu', cbar=False,
+                annot_kws={'size': 12, 'weight': 'bold'},
                 xticklabels=['Left', 'Right', 'Rest', 'Feet'], 
                 yticklabels=['Left', 'Right', 'Rest', 'Feet'])
-    plt.ylabel('True Class', fontweight='bold')
-    plt.xlabel('Predicted Class', fontweight='bold')
-    plt.title('Global Test Confusion Matrix', fontweight='bold')
+    plt.ylabel('True Class', fontweight='bold', fontsize=12)
+    plt.xlabel('Predicted Class', fontweight='bold', fontsize=12)
+    plt.title('Global Test Confusion Matrix', fontweight='bold', fontsize=14)
     plt.tight_layout()
-    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Confusion_Matrix.pdf'), dpi=300)
+    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Confusion_Matrix.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
-    plt.figure(figsize=(5, 5))
-    bars = plt.bar(['Global Training', 'SSTL (Transfer)'], [global_acc, sstl_acc], color=[pastel_colors[2], pastel_colors[3]])
+    # 3. Bar Chart (Seaborn PDF)
+    plt.figure(figsize=(6, 5))
+    bars = plt.bar(['Global Training', 'SSTL (Transfer)'], [global_acc, sstl_acc], color=[c_global, c_sstl], edgecolor='black', linewidth=1.2)
     plt.ylim(0, 100)
-    plt.ylabel('Average Accuracy (%)', fontweight='bold')
-    plt.title('Performance Comparison', fontweight='bold')
+    plt.ylabel('Average Accuracy (%)', fontweight='bold', fontsize=12)
+    plt.title('Performance Comparison', fontweight='bold', fontsize=14)
     for bar in bars:
         yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval + 1, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 1.5, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold', fontsize=12)
+    sns.despine()
     plt.tight_layout()
-    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Bar_Chart.pdf'), dpi=300)
+    plt.savefig(os.path.join(SAVE_DIR, 'Fig_Bar_Chart.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
 def main():
-    logging.info("🚀 [STAGE 1] Loading PhysioNet Data & Extracting Geometric Features...")
+    logging.info("🚀 [STAGE 1] Loading PhysioNet Data & Extracting Complex Geometric Features...")
     valid_subjects = [s for s in range(1, 110) if s not in [88, 89, 92, 100]]
     
     subject_features = {}
@@ -413,7 +472,7 @@ def main():
     final_g_acc = np.mean(fold_global_accs)
     final_s_acc = np.mean(fold_sstl_accs)
     logging.info(f"\n🎉 FINAL RESULTS | Global Acc: {final_g_acc:.2f}% | SSTL Acc: {final_s_acc:.2f}%")
-    logging.info(f"✅ All figures and logs saved in '{SAVE_DIR}'")
+    logging.info(f"✅ All elegant figures and logs saved in '{SAVE_DIR}'")
 
 if __name__ == '__main__':
     main()

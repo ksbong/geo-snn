@@ -146,10 +146,10 @@ def extract_robust_features_batch(X_array):
     return torch.stack([normalize_feature(env_t), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
-# [2] GeoEEG-SNN 모델 (Original Idea + Depthwise Separable)
+# [2] GeoEEG-SNN 모델 (네 메인 아이디어 완벽 보존형)
 # ==========================================
 class GDLIF(nn.Module):
-    def __init__(self, channels=32, v_base=1.0):
+    def __init__(self, channels=64, v_base=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(0.1))
         self.gamma = nn.Parameter(torch.tensor(0.1)) 
@@ -183,58 +183,59 @@ class GeoEEGSNN(nn.Module):
         super().__init__()
         self.encoder = LearnablePopulationEncoder(num_neurons=4) 
         
-        encoded_feature_dim = 3 * 4  # (Env, Curv, Tang) * 4 neurons = 12
-        D = 2 # Spatial Filter Multiplier (EEGNet Style)
+        encoded_feature_dim = 3 * 4  # 12
         
-        # SOTA Spatial Convolution
-        self.spatial = nn.Sequential(
-            nn.Conv2d(encoded_feature_dim, encoded_feature_dim * D, 
-                      kernel_size=(in_channels, 1), groups=encoded_feature_dim, bias=False),
-            nn.BatchNorm2d(encoded_feature_dim * D),
+        # 🚨 수정: 64개 전극 공간은 그대로 유지하면서 12개의 피처를 하나로 압축
+        self.feature_fusion = nn.Sequential(
+            nn.Conv2d(encoded_feature_dim, 1, kernel_size=(1, 1), bias=False),
+            nn.BatchNorm2d(1),
             nn.ELU()
         )
         
-        # SOTA Temporal Convolution
+        # 🚨 수정: 64개 공간 정보를 그대로 받아들이는 분리형 시간 필터
         self.temporal = nn.Sequential(
-            nn.Conv1d(encoded_feature_dim * D, encoded_feature_dim * D, 
-                      kernel_size=16, padding=8, groups=encoded_feature_dim * D, bias=False),
-            nn.Conv1d(encoded_feature_dim * D, 32, kernel_size=1, bias=False),
-            nn.BatchNorm1d(32),
+            nn.Conv1d(in_channels, in_channels, kernel_size=16, padding=8, groups=in_channels, bias=False),
+            nn.Conv1d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(in_channels),
             nn.ELU(),
-            nn.AvgPool1d(4), # T: 480 -> 120
-            nn.Dropout(0.5)
+            nn.AvgPool1d(4), # 480 -> 120
+            nn.Dropout(0.3)  # 뉴런 통합이 죽지 않도록 0.3으로 하향
         )
         
-        self.lif = GDLIF(channels=32)
-        self.fc = nn.Linear(32, num_classes)
+        # 🚨 64채널 복구: 네 원래 아이디어대로 각 전극마다 GDLIF 독립 제어
+        self.lif = GDLIF(channels=in_channels)
+        self.fc = nn.Linear(in_channels, num_classes)
 
     def forward(self, xb):
         curv_raw, tang_raw = xb[:, 1, :, :], xb[:, 2, :, :]
         
-        # 공간 필터를 거쳐 32채널이 되므로, GDLIF 제어 신호도 64채널 평균 후 32채널로 확장(Broadcast)
-        curv_pooled = F.avg_pool1d(curv_raw.mean(dim=1, keepdim=True), 4).permute(2, 0, 1).expand(-1, -1, 32)
-        tang_pooled = F.avg_pool1d(tang_raw.mean(dim=1, keepdim=True), 4).permute(2, 0, 1).expand(-1, -1, 32)
+        # 64채널 공간 보존
+        curv_pooled = F.avg_pool1d(curv_raw, 4).permute(2, 0, 1) # (120, B, 64)
+        tang_pooled = F.avg_pool1d(tang_raw, 4).permute(2, 0, 1) # (120, B, 64)
 
-        x_enc = self.encoder(xb)
+        x_enc = self.encoder(xb) 
         
-        s_out = self.spatial(x_enc).squeeze(2) 
-        c = self.temporal(s_out).permute(2, 0, 1) # (120, B, 32)
+        # (B, 12, 64, 480) -> (B, 1, 64, 480) -> (B, 64, 480)
+        s_out = self.feature_fusion(x_enc).squeeze(1) 
+        
+        c = self.temporal(s_out).permute(2, 0, 1) # (120, B, 64)
         
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
         spikes = []
         for t in range(c.size(0)):
+            # 64채널의 독립적인 동적 임계값 적용 (네 아이디어 완벽 구현)
             s, m = self.lif(c[t], m, curv_pooled[t], tang_pooled[t])
             spikes.append(s)
             
-        spikes_tensor = torch.stack(spikes) # (120, B, 32)
+        spikes_tensor = torch.stack(spikes) # (120, B, 64)
         
         attn_weights = F.softmax(curv_pooled, dim=0) 
-        out_features = torch.sum(spikes_tensor * attn_weights, dim=0) # (B, 32)
+        out_features = torch.sum(spikes_tensor * attn_weights, dim=0) # (B, 64)
         
         return self.fc(out_features)
 
 # ==========================================
-# [3] 검증 로직
+# [3] 검증 로직 (파멸적 노이즈 삭제)
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
@@ -259,8 +260,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             
-            noise = torch.randn_like(xb) * 0.05 
-            xb = xb + noise
+            # 🚨 치명적 버그 수정: 기하학 피처를 깨부수던 가우시안 노이즈 주입 삭제
             
             optimizer.zero_grad()
             out = model(xb)
@@ -358,7 +358,7 @@ def run_sstl(model_state, subject_X, subject_Y):
     return np.mean(fold_accs)
 
 # ==========================================
-# [4] 논문 퀄리티 Figure 생성
+# [4] 논문 퀄리티 Figure 생성 
 # ==========================================
 def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels):
     c_loss = "#A0C4FF" 

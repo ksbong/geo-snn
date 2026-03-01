@@ -9,3 +9,4 @@ matplotlib
 seaborn
 braindecode
 moabb
+plotly

@@ -146,10 +146,10 @@ def extract_robust_features_batch(X_array):
     return torch.stack([normalize_feature(env_t), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
-# [2] GeoEEG-SNN 모델 (네 메인 아이디어 완벽 보존형)
+# [2] GeoEEG-SNN 모델 
 # ==========================================
 class GDLIF(nn.Module):
-    def __init__(self, channels=64, v_base=1.0):
+    def __init__(self, channels=32, v_base=1.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(0.1))
         self.gamma = nn.Parameter(torch.tensor(0.1)) 
@@ -160,8 +160,11 @@ class GDLIF(nn.Module):
     def forward(self, x_t, m_prev, curv_t, tang_t):
         tang_c = torch.clamp(tang_t, min=-2.0, max=2.0)
         curv_c = torch.clamp(curv_t, min=-2.0, max=2.0)
-        v_th = torch.clamp(self.v_base + self.alpha * tang_c, min=0.1) 
-        beta = torch.sigmoid(self.beta_base_logit - self.gamma * curv_c)
+        
+        # 🚨 완벽 복구: 곡률(Curvature) -> 임계값, 얽힘(Tangling) -> 감쇠계수
+        v_th = torch.clamp(self.v_base + self.alpha * curv_c, min=0.1) 
+        beta = torch.sigmoid(self.beta_base_logit - self.gamma * tang_c)
+        
         m_next = beta * m_prev + x_t
         spike = self.spike_grad(m_next - v_th)
         m_next = m_next - spike * v_th
@@ -184,58 +187,57 @@ class GeoEEGSNN(nn.Module):
         self.encoder = LearnablePopulationEncoder(num_neurons=4) 
         
         encoded_feature_dim = 3 * 4  # 12
+        D = 2 
         
-        # 🚨 수정: 64개 전극 공간은 그대로 유지하면서 12개의 피처를 하나로 압축
-        self.feature_fusion = nn.Sequential(
-            nn.Conv2d(encoded_feature_dim, 1, kernel_size=(1, 1), bias=False),
-            nn.BatchNorm2d(1),
+        # 🚨 공간 필터: EEGNet 스타일 Depthwise 융합 
+        self.spatial = nn.Sequential(
+            nn.Conv2d(encoded_feature_dim, encoded_feature_dim * D, 
+                      kernel_size=(in_channels, 1), groups=encoded_feature_dim, bias=False),
+            nn.BatchNorm2d(encoded_feature_dim * D),
             nn.ELU()
         )
         
-        # 🚨 수정: 64개 공간 정보를 그대로 받아들이는 분리형 시간 필터
+        # 🚨 시간 필터: 커널 15, 패딩 7 동기화 + 드롭아웃 0.3 하향
         self.temporal = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels, kernel_size=16, padding=8, groups=in_channels, bias=False),
-            nn.Conv1d(in_channels, in_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(in_channels),
+            nn.Conv1d(encoded_feature_dim * D, encoded_feature_dim * D, 
+                      kernel_size=15, padding=7, groups=encoded_feature_dim * D, bias=False),
+            nn.Conv1d(encoded_feature_dim * D, 32, kernel_size=1, bias=False),
+            nn.BatchNorm1d(32),
             nn.ELU(),
-            nn.AvgPool1d(4), # 480 -> 120
-            nn.Dropout(0.3)  # 뉴런 통합이 죽지 않도록 0.3으로 하향
+            nn.AvgPool1d(4), 
+            nn.Dropout(0.3)
         )
         
-        # 🚨 64채널 복구: 네 원래 아이디어대로 각 전극마다 GDLIF 독립 제어
-        self.lif = GDLIF(channels=in_channels)
-        self.fc = nn.Linear(in_channels, num_classes)
+        self.lif = GDLIF(channels=32)
+        self.fc = nn.Linear(32, num_classes)
 
     def forward(self, xb):
         curv_raw, tang_raw = xb[:, 1, :, :], xb[:, 2, :, :]
         
-        # 64채널 공간 보존
-        curv_pooled = F.avg_pool1d(curv_raw, 4).permute(2, 0, 1) # (120, B, 64)
-        tang_pooled = F.avg_pool1d(tang_raw, 4).permute(2, 0, 1) # (120, B, 64)
+        # 🚨 차원 브로드캐스팅: 시간 압축(32채널)에 맞춰 GDLIF 제어 신호 확장
+        curv_pooled = F.avg_pool1d(curv_raw.mean(dim=1, keepdim=True), 4).permute(2, 0, 1).expand(-1, -1, 32)
+        tang_pooled = F.avg_pool1d(tang_raw.mean(dim=1, keepdim=True), 4).permute(2, 0, 1).expand(-1, -1, 32)
 
-        x_enc = self.encoder(xb) 
+        x_enc = self.encoder(xb)
         
-        # (B, 12, 64, 480) -> (B, 1, 64, 480) -> (B, 64, 480)
-        s_out = self.feature_fusion(x_enc).squeeze(1) 
-        
-        c = self.temporal(s_out).permute(2, 0, 1) # (120, B, 64)
+        s_out = self.spatial(x_enc).squeeze(2) 
+        c = self.temporal(s_out).permute(2, 0, 1) 
         
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
         spikes = []
         for t in range(c.size(0)):
-            # 64채널의 독립적인 동적 임계값 적용 (네 아이디어 완벽 구현)
             s, m = self.lif(c[t], m, curv_pooled[t], tang_pooled[t])
             spikes.append(s)
             
-        spikes_tensor = torch.stack(spikes) # (120, B, 64)
+        spikes_tensor = torch.stack(spikes) 
         
         attn_weights = F.softmax(curv_pooled, dim=0) 
-        out_features = torch.sum(spikes_tensor * attn_weights, dim=0) # (B, 64)
+        out_features = torch.sum(spikes_tensor * attn_weights, dim=0) 
         
         return self.fc(out_features)
 
 # ==========================================
-# [3] 검증 로직 (파멸적 노이즈 삭제)
+# [3] 검증 로직 (파멸적 노이즈 삭제 & 인내심 50 상향 & SSTL 폭탄 해체)
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
@@ -260,8 +262,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             
-            # 🚨 치명적 버그 수정: 기하학 피처를 깨부수던 가우시안 노이즈 주입 삭제
-            
+            # 노이즈 주입 완전 제거
             optimizer.zero_grad()
             out = model(xb)
             loss = criterion(out, yb)
@@ -323,11 +324,16 @@ def run_sstl(model_state, subject_X, subject_Y):
         model = GeoEEGSNN().to(device)
         model.load_state_dict(model_state)
         
-        model.dropout.train() 
+        # 🚨 폭탄 해체: BatchNorm 오염 방지를 위해 전체 eval 상태 유지
+        model.eval() 
         
         for param in model.parameters(): param.requires_grad = False
         for param in model.lif.parameters(): param.requires_grad = True
         for param in model.fc.parameters(): param.requires_grad = True
+        
+        # 🚨 봉인 해제된 부품만 명시적으로 train 모드 전환
+        model.lif.train()
+        model.fc.train()
             
         optimizer = torch.optim.AdamW([
             {'params': model.fc.parameters(), 'lr': 0.002},
@@ -337,7 +343,7 @@ def run_sstl(model_state, subject_X, subject_Y):
         criterion = nn.CrossEntropyLoss()
         
         for _ in range(25): 
-            model.train()
+            # 🚨 주의: 여기 model.train() 절대 쓰지 않음 (BatchNorm 보호)
             for xb, yb in train_dl:
                 xb, yb = xb.to(device), yb.to(device)
                 optimizer.zero_grad()
@@ -358,7 +364,7 @@ def run_sstl(model_state, subject_X, subject_Y):
     return np.mean(fold_accs)
 
 # ==========================================
-# [4] 논문 퀄리티 Figure 생성 
+# [4] 논문 퀄리티 Figure 생성 (Plotly 버그 수정 완료)
 # ==========================================
 def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels):
     c_loss = "#A0C4FF" 

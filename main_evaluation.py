@@ -141,7 +141,7 @@ def extract_robust_features_batch(X_array):
     tangling, _ = ratio.max(dim=-1)
     tangling = torch.log1p(tangling)
     
-    # 🚨 수정됨: Trial 단위(dim=-1)로 정규화하여 데이터 리키지 차단!
+    # Trial 단위(dim=-1) 정규화 유지 (데이터 리키지 차단)
     def normalize_feature(feat): 
         return (feat - feat.mean(dim=-1, keepdim=True)) / (feat.std(dim=-1, keepdim=True) + 1e-6)
         
@@ -151,13 +151,14 @@ def extract_robust_features_batch(X_array):
 # [2] GeoEEG-SNN 모델 
 # ==========================================
 class GDLIF(nn.Module):
-    # 🚨 수정됨: 입력 전류 스케일에 맞춰 v_base를 1.0에서 0.3으로 튜닝
-    def __init__(self, channels=32, v_base=0.3):
+    # 🚨 수정됨: 발화 유도를 위해 v_base를 0.15로 파격 하향 조정
+    def __init__(self, channels=32, v_base=0.15):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(0.1))
         self.gamma = nn.Parameter(torch.tensor(0.1)) 
         self.v_base = v_base
-        self.beta_base_logit = nn.Parameter(torch.tensor(2.0)) 
+        # 🚨 수정됨: 감쇠율(Leak)을 줄여 통합(Integration) 성능 강화 (logit 3.0 -> beta ≈ 0.95)
+        self.beta_base_logit = nn.Parameter(torch.tensor(3.0)) 
         self.spike_grad = surrogate.fast_sigmoid(slope=25)
 
     def forward(self, x_t, m_prev, curv_t, tang_t):
@@ -191,7 +192,7 @@ class GeoEEGSNN(nn.Module):
         encoded_feature_dim = 3 * 4  # 12
         D = 2 
         
-        # 🚨 수정됨: 기하학적 제어 신호(Curvature, Tangling)를 32차원으로 맵핑하는 공간 필터 추가
+        # 공간 정보(Spatial Information) 매핑 필터 유지
         self.curv_mapper = nn.Conv1d(in_channels, 32, kernel_size=1, bias=False)
         self.tang_mapper = nn.Conv1d(in_channels, 32, kernel_size=1, bias=False)
         
@@ -218,9 +219,8 @@ class GeoEEGSNN(nn.Module):
     def forward(self, xb):
         curv_raw, tang_raw = xb[:, 1, :, :], xb[:, 2, :, :]
         
-        # 🚨 수정됨: 채널 평균을 내지 않고 Conv1d로 64->32 채널 투영 후 시간축 풀링
-        curv_mapped = self.curv_mapper(curv_raw) # (B, 32, T)
-        tang_mapped = self.tang_mapper(tang_raw) # (B, 32, T)
+        curv_mapped = self.curv_mapper(curv_raw) 
+        tang_mapped = self.tang_mapper(tang_raw) 
         
         curv_pooled = F.avg_pool1d(curv_mapped, 4).permute(2, 0, 1) # (T_pool, B, 32)
         tang_pooled = F.avg_pool1d(tang_mapped, 4).permute(2, 0, 1) # (T_pool, B, 32)
@@ -228,24 +228,24 @@ class GeoEEGSNN(nn.Module):
         x_enc = self.encoder(xb)
         
         s_out = self.spatial(x_enc).squeeze(2) 
-        c = self.temporal(s_out).permute(2, 0, 1) # (T_pool, B, 32)
+        c = self.temporal(s_out).permute(2, 0, 1) 
         
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
         spikes = []
         for t in range(c.size(0)):
-            # 🚨 텐서 차원이 완벽하게 일치하여 억지 브로드캐스팅(expand) 불필요
-            s, m = self.lif(c[t], m, curv_pooled[t], tang_pooled[t])
+            # 🚨 수정됨: 입력 신호 강제 2배 펌핑! (Dead Neuron 타파)
+            s, m = self.lif(c[t] * 2.0, m, curv_pooled[t], tang_pooled[t])
             spikes.append(s)
             
-        spikes_tensor = torch.stack(spikes) 
+        spikes_tensor = torch.stack(spikes) # (T_pool, B, 32)
         
-        attn_weights = F.softmax(curv_pooled, dim=0) 
-        out_features = torch.sum(spikes_tensor * attn_weights, dim=0) 
+        # 🚨 수정됨: DNN 찌꺼기(Softmax Attention) 폐기, SNN 정석 발화율(Rate) 코딩 적용
+        firing_rate = spikes_tensor.mean(dim=0) # (B, 32)
         
-        return self.fc(out_features)
+        return self.fc(firing_rate)
 
 # ==========================================
-# [3] 검증 로직 (파멸적 노이즈 삭제 & 인내심 50 상향 & SSTL 폭탄 해체)
+# [3] 검증 로직 및 [4] Figure 로직은 이전과 동일 (생략 없이 실행 가능)
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
@@ -367,9 +367,6 @@ def run_sstl(model_state, subject_X, subject_Y):
         
     return np.mean(fold_accs)
 
-# ==========================================
-# [4] 논문 퀄리티 Figure 생성 (Plotly 버그 수정 완료)
-# ==========================================
 def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels):
     c_loss = "#A0C4FF" 
     c_acc = "#FFB3C6"  

@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 import plotly.graph_objects as go
-import plotly.io as pio
 import copy
 
 # ==========================================
@@ -37,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
                     handlers=[logging.FileHandler(os.path.join(SAVE_DIR, "full_eval_log.txt")), logging.StreamHandler()])
 
 # ==========================================
-# [1] 데이터 로더 및 피처 추출
+# [1] 데이터 로더 및 피처 추출 (복소 평면 기하학)
 # ==========================================
 def load_local_runs(subject, run_list):
     sub_str = f"S{subject:03d}"
@@ -147,7 +146,7 @@ def extract_robust_features_batch(X_array):
     return torch.stack([normalize_feature(env_t), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
-# [2] GeoEEG-SNN 모델
+# [2] GeoEEG-SNN 모델 (Diet Version)
 # ==========================================
 class GDLIF(nn.Module):
     def __init__(self, channels=64, v_base=1.0):
@@ -168,51 +167,36 @@ class GDLIF(nn.Module):
         m_next = m_next - spike * v_th
         return spike, m_next
 
-class LearnablePopulationEncoder(nn.Module):
-    def __init__(self, num_neurons=4):
-        super().__init__()
-        self.mu = nn.Parameter(torch.linspace(-3.0, 3.0, num_neurons))
-        self.sigma = nn.Parameter(torch.full((num_neurons,), 2.0))
-        
-    def forward(self, x):
-        B, F_types, C, T = x.shape
-        encoded = torch.exp(-((x.unsqueeze(-1) - self.mu)**2) / (2 * self.sigma**2 + 1e-6))
-        return encoded.permute(0, 1, 2, 4, 3).reshape(B, F_types * C * 4, T)
-
 class GeoEEGSNN(nn.Module):
     def __init__(self, in_channels=64, num_classes=4):
         super().__init__()
-        self.encoder = LearnablePopulationEncoder(num_neurons=4) 
-        encoded_dim = in_channels * 3 * 4 
-        
-        self.spatial = nn.Sequential(
-            nn.Conv1d(encoded_dim, 128, kernel_size=1, bias=False), 
-            nn.InstanceNorm1d(128, affine=True),
-            nn.ReLU(),
+        # 🚨 군살 쫙 뺀 컴팩트 인코더
+        self.feature_extractor = nn.Sequential(
+            nn.Conv1d(in_channels * 3, 128, kernel_size=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(0.3),
             nn.Conv1d(128, in_channels, kernel_size=1, bias=False),
-            nn.InstanceNorm1d(in_channels, affine=True),
-            nn.ReLU()
+            nn.BatchNorm1d(in_channels),
+            nn.GELU(),
+            nn.AvgPool1d(4) # T: 480 -> 120
         )
-        self.temporal = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels, kernel_size=15, padding=7, bias=False),
-            nn.InstanceNorm1d(in_channels, affine=True),
-            nn.ReLU(),
-            nn.Conv1d(in_channels, in_channels, kernel_size=1, bias=False),
-            nn.InstanceNorm1d(in_channels, affine=True),
-            nn.ReLU(),
-            nn.AvgPool1d(8)
-        )
-        self.dropout = nn.Dropout(0.6)
+        self.dropout = nn.Dropout(0.5)
         self.lif = GDLIF(channels=in_channels)
         self.fc = nn.Linear(in_channels, num_classes)
 
     def forward(self, xb):
+        # xb shape: (B, 3, 64, 480)
         curv_raw, tang_raw = xb[:, 1, :, :], xb[:, 2, :, :]
-        curv_pooled = F.avg_pool1d(curv_raw, 8).permute(2, 0, 1) 
-        tang_pooled = F.avg_pool1d(tang_raw, 8).permute(2, 0, 1)
+        
+        curv_pooled = F.avg_pool1d(curv_raw, 4).permute(2, 0, 1) # (120, B, 64)
+        tang_pooled = F.avg_pool1d(tang_raw, 4).permute(2, 0, 1) # (120, B, 64)
 
-        x_enc = self.encoder(xb) 
-        c = self.dropout(self.temporal(self.spatial(x_enc))).permute(2, 0, 1) 
+        B, F_dim, C, T = xb.shape
+        x_flat = xb.view(B, F_dim * C, T) # -> (B, 192, 480)
+
+        c = self.feature_extractor(x_flat) # -> (B, 64, 120)
+        c = self.dropout(c).permute(2, 0, 1) # -> (120, B, 64)
         
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
         spikes = []
@@ -220,14 +204,13 @@ class GeoEEGSNN(nn.Module):
             s, m = self.lif(c[t], m, curv_pooled[t], tang_pooled[t])
             spikes.append(s)
             
-        spikes_tensor = torch.stack(spikes) 
-        attn_weights = F.softmax(curv_pooled, dim=0) 
-        out_features = torch.sum(spikes_tensor * attn_weights, dim=0) 
+        spikes_tensor = torch.stack(spikes) # (120, B, 64)
+        spike_rate = spikes_tensor.mean(dim=0) # (B, 64)
         
-        return self.fc(out_features)
+        return self.fc(spike_rate)
 
 # ==========================================
-# [3] 검증 로직 (조기 종료 탑재)
+# [3] 검증 로직 (조기 종료 & 뉴런 봉인 해제)
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
@@ -243,7 +226,6 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
     best_model_state = None
     all_preds, all_labels = [], []
     
-    # 🚨 조기 종료 파라미터
     patience = 25
     patience_counter = 0
 
@@ -284,7 +266,6 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         test_acc = (corr / total) * 100
         history_acc.append(test_acc)
         
-        # 🚨 조기 종료 & 최고점 박제 로직
         if test_acc > best_acc:
             best_acc = test_acc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -300,7 +281,6 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
             logging.info(f"🚨 조기 종료 발동! Epoch {epoch+1}에서 학습을 멈춥니다. (최고 정확도: {best_acc:.2f}%)")
             break
             
-    # 학습 종료 후 최고 모델로 롤백 (이 가중치로 SSTL 진행해야 함)
     model.load_state_dict(best_model_state)
     logging.info("✅ 가장 똑똑했던 상태(Best Weight)로 모델을 복구했습니다.")
     return best_acc, best_model_state, history_loss, history_acc, all_preds, all_labels
@@ -321,13 +301,19 @@ def run_sstl(model_state, subject_X, subject_Y):
         
         model.dropout.train() 
         
+        # 🚨 GDLIF 봉인 해제: SNN 뉴런이 새 피험자에 적응하도록 열어줌
         for param in model.parameters(): param.requires_grad = False
+        for param in model.lif.parameters(): param.requires_grad = True
         for param in model.fc.parameters(): param.requires_grad = True
             
-        optimizer = torch.optim.AdamW(model.fc.parameters(), lr=0.001, weight_decay=1e-3)
+        optimizer = torch.optim.AdamW([
+            {'params': model.fc.parameters(), 'lr': 0.002},
+            {'params': model.lif.parameters(), 'lr': 0.005}
+        ], weight_decay=1e-3)
+        
         criterion = nn.CrossEntropyLoss()
         
-        for _ in range(15): 
+        for _ in range(20): 
             model.train()
             for xb, yb in train_dl:
                 xb, yb = xb.to(device), yb.to(device)
@@ -349,18 +335,16 @@ def run_sstl(model_state, subject_X, subject_Y):
     return np.mean(fold_accs)
 
 # ==========================================
-# [4] 논문 퀄리티 Figure 생성 (Seaborn + Plotly)
+# [4] 논문 퀄리티 Figure 생성 (Plotly 버그 수정)
 # ==========================================
 def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels):
-    # 🎨 우아한 파스텔톤 컬러 팔레트 (헥스 코드 지정)
-    c_loss = "#A0C4FF" # 소프트 블루
-    c_acc = "#FFB3C6"  # 코랄 핑크
-    c_global = "#BDB2FF" # 라벤더
-    c_sstl = "#FFD6A5" # 피치
+    c_loss = "#A0C4FF" 
+    c_acc = "#FFB3C6"  
+    c_global = "#BDB2FF" 
+    c_sstl = "#FFD6A5" 
     
     sns.set_theme(style="whitegrid", font_scale=1.1)
 
-    # 1. Learning Curve (Seaborn 정적 PDF)
     fig, ax1 = plt.subplots(figsize=(8, 5))
     ax2 = ax1.twinx()
     ax1.plot(hist_loss, color=c_loss, linewidth=3, label='Train Loss')
@@ -376,18 +360,17 @@ def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels)
     plt.savefig(os.path.join(SAVE_DIR, 'Fig_Learning_Curve.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 1-1. Learning Curve (Plotly 인터랙티브 HTML)
+    # 🚨 title_font 로 에러 완전 해결
     fig_html = go.Figure()
     fig_html.add_trace(go.Scatter(y=hist_loss, mode='lines', name='Train Loss', line=dict(color=c_loss, width=3), yaxis='y1'))
     fig_html.add_trace(go.Scatter(y=hist_acc, mode='lines', name='Test Acc', line=dict(color=c_acc, width=3), yaxis='y2'))
     fig_html.update_layout(
         title='Global Training Dynamics', template='plotly_white',
-        yaxis=dict(title='Loss', titlefont=dict(color=c_loss), tickfont=dict(color=c_loss)),
-        yaxis2=dict(title='Accuracy (%)', titlefont=dict(color=c_acc), tickfont=dict(color=c_acc), overlaying='y', side='right')
+        yaxis=dict(title='Loss', title_font=dict(color=c_loss), tickfont=dict(color=c_loss)),
+        yaxis2=dict(title='Accuracy (%)', title_font=dict(color=c_acc), tickfont=dict(color=c_acc), overlaying='y', side='right')
     )
     fig_html.write_html(os.path.join(SAVE_DIR, 'Interactive_Learning_Curve.html'))
 
-    # 2. Confusion Matrix (Seaborn Heatmap)
     cm = confusion_matrix(labels, preds, normalize='true')
     plt.figure(figsize=(7, 6))
     sns.heatmap(cm, annot=True, fmt='.2f', cmap='PuBu', cbar=False,
@@ -401,7 +384,6 @@ def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels)
     plt.savefig(os.path.join(SAVE_DIR, 'Fig_Confusion_Matrix.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 3. Bar Chart (Seaborn PDF)
     plt.figure(figsize=(6, 5))
     bars = plt.bar(['Global Training', 'SSTL (Transfer)'], [global_acc, sstl_acc], color=[c_global, c_sstl], edgecolor='black', linewidth=1.2)
     plt.ylim(0, 100)

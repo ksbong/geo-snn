@@ -146,7 +146,7 @@ def extract_robust_features_batch(X_array):
     return torch.stack([normalize_feature(env_t), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
-# [2] GeoEEG-SNN 모델 (Diet Version)
+# [2] GeoEEG-SNN 모델 (Original Idea Preserved)
 # ==========================================
 class GDLIF(nn.Module):
     def __init__(self, channels=64, v_base=1.0):
@@ -167,19 +167,44 @@ class GDLIF(nn.Module):
         m_next = m_next - spike * v_th
         return spike, m_next
 
+class LearnablePopulationEncoder(nn.Module):
+    def __init__(self, num_neurons=4):
+        super().__init__()
+        self.mu = nn.Parameter(torch.linspace(-3.0, 3.0, num_neurons))
+        self.sigma = nn.Parameter(torch.full((num_neurons,), 2.0))
+        
+    def forward(self, x):
+        B, F_types, C, T = x.shape
+        encoded = torch.exp(-((x.unsqueeze(-1) - self.mu)**2) / (2 * self.sigma**2 + 1e-6))
+        # 네 오리지널 아이디어: (B, F_types, C, T, num_neurons) -> (B, F_types*num_neurons, C, T)
+        return encoded.permute(0, 1, 4, 2, 3).reshape(B, F_types * self.mu.shape[0], C, T)
+
 class GeoEEGSNN(nn.Module):
     def __init__(self, in_channels=64, num_classes=4):
         super().__init__()
-        # 🚨 군살 쫙 뺀 컴팩트 인코더
-        self.feature_extractor = nn.Sequential(
-            nn.Conv1d(in_channels * 3, 128, kernel_size=1, bias=False),
-            nn.BatchNorm1d(128),
+        self.encoder = LearnablePopulationEncoder(num_neurons=4) 
+        
+        # 🚨 버그 수정: 공간 차원(C=64)을 유지하면서 피처 차원(F_types*num_neurons = 12)을 융합
+        encoded_feature_dim = 3 * 4  # (Env, Curv, Tang) * 4 neurons
+        
+        self.spatial = nn.Sequential(
+            # 공간 차원이 아닌 피처 차원을 합치는 올바른 방법
+            nn.Conv2d(encoded_feature_dim, 32, kernel_size=(1, 1), bias=False), 
+            nn.BatchNorm2d(32),
             nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Conv1d(128, in_channels, kernel_size=1, bias=False),
+            nn.Conv2d(32, 1, kernel_size=(1, 1), bias=False), # -> (B, 1, C, T)
+            nn.BatchNorm2d(1),
+            nn.GELU()
+        )
+        
+        self.temporal = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels, kernel_size=15, padding=7, bias=False),
             nn.BatchNorm1d(in_channels),
             nn.GELU(),
-            nn.AvgPool1d(4) # T: 480 -> 120
+            nn.Conv1d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(in_channels),
+            nn.GELU(),
+            nn.AvgPool1d(4) # T를 1/4로 압축 (SNN 연산량 감소)
         )
         self.dropout = nn.Dropout(0.5)
         self.lif = GDLIF(channels=in_channels)
@@ -189,14 +214,15 @@ class GeoEEGSNN(nn.Module):
         # xb shape: (B, 3, 64, 480)
         curv_raw, tang_raw = xb[:, 1, :, :], xb[:, 2, :, :]
         
-        curv_pooled = F.avg_pool1d(curv_raw, 4).permute(2, 0, 1) # (120, B, 64)
-        tang_pooled = F.avg_pool1d(tang_raw, 4).permute(2, 0, 1) # (120, B, 64)
+        curv_pooled = F.avg_pool1d(curv_raw, 4).permute(2, 0, 1) # (T/4, B, C)
+        tang_pooled = F.avg_pool1d(tang_raw, 4).permute(2, 0, 1)
 
-        B, F_dim, C, T = xb.shape
-        x_flat = xb.view(B, F_dim * C, T) # -> (B, 192, 480)
-
-        c = self.feature_extractor(x_flat) # -> (B, 64, 120)
-        c = self.dropout(c).permute(2, 0, 1) # -> (120, B, 64)
+        x_enc = self.encoder(xb) # (B, 12, 64, 480)
+        
+        # 공간 융합 후 불필요한 차원 제거 -> (B, 64, 480)
+        s_out = self.spatial(x_enc).squeeze(1) 
+        
+        c = self.dropout(self.temporal(s_out)).permute(2, 0, 1) # (T/4, B, 64)
         
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
         spikes = []
@@ -204,10 +230,13 @@ class GeoEEGSNN(nn.Module):
             s, m = self.lif(c[t], m, curv_pooled[t], tang_pooled[t])
             spikes.append(s)
             
-        spikes_tensor = torch.stack(spikes) # (120, B, 64)
-        spike_rate = spikes_tensor.mean(dim=0) # (B, 64)
+        spikes_tensor = torch.stack(spikes) # (T, B, C)
         
-        return self.fc(spike_rate)
+        # SNN의 결과를 단순 평균이 아닌 Attention 메커니즘으로 추출 (네 오리지널 아이디어)
+        attn_weights = F.softmax(curv_pooled, dim=0) 
+        out_features = torch.sum(spikes_tensor * attn_weights, dim=0) 
+        
+        return self.fc(out_features)
 
 # ==========================================
 # [3] 검증 로직 (조기 종료 & 뉴런 봉인 해제)
@@ -217,7 +246,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
     test_dl = DataLoader(TensorDataset(X_test, Y_test), batch_size=128, shuffle=False)
 
     model = GeoEEGSNN().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=1e-2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-3) # 학습률 안정화
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=150)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
@@ -235,7 +264,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             
-            noise = torch.randn_like(xb) * 0.01
+            noise = torch.randn_like(xb) * 0.05 # 노이즈를 살짝 키워서 과적합 방지
             xb = xb + noise
             
             optimizer.zero_grad()
@@ -301,19 +330,20 @@ def run_sstl(model_state, subject_X, subject_Y):
         
         model.dropout.train() 
         
-        # 🚨 GDLIF 봉인 해제: SNN 뉴런이 새 피험자에 적응하도록 열어줌
+        # 🚨 핵심: GDLIF 봉인 해제!
         for param in model.parameters(): param.requires_grad = False
-        for param in model.lif.parameters(): param.requires_grad = True
+        for param in model.lif.parameters(): param.requires_grad = True # 뉴런 적응 허용
         for param in model.fc.parameters(): param.requires_grad = True
             
+        # 열어둔 부분만 집중 학습
         optimizer = torch.optim.AdamW([
             {'params': model.fc.parameters(), 'lr': 0.002},
-            {'params': model.lif.parameters(), 'lr': 0.005}
+            {'params': model.lif.parameters(), 'lr': 0.005} # GDLIF 변화폭을 크게 줌
         ], weight_decay=1e-3)
         
         criterion = nn.CrossEntropyLoss()
         
-        for _ in range(20): 
+        for _ in range(25): # SSTL 에포크 증가 (20 -> 25)
             model.train()
             for xb, yb in train_dl:
                 xb, yb = xb.to(device), yb.to(device)
@@ -360,7 +390,6 @@ def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels)
     plt.savefig(os.path.join(SAVE_DIR, 'Fig_Learning_Curve.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 🚨 title_font 로 에러 완전 해결
     fig_html = go.Figure()
     fig_html.add_trace(go.Scatter(y=hist_loss, mode='lines', name='Train Loss', line=dict(color=c_loss, width=3), yaxis='y1'))
     fig_html.add_trace(go.Scatter(y=hist_acc, mode='lines', name='Test Acc', line=dict(color=c_acc, width=3), yaxis='y2'))

@@ -184,27 +184,24 @@ class GeoEEGSNN(nn.Module):
         super().__init__()
         self.encoder = LearnablePopulationEncoder(num_neurons=4) 
         
-        # 🚨 버그 수정: 공간 차원(C=64)을 유지하면서 피처 차원(F_types*num_neurons = 12)을 융합
-        encoded_feature_dim = 3 * 4  # (Env, Curv, Tang) * 4 neurons
+        encoded_feature_dim = 3 * 4  # (Env, Curv, Tang) * 4 neurons = 12
         
+        # 🚨 핵심 버그 수정: 진정한 공간 필터(Spatial Filter)
+        # kernel_size=(in_channels, 1) 을 써서 64개 전극의 특징을 완벽하게 융합
         self.spatial = nn.Sequential(
-            # 공간 차원이 아닌 피처 차원을 합치는 올바른 방법
-            nn.Conv2d(encoded_feature_dim, 32, kernel_size=(1, 1), bias=False), 
+            nn.Conv2d(encoded_feature_dim, 32, kernel_size=(in_channels, 1), bias=False), # -> (B, 32, 1, T)
             nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.Conv2d(32, 1, kernel_size=(1, 1), bias=False), # -> (B, 1, C, T)
-            nn.BatchNorm2d(1),
             nn.GELU()
         )
         
         self.temporal = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels, kernel_size=15, padding=7, bias=False),
+            nn.Conv1d(32, in_channels, kernel_size=15, padding=7, bias=False), # -> (B, 64, T)
             nn.BatchNorm1d(in_channels),
             nn.GELU(),
             nn.Conv1d(in_channels, in_channels, kernel_size=1, bias=False),
             nn.BatchNorm1d(in_channels),
             nn.GELU(),
-            nn.AvgPool1d(4) # T를 1/4로 압축 (SNN 연산량 감소)
+            nn.AvgPool1d(4) # T를 1/4로 압축
         )
         self.dropout = nn.Dropout(0.5)
         self.lif = GDLIF(channels=in_channels)
@@ -219,9 +216,10 @@ class GeoEEGSNN(nn.Module):
 
         x_enc = self.encoder(xb) # (B, 12, 64, 480)
         
-        # 공간 융합 후 불필요한 차원 제거 -> (B, 64, 480)
-        s_out = self.spatial(x_enc).squeeze(1) 
+        # 공간 필터 통과 후 (B, 32, 1, 480) -> (B, 32, 480)으로 차원 축소
+        s_out = self.spatial(x_enc).squeeze(2) 
         
+        # 시간 필터 통과
         c = self.dropout(self.temporal(s_out)).permute(2, 0, 1) # (T/4, B, 64)
         
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
@@ -239,14 +237,14 @@ class GeoEEGSNN(nn.Module):
         return self.fc(out_features)
 
 # ==========================================
-# [3] 검증 로직 (조기 종료 & 뉴런 봉인 해제)
+# [3] 검증 로직 (인내심 상향 & 뉴런 봉인 해제)
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
     test_dl = DataLoader(TensorDataset(X_test, Y_test), batch_size=128, shuffle=False)
 
     model = GeoEEGSNN().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-3) # 학습률 안정화
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=150)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
@@ -255,7 +253,8 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
     best_model_state = None
     all_preds, all_labels = [], []
     
-    patience = 25
+    # 🚨 수정: 인내심 50으로 대폭 상향
+    patience = 50
     patience_counter = 0
 
     for epoch in range(150): 
@@ -264,7 +263,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             
-            noise = torch.randn_like(xb) * 0.05 # 노이즈를 살짝 키워서 과적합 방지
+            noise = torch.randn_like(xb) * 0.05 
             xb = xb + noise
             
             optimizer.zero_grad()
@@ -330,20 +329,19 @@ def run_sstl(model_state, subject_X, subject_Y):
         
         model.dropout.train() 
         
-        # 🚨 핵심: GDLIF 봉인 해제!
+        # 🚨 GDLIF 봉인 해제
         for param in model.parameters(): param.requires_grad = False
-        for param in model.lif.parameters(): param.requires_grad = True # 뉴런 적응 허용
+        for param in model.lif.parameters(): param.requires_grad = True
         for param in model.fc.parameters(): param.requires_grad = True
             
-        # 열어둔 부분만 집중 학습
         optimizer = torch.optim.AdamW([
             {'params': model.fc.parameters(), 'lr': 0.002},
-            {'params': model.lif.parameters(), 'lr': 0.005} # GDLIF 변화폭을 크게 줌
+            {'params': model.lif.parameters(), 'lr': 0.005}
         ], weight_decay=1e-3)
         
         criterion = nn.CrossEntropyLoss()
         
-        for _ in range(25): # SSTL 에포크 증가 (20 -> 25)
+        for _ in range(25): 
             model.train()
             for xb, yb in train_dl:
                 xb, yb = xb.to(device), yb.to(device)

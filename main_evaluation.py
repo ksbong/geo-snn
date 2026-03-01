@@ -26,7 +26,7 @@ np.random.seed(SEED)
 torch.backends.cudnn.benchmark = True 
 
 DATA_DIR_PHYSIONET = './raw_data/files'
-SAVE_DIR = './results_geoeeg_final'
+SAVE_DIR = './results_geoeeg_final_fixed'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 mne.set_log_level('ERROR')
@@ -141,15 +141,18 @@ def extract_robust_features_batch(X_array):
     tangling, _ = ratio.max(dim=-1)
     tangling = torch.log1p(tangling)
     
+    # 🚨 수정됨: Trial 단위(dim=-1)로 정규화하여 데이터 리키지 차단!
     def normalize_feature(feat): 
-        return (feat - feat.mean(dim=(0, 2), keepdim=True)) / (feat.std(dim=(0, 2), keepdim=True) + 1e-6)
+        return (feat - feat.mean(dim=-1, keepdim=True)) / (feat.std(dim=-1, keepdim=True) + 1e-6)
+        
     return torch.stack([normalize_feature(env_t), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
 # [2] GeoEEG-SNN 모델 
 # ==========================================
 class GDLIF(nn.Module):
-    def __init__(self, channels=32, v_base=1.0):
+    # 🚨 수정됨: 입력 전류 스케일에 맞춰 v_base를 1.0에서 0.3으로 튜닝
+    def __init__(self, channels=32, v_base=0.3):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(0.1))
         self.gamma = nn.Parameter(torch.tensor(0.1)) 
@@ -161,7 +164,6 @@ class GDLIF(nn.Module):
         tang_c = torch.clamp(tang_t, min=-2.0, max=2.0)
         curv_c = torch.clamp(curv_t, min=-2.0, max=2.0)
         
-        # 🚨 완벽 복구: 곡률(Curvature) -> 임계값, 얽힘(Tangling) -> 감쇠계수
         v_th = torch.clamp(self.v_base + self.alpha * curv_c, min=0.1) 
         beta = torch.sigmoid(self.beta_base_logit - self.gamma * tang_c)
         
@@ -189,7 +191,10 @@ class GeoEEGSNN(nn.Module):
         encoded_feature_dim = 3 * 4  # 12
         D = 2 
         
-        # 🚨 공간 필터: EEGNet 스타일 Depthwise 융합 
+        # 🚨 수정됨: 기하학적 제어 신호(Curvature, Tangling)를 32차원으로 맵핑하는 공간 필터 추가
+        self.curv_mapper = nn.Conv1d(in_channels, 32, kernel_size=1, bias=False)
+        self.tang_mapper = nn.Conv1d(in_channels, 32, kernel_size=1, bias=False)
+        
         self.spatial = nn.Sequential(
             nn.Conv2d(encoded_feature_dim, encoded_feature_dim * D, 
                       kernel_size=(in_channels, 1), groups=encoded_feature_dim, bias=False),
@@ -197,7 +202,6 @@ class GeoEEGSNN(nn.Module):
             nn.ELU()
         )
         
-        # 🚨 시간 필터: 커널 15, 패딩 7 동기화 + 드롭아웃 0.3 하향
         self.temporal = nn.Sequential(
             nn.Conv1d(encoded_feature_dim * D, encoded_feature_dim * D, 
                       kernel_size=15, padding=7, groups=encoded_feature_dim * D, bias=False),
@@ -214,18 +218,22 @@ class GeoEEGSNN(nn.Module):
     def forward(self, xb):
         curv_raw, tang_raw = xb[:, 1, :, :], xb[:, 2, :, :]
         
-        # 🚨 차원 브로드캐스팅: 시간 압축(32채널)에 맞춰 GDLIF 제어 신호 확장
-        curv_pooled = F.avg_pool1d(curv_raw.mean(dim=1, keepdim=True), 4).permute(2, 0, 1).expand(-1, -1, 32)
-        tang_pooled = F.avg_pool1d(tang_raw.mean(dim=1, keepdim=True), 4).permute(2, 0, 1).expand(-1, -1, 32)
+        # 🚨 수정됨: 채널 평균을 내지 않고 Conv1d로 64->32 채널 투영 후 시간축 풀링
+        curv_mapped = self.curv_mapper(curv_raw) # (B, 32, T)
+        tang_mapped = self.tang_mapper(tang_raw) # (B, 32, T)
+        
+        curv_pooled = F.avg_pool1d(curv_mapped, 4).permute(2, 0, 1) # (T_pool, B, 32)
+        tang_pooled = F.avg_pool1d(tang_mapped, 4).permute(2, 0, 1) # (T_pool, B, 32)
 
         x_enc = self.encoder(xb)
         
         s_out = self.spatial(x_enc).squeeze(2) 
-        c = self.temporal(s_out).permute(2, 0, 1) 
+        c = self.temporal(s_out).permute(2, 0, 1) # (T_pool, B, 32)
         
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
         spikes = []
         for t in range(c.size(0)):
+            # 🚨 텐서 차원이 완벽하게 일치하여 억지 브로드캐스팅(expand) 불필요
             s, m = self.lif(c[t], m, curv_pooled[t], tang_pooled[t])
             spikes.append(s)
             
@@ -243,7 +251,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
     test_dl = DataLoader(TensorDataset(X_test, Y_test), batch_size=128, shuffle=False)
 
-    model = GeoEEGSNN().to(device)
+    model = GeoEEGSNN(in_channels=64).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=150)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -262,7 +270,6 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
             
-            # 노이즈 주입 완전 제거
             optimizer.zero_grad()
             out = model(xb)
             loss = criterion(out, yb)
@@ -300,7 +307,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
             patience_counter += 1
             
         if (epoch + 1) % 10 == 0:
-            logging.info(f"  -> Epoch {epoch+1}/150 | Loss: {avg_loss:.4f} | Test Acc: {test_acc:.2f}% | Patience: {patience_counter}/{patience}")
+            logging.info(f"   -> Epoch {epoch+1}/150 | Loss: {avg_loss:.4f} | Test Acc: {test_acc:.2f}% | Patience: {patience_counter}/{patience}")
             
         if patience_counter >= patience:
             logging.info(f"🚨 조기 종료 발동! Epoch {epoch+1}에서 학습을 멈춥니다. (최고 정확도: {best_acc:.2f}%)")
@@ -321,17 +328,15 @@ def run_sstl(model_state, subject_X, subject_Y):
         train_dl = DataLoader(TensorDataset(X_tr, Y_tr), batch_size=16, shuffle=True)
         test_dl = DataLoader(TensorDataset(X_te, Y_te), batch_size=16, shuffle=False)
         
-        model = GeoEEGSNN().to(device)
+        model = GeoEEGSNN(in_channels=64).to(device)
         model.load_state_dict(model_state)
         
-        # 🚨 폭탄 해체: BatchNorm 오염 방지를 위해 전체 eval 상태 유지
         model.eval() 
         
         for param in model.parameters(): param.requires_grad = False
         for param in model.lif.parameters(): param.requires_grad = True
         for param in model.fc.parameters(): param.requires_grad = True
         
-        # 🚨 봉인 해제된 부품만 명시적으로 train 모드 전환
         model.lif.train()
         model.fc.train()
             
@@ -343,7 +348,6 @@ def run_sstl(model_state, subject_X, subject_Y):
         criterion = nn.CrossEntropyLoss()
         
         for _ in range(25): 
-            # 🚨 주의: 여기 model.train() 절대 쓰지 않음 (BatchNorm 보호)
             for xb, yb in train_dl:
                 xb, yb = xb.to(device), yb.to(device)
                 optimizer.zero_grad()

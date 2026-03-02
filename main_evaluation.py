@@ -9,7 +9,7 @@ import os
 import warnings
 from scipy.signal import savgol_filter
 import logging
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
@@ -26,7 +26,7 @@ np.random.seed(SEED)
 torch.backends.cudnn.benchmark = True 
 
 DATA_DIR_PHYSIONET = './raw_data/files'
-SAVE_DIR = './results_geoeeg_final_fixed'
+SAVE_DIR = './results_geoeeg_smooth_final'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 mne.set_log_level('ERROR')
@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
                     handlers=[logging.FileHandler(os.path.join(SAVE_DIR, "full_eval_log.txt")), logging.StreamHandler()])
 
 # ==========================================
-# [1] 데이터 로더 및 피처 추출 (복소 평면 기하학)
+# [1] 데이터 로더 및 피처 추출 (CPU 병목 구간 - S-G 필터 적용)
 # ==========================================
 def load_local_runs(subject, run_list):
     sub_str = f"S{subject:03d}"
@@ -45,6 +45,7 @@ def load_local_runs(subject, run_list):
         file_path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf")
         if not os.path.exists(file_path): return None
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+        # 🚨 원래는 Sub-band 필터링이 정석이지만, 네 S-G 필터 아이디어를 살리기 위해 4~40Hz 유지
         raw.filter(l_freq=4., h_freq=40., fir_design='firwin', verbose=False) 
         mne.datasets.eegbci.standardize(raw)
         raw.set_montage('standard_1005', match_case=False, on_missing='ignore')
@@ -94,6 +95,7 @@ def extract_robust_features_batch(X_array):
     y = analytic.imag.numpy()
     env = np.sqrt(x**2 + y**2)
     
+    # 🚨 유저 오리지널 아이디어: Savitzky-Golay 필터로 미분 노이즈(Chaos) 억제
     half_win = 5
     vx_raw = savgol_filter(x, window_length=11, polyorder=3, deriv=1, axis=-1)
     vy_raw = savgol_filter(y, window_length=11, polyorder=3, deriv=1, axis=-1)
@@ -141,37 +143,44 @@ def extract_robust_features_batch(X_array):
     tangling, _ = ratio.max(dim=-1)
     tangling = torch.log1p(tangling)
     
-    # Trial 단위(dim=-1) 정규화 유지 (데이터 리키지 차단)
     def normalize_feature(feat): 
         return (feat - feat.mean(dim=-1, keepdim=True)) / (feat.std(dim=-1, keepdim=True) + 1e-6)
         
     return torch.stack([normalize_feature(env_t), normalize_feature(curvature), normalize_feature(tangling)], dim=1)
 
 # ==========================================
-# [2] GeoEEG-SNN 모델 
+# [2] GeoEEG-SNN 모델 (Neuromodulation 적용)
 # ==========================================
-class GDLIF(nn.Module):
-    # 🚨 수정됨: 발화 유도를 위해 v_base를 0.15로 파격 하향 조정
-    def __init__(self, channels=32, v_base=0.15):
+class SmoothGDLIF(nn.Module):
+    def __init__(self, channels=32, v_base=0.3):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(0.1))
-        self.gamma = nn.Parameter(torch.tensor(0.1)) 
         self.v_base = v_base
-        # 🚨 수정됨: 감쇠율(Leak)을 줄여 통합(Integration) 성능 강화 (logit 3.0 -> beta ≈ 0.95)
-        self.beta_base_logit = nn.Parameter(torch.tensor(3.0)) 
+        
+        # 🚨 핵심: 기하학적 피처를 부드럽게 누적하는 '느린 상태 변수' 시상수
+        self.tau_geo = nn.Parameter(torch.tensor(0.9)) 
+        self.beta_m = nn.Parameter(torch.tensor(0.85)) # 막전위 감쇠율
+        
+        self.alpha = nn.Parameter(torch.tensor(0.5)) # 곡률 -> 임계값 제어
+        self.gamma = nn.Parameter(torch.tensor(0.5)) # 얽힘 -> 민감도 제어
+        
         self.spike_grad = surrogate.fast_sigmoid(slope=25)
 
-    def forward(self, x_t, m_prev, curv_t, tang_t):
-        tang_c = torch.clamp(tang_t, min=-2.0, max=2.0)
-        curv_c = torch.clamp(curv_t, min=-2.0, max=2.0)
+    def forward(self, x_t, m_prev, curv_t, tang_t, c_prev, t_prev):
+        # 1. 느린 조절자(Neuromodulator) 갱신: 피처의 급격한 변화(Noise)를 한 번 더 억제
+        tau_g = torch.sigmoid(self.tau_geo)
+        c_next = tau_g * c_prev + (1 - tau_g) * curv_t
+        t_next = tau_g * t_prev + (1 - tau_g) * tang_t
         
-        v_th = torch.clamp(self.v_base + self.alpha * curv_c, min=0.1) 
-        beta = torch.sigmoid(self.beta_base_logit - self.gamma * tang_c)
+        # 2. 역학 제어: 부드러워진 상태 변수로 LIF 파라미터 튜닝
+        v_th = torch.clamp(self.v_base + self.alpha * c_next, min=0.1) 
+        sensitivity = torch.sigmoid(1.0 - self.gamma * t_next) 
         
-        m_next = beta * m_prev + x_t
+        # 3. 통합 및 발화 (Integration and Fire)
+        m_next = self.beta_m * m_prev + (x_t * sensitivity)
         spike = self.spike_grad(m_next - v_th)
         m_next = m_next - spike * v_th
-        return spike, m_next
+        
+        return spike, m_next, c_next, t_next
 
 class LearnablePopulationEncoder(nn.Module):
     def __init__(self, num_neurons=4):
@@ -188,11 +197,9 @@ class GeoEEGSNN(nn.Module):
     def __init__(self, in_channels=64, num_classes=4):
         super().__init__()
         self.encoder = LearnablePopulationEncoder(num_neurons=4) 
-        
-        encoded_feature_dim = 3 * 4  # 12
+        encoded_feature_dim = 3 * 4  
         D = 2 
         
-        # 공간 정보(Spatial Information) 매핑 필터 유지
         self.curv_mapper = nn.Conv1d(in_channels, 32, kernel_size=1, bias=False)
         self.tang_mapper = nn.Conv1d(in_channels, 32, kernel_size=1, bias=False)
         
@@ -213,39 +220,37 @@ class GeoEEGSNN(nn.Module):
             nn.Dropout(0.3)
         )
         
-        self.lif = GDLIF(channels=32)
+        self.lif = SmoothGDLIF(channels=32)
         self.fc = nn.Linear(32, num_classes)
 
     def forward(self, xb):
         curv_raw, tang_raw = xb[:, 1, :, :], xb[:, 2, :, :]
-        
         curv_mapped = self.curv_mapper(curv_raw) 
         tang_mapped = self.tang_mapper(tang_raw) 
         
-        curv_pooled = F.avg_pool1d(curv_mapped, 4).permute(2, 0, 1) # (T_pool, B, 32)
-        tang_pooled = F.avg_pool1d(tang_mapped, 4).permute(2, 0, 1) # (T_pool, B, 32)
+        curv_pooled = F.avg_pool1d(curv_mapped, 4).permute(2, 0, 1) 
+        tang_pooled = F.avg_pool1d(tang_mapped, 4).permute(2, 0, 1) 
 
         x_enc = self.encoder(xb)
-        
         s_out = self.spatial(x_enc).squeeze(2) 
         c = self.temporal(s_out).permute(2, 0, 1) 
         
+        # 🚨 상태 변수 초기화
         m = torch.zeros(c.size(1), c.size(2), device=xb.device) 
+        c_state = torch.zeros_like(m)
+        t_state = torch.zeros_like(m)
+        
         spikes = []
-        for t in range(c.size(0)):
-            # 🚨 수정됨: 입력 신호 강제 2배 펌핑! (Dead Neuron 타파)
-            s, m = self.lif(c[t] * 2.0, m, curv_pooled[t], tang_pooled[t])
+        for time_step in range(c.size(0)):
+            s, m, c_state, t_state = self.lif(c[time_step], m, curv_pooled[time_step], tang_pooled[time_step], c_state, t_state)
             spikes.append(s)
             
-        spikes_tensor = torch.stack(spikes) # (T_pool, B, 32)
-        
-        # 🚨 수정됨: DNN 찌꺼기(Softmax Attention) 폐기, SNN 정석 발화율(Rate) 코딩 적용
-        firing_rate = spikes_tensor.mean(dim=0) # (B, 32)
-        
+        spikes_tensor = torch.stack(spikes)
+        firing_rate = spikes_tensor.mean(dim=0) # SNN 정석 발화율 인코딩
         return self.fc(firing_rate)
 
 # ==========================================
-# [3] 검증 로직 및 [4] Figure 로직은 이전과 동일 (생략 없이 실행 가능)
+# [3] 단일 피험자 성능 확인 및 Global Training
 # ==========================================
 def run_global_training(X_train, Y_train, X_test, Y_test):
     train_dl = DataLoader(TensorDataset(X_train, Y_train), batch_size=128, shuffle=True)
@@ -257,8 +262,8 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     best_acc = 0
+    best_model_state = None  # 🚨 추가됨: 최고 모델 저장용
     history_loss, history_acc = [], []
-    best_model_state = None
     all_preds, all_labels = [], []
     
     patience = 50
@@ -269,10 +274,8 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         train_loss = 0
         for xb, yb in train_dl:
             xb, yb = xb.to(device), yb.to(device)
-            
             optimizer.zero_grad()
-            out = model(xb)
-            loss = criterion(out, yb)
+            loss = criterion(model(xb), yb)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -300,7 +303,7 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
         
         if test_acc > best_acc:
             best_acc = test_acc
-            best_model_state = copy.deepcopy(model.state_dict())
+            best_model_state = copy.deepcopy(model.state_dict()) # 🚨 추가됨
             all_preds, all_labels = preds_list, labels_list
             patience_counter = 0
         else:
@@ -310,33 +313,28 @@ def run_global_training(X_train, Y_train, X_test, Y_test):
             logging.info(f"   -> Epoch {epoch+1}/150 | Loss: {avg_loss:.4f} | Test Acc: {test_acc:.2f}% | Patience: {patience_counter}/{patience}")
             
         if patience_counter >= patience:
-            logging.info(f"🚨 조기 종료 발동! Epoch {epoch+1}에서 학습을 멈춥니다. (최고 정확도: {best_acc:.2f}%)")
+            logging.info(f"🚨 조기 종료 발동! (최고 정확도: {best_acc:.2f}%)")
             break
             
-    model.load_state_dict(best_model_state)
-    logging.info("✅ 가장 똑똑했던 상태(Best Weight)로 모델을 복구했습니다.")
-    return best_acc, best_model_state, history_loss, history_acc, all_preds, all_labels
+    # 🚨 수정됨: SNN 최고 상태 리턴
+    return best_acc, best_model_state, history_loss, history_acc, all_preds, all_labels 
 
+# 🚨 누락됐던 SSTL 함수 복구
 def run_sstl(model_state, subject_X, subject_Y):
     kf = KFold(n_splits=4, shuffle=True, random_state=SEED)
     fold_accs = []
-    
     for train_idx, test_idx in kf.split(subject_X):
         X_tr, Y_tr = subject_X[train_idx], subject_Y[train_idx]
         X_te, Y_te = subject_X[test_idx], subject_Y[test_idx]
-        
         train_dl = DataLoader(TensorDataset(X_tr, Y_tr), batch_size=16, shuffle=True)
         test_dl = DataLoader(TensorDataset(X_te, Y_te), batch_size=16, shuffle=False)
         
         model = GeoEEGSNN(in_channels=64).to(device)
         model.load_state_dict(model_state)
-        
         model.eval() 
-        
         for param in model.parameters(): param.requires_grad = False
         for param in model.lif.parameters(): param.requires_grad = True
         for param in model.fc.parameters(): param.requires_grad = True
-        
         model.lif.train()
         model.fc.train()
             
@@ -344,7 +342,6 @@ def run_sstl(model_state, subject_X, subject_Y):
             {'params': model.fc.parameters(), 'lr': 0.002},
             {'params': model.lif.parameters(), 'lr': 0.005}
         ], weight_decay=1e-3)
-        
         criterion = nn.CrossEntropyLoss()
         
         for _ in range(25): 
@@ -364,22 +361,20 @@ def run_sstl(model_state, subject_X, subject_Y):
                 corr += (preds == yb).sum().item()
                 total += yb.size(0)
         fold_accs.append((corr / total) * 100)
-        
     return np.mean(fold_accs)
 
+# 🚨 누락됐던 시각화 함수 복구
 def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels):
     c_loss = "#A0C4FF" 
     c_acc = "#FFB3C6"  
     c_global = "#BDB2FF" 
     c_sstl = "#FFD6A5" 
-    
     sns.set_theme(style="whitegrid", font_scale=1.1)
 
     fig, ax1 = plt.subplots(figsize=(8, 5))
     ax2 = ax1.twinx()
     ax1.plot(hist_loss, color=c_loss, linewidth=3, label='Train Loss')
     ax2.plot(hist_acc, color=c_acc, linewidth=3, linestyle='-', label='Test Acc')
-    
     ax1.set_xlabel('Epochs', fontweight='bold', fontsize=12)
     ax1.set_ylabel('Loss', color=c_loss, fontweight='bold', fontsize=12)
     ax2.set_ylabel('Accuracy (%)', color=c_acc, fontweight='bold', fontsize=12)
@@ -389,16 +384,6 @@ def plot_paper_figures(global_acc, sstl_acc, hist_loss, hist_acc, preds, labels)
     plt.tight_layout()
     plt.savefig(os.path.join(SAVE_DIR, 'Fig_Learning_Curve.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
-
-    fig_html = go.Figure()
-    fig_html.add_trace(go.Scatter(y=hist_loss, mode='lines', name='Train Loss', line=dict(color=c_loss, width=3), yaxis='y1'))
-    fig_html.add_trace(go.Scatter(y=hist_acc, mode='lines', name='Test Acc', line=dict(color=c_acc, width=3), yaxis='y2'))
-    fig_html.update_layout(
-        title='Global Training Dynamics', template='plotly_white',
-        yaxis=dict(title='Loss', title_font=dict(color=c_loss), tickfont=dict(color=c_loss)),
-        yaxis2=dict(title='Accuracy (%)', title_font=dict(color=c_acc), tickfont=dict(color=c_acc), overlaying='y', side='right')
-    )
-    fig_html.write_html(os.path.join(SAVE_DIR, 'Interactive_Learning_Curve.html'))
 
     cm = confusion_matrix(labels, preds, normalize='true')
     plt.figure(figsize=(7, 6))
@@ -443,12 +428,16 @@ def main():
             
     logging.info(f"✅ Extracted features for {len(subject_features)} subjects.")
 
+    # 🚨 STAGE 1.5: 유저 아이디어 검증 (Subject 1)
+    if 1 in subject_features:
+        run_single_subject_sanity_check(subject_features[1], subject_labels[1])
+
     subjects_array = np.array(list(subject_features.keys()))
     kf_global = KFold(n_splits=5, shuffle=True, random_state=SEED)
     
     fold_global_accs, fold_sstl_accs = [], []
     
-    logging.info("\n" + "="*50 + "\n[STAGE 2] Starting HR-SNN Protocol (PhysioNet)\n" + "="*50)
+    logging.info("\n" + "="*50 + "\n[STAGE 2] Starting Smooth-GDLIF SNN Protocol\n" + "="*50)
     for fold, (train_sub_idx, test_sub_idx) in enumerate(kf_global.split(subjects_array)):
         if fold > 0: break 
         

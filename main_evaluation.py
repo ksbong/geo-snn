@@ -186,8 +186,10 @@ class DeepGeoConvSNN(nn.Module):
         self.v_th3, self.tau3 = 0.3, 2.0
         
         self.dp_pool = nn.AvgPool1d(kernel_size=32, stride=32)
-        self.pre_fc_bn = nn.BatchNorm1d(256 * 15)
-        self.fc_out = nn.Linear(256 * 15, num_classes)
+        
+        # [핵심 수정] 479 스텝을 32로 나누면 14칸이 됨. 15 -> 14로 수정
+        self.pre_fc_bn = nn.BatchNorm1d(256 * 14)
+        self.fc_out = nn.Linear(256 * 14, num_classes)
 
     def forward(self, features, return_features=False):
         batch_size, channels, time_steps, _ = features.shape

@@ -77,6 +77,7 @@ def load_physionet_dual_runpod(subject):
             
             ep_base = mne.Epochs(raw_lr, ev_lr, tmin=0., tmax=2.99, baseline=None, preload=True, verbose=False)
             ep_csd = mne.Epochs(raw_lr_csd, ev_lr, tmin=0., tmax=2.99, baseline=None, preload=True, verbose=False)
+            # 정상 피험자들만 들어오므로 480 길이 보장
             epochs_base_list.append(ep_base.get_data()[:, :, :480])
             epochs_csd_list.append(ep_csd.get_data()[:, :, :480])
             labels_list.append(ep_base.events[:, -1])
@@ -246,9 +247,12 @@ if __name__ == "__main__":
     
     X_features, y_all = [], []
     ch_names = None
-    target_subjects = list(range(1, 106)) 
     
-    logging.info("Loading Data and Extracting Features...")
+    # [수정 완료] 논문에 명시된 결측/불량 피험자(88, 92, 100, 104) 완벽 제외 처리
+    excluded_subjects = [88, 92, 100, 104]
+    target_subjects = [s for s in range(1, 110) if s not in excluded_subjects]
+    
+    logging.info(f"Loading Data and Extracting Features for {len(target_subjects)} subjects...")
     for sub in target_subjects:
         X_base, X_csd, y_raw, ch = load_physionet_dual_runpod(sub)
         if X_base is None: continue
@@ -330,7 +334,6 @@ if __name__ == "__main__":
             all_labels.extend(y_batch.cpu().numpy())
             all_feats.extend(flat_feat.cpu().numpy())
             
-            # 단일 샘플 스파이크 래스터 추출 (시각화용)
             if len(all_preds) == len(y_batch): 
                 sample_spk1 = spk1[0].cpu().numpy()
                 sample_spk3 = spk3[0].cpu().numpy()
@@ -339,7 +342,6 @@ if __name__ == "__main__":
     all_labels = np.array(all_labels)
     all_feats = np.array(all_feats)
     
-    # [핵심] 사후 재생성을 위한 원시 데이터(Raw data) .npz 저장
     npz_path = os.path.join(SAVE_DIR, 'snn_plot_data.npz')
     np.savez_compressed(npz_path, 
                         loss=history['loss'], acc=history['acc'], 
@@ -347,7 +349,6 @@ if __name__ == "__main__":
                         feats=all_feats, spk1=sample_spk1, spk3=sample_spk3)
     logging.info(f"Raw plotting data saved to: {npz_path}")
 
-    # [시각화] 개별 패널 및 6-Panel 통합 피겨 생성
     class_names = ['Left Hand', 'Right Hand', 'Both Hands', 'Feet']
     colors = ['#1f77b4', '#ff7f0e', '#9467bd', '#2ca02c']
     
@@ -420,5 +421,5 @@ if __name__ == "__main__":
     ax7.set_ylabel("Spikes per Timestep")
     save_panel(fig_F, 'Panel_F_Sparsity.png')
     
-    plt.close('all') # 메모리 정리
+    plt.close('all') 
     logging.info("Individual panels and data saved successfully.")

@@ -28,7 +28,6 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 torch.backends.cudnn.benchmark = True 
 
-# 🌟 자신의 환경(RunPod/Colab)에 맞게 경로 수정 필수
 DATA_DIR_PHYSIONET = './raw_data/files' 
 SAVE_DIR = './results_ultimate_geosnn'
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -50,7 +49,6 @@ BATCH_SIZE = 128
 # [2] 전처리: 유클리드 정렬 (EA) & Data Augmentation
 # ==========================================
 def euclidean_alignment(X):
-    """ 피험자별 공분산 행렬의 영점을 맞추는 EA 전처리 (Singular 방지 1e-6) """
     trials, channels, time_pts = X.shape
     X_flat = X.transpose(1, 0, 2).reshape(channels, -1)
     cov = np.cov(X_flat)
@@ -60,7 +58,6 @@ def euclidean_alignment(X):
     return X_aligned_flat.reshape(channels, trials, time_pts).transpose(1, 0, 2)
 
 def augment_with_sliding_window(features, labels, window_size=320, step_size=32):
-    """ 480스텝(3초) 데이터를 320스텝(2초) 창문으로 32스텝(0.2초)씩 밀면서 6배 증강 """
     N, C, T, F = features.shape
     aug_features, aug_labels = [], []
     for start in range(0, T - window_size + 1, step_size):
@@ -138,7 +135,6 @@ def extract_4d_features(X_base, X_csd):
     tang = np.log1p(np.abs(u*vv - v*vu) * 1000.0)
     feat = np.stack([u, v, curv, tang], axis=-1).astype(np.float32)
     
-    # 피험자별 Z-score 정규화
     for i in range(4): 
         f_mean = feat[..., i].mean(axis=(0, 1, 2), keepdims=True)
         f_std = feat[..., i].std(axis=(0, 1, 2), keepdims=True) + 1e-6
@@ -158,9 +154,14 @@ def compute_gcn_laplacian(ch_names):
 # ==========================================
 class FastSigmoid(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, i, alpha=5.0): ctx.save_for_backward(i); ctx.alpha=alpha; return (i>0).float()
+    def forward(ctx, i, alpha=2.0): 
+        ctx.save_for_backward(i)
+        ctx.alpha = alpha
+        return (i > 0).float()
     @staticmethod
-    def backward(ctx, grad): i, = ctx.saved_tensors; return grad/(ctx.alpha*torch.abs(i)+1.0)**2, None
+    def backward(ctx, grad): 
+        i, = ctx.saved_tensors
+        return grad / (ctx.alpha * torch.abs(i) + 1.0)**2, None
 
 class UltimateGeoSNN(nn.Module):
     def __init__(self, num_channels=15, num_classes=4, A_norm=None):
@@ -186,7 +187,8 @@ class UltimateGeoSNN(nn.Module):
         self.dropout = nn.Dropout(p=0.3) 
         self.fc_out = nn.Linear(256 * 10, num_classes)
         
-        self.v_th1, self.v_th2, self.v_th3 = 0.15, 0.3, 0.3
+        # 🌟 원래 의도를 살린 계층적 임계값 세팅 (1:2:2 비율 유지하며 과발화 억제)
+        self.v_th1, self.v_th2, self.v_th3 = 0.3, 0.6, 0.6
         self.tau_base = 35.0
         
         self.g_curv = nn.Parameter(torch.tensor(0.8))
@@ -211,9 +213,7 @@ class UltimateGeoSNN(nn.Module):
             spks1.append(s1)
             
         s1_stack = torch.stack(spks1, dim=2)
-        
         s_spatial = self.bn_spatial(self.spatial_conv(s1_stack))
-        
         c1 = self.bn1(self.conv1(s_spatial)) + self.shortcut1(s_spatial)
         
         v2, spks2 = torch.zeros(b, 128, device=device), []
@@ -239,14 +239,13 @@ class UltimateGeoSNN(nn.Module):
         out = self.pre_fc_bn(self.dp_pool(s3_stack).view(b, -1))
         out = self.dropout(out) 
         
-        # 🌟 디버깅: 훈련 중 5% 확률로 각 레이어의 평균 발화율(Firing Rate) 모니터링
         if self.training and torch.rand(1).item() < 0.05:
             logging.info(f"[SNN Firing Rate Debug] L1: {s1_stack.mean().item():.4f} | L2: {s2_stack.mean().item():.4f} | L3: {s3_stack.mean().item():.4f}")
 
         return self.fc_out(out)
 
 # ==========================================
-# [4] Main Execution: 데이터 로딩, 증강 및 훈련 루프
+# [4] Main Execution
 # ==========================================
 if __name__ == "__main__":
     logging.info(f"🌍 System Ready. Device: {device}")
@@ -284,17 +283,11 @@ if __name__ == "__main__":
     
     model = UltimateGeoSNN(num_channels=15, num_classes=4, A_norm=A_norm_motor).to(device)
     
-    # 🌟 SNN에 맞게 초기 학습률을 0.01에서 0.001로 하향 조정
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     scaler = GradScaler()
     
-    # 🌟 폭주하던 OneCycleLR 대신 얌전한 CosineAnnealingLR 도입
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS,
-        eta_min=1e-5
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
     
     logging.info(f"\n🚀 궁극의 하이브리드 SNN 훈련 시작 (Epochs: {EPOCHS}, Batch: {BATCH_SIZE})")
     best_acc = 0.0
@@ -304,8 +297,6 @@ if __name__ == "__main__":
         start_t = time.time()
         model.train()
         total_loss = 0
-        
-        # 🌟 Train Acc 계산용 변수 추가
         train_correct = 0
         train_total = 0
         
@@ -322,14 +313,12 @@ if __name__ == "__main__":
             scaler.update()
             total_loss += loss.item()
             
-            # 🌟 Train Acc 계산 로직
+            # 🌟 Train Acc 계산
             _, predicted = outputs.max(1)
             train_total += yb.size(0)
             train_correct += predicted.eq(yb).sum().item()
             
         scheduler.step()
-        
-        # 🌟 에포크 종료 후 Train Acc 산출
         train_acc = 100. * train_correct / train_total
         
         model.eval()
@@ -353,12 +342,10 @@ if __name__ == "__main__":
         for i in range(num_original_trials):
             start_idx = i * NUM_WINDOWS_PER_TRIAL
             end_idx = start_idx + NUM_WINDOWS_PER_TRIAL
-            
             window_preds = all_preds[start_idx:end_idx]
             final_pred = np.bincount(window_preds).argmax() 
             
-            if final_pred == all_labels[start_idx]:
-                correct += 1
+            if final_pred == all_labels[start_idx]: correct += 1
             total += 1
                 
         test_acc = 100 * correct / total
@@ -370,8 +357,7 @@ if __name__ == "__main__":
         epoch_time = time.time() - start_t
         curr_lr = scheduler.get_last_lr()[0]
         
-        # 🌟 로그 출력에 Train Acc 추가
+        # 🌟 Train Acc 포함된 깔끔한 로그
         logging.info(f"Epoch [{epoch+1:03d}/{EPOCHS}] Loss: {total_loss/len(train_loader):.4f} | Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Best: {best_acc:.2f}% | LR: {curr_lr:.5f} | Time: {epoch_time:.1f}s")
-        
-    
+
     logging.info(f"\n🎉 훈련 완료! 최종 최고 제로샷 테스트 정확도: {best_acc:.2f}%")

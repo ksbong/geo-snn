@@ -305,6 +305,10 @@ if __name__ == "__main__":
         model.train()
         total_loss = 0
         
+        # 🌟 Train Acc 계산용 변수 추가
+        train_correct = 0
+        train_total = 0
+        
         for xb, yb in train_loader:
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -318,8 +322,15 @@ if __name__ == "__main__":
             scaler.update()
             total_loss += loss.item()
             
-        # 🌟 CosineAnnealingLR은 배치가 아니라 에포크 끝에서 업데이트!
+            # 🌟 Train Acc 계산 로직
+            _, predicted = outputs.max(1)
+            train_total += yb.size(0)
+            train_correct += predicted.eq(yb).sum().item()
+            
         scheduler.step()
+        
+        # 🌟 에포크 종료 후 Train Acc 산출
+        train_acc = 100. * train_correct / train_total
         
         model.eval()
         correct, total = 0, 0
@@ -359,6 +370,8 @@ if __name__ == "__main__":
         epoch_time = time.time() - start_t
         curr_lr = scheduler.get_last_lr()[0]
         
-        logging.info(f"Epoch [{epoch+1:03d}/{EPOCHS}] Loss: {total_loss/len(train_loader):.4f} | Trial Acc: {test_acc:.2f}% | Best: {best_acc:.2f}% | LR: {curr_lr:.5f} | Time: {epoch_time:.1f}s")
-
+        # 🌟 로그 출력에 Train Acc 추가
+        logging.info(f"Epoch [{epoch+1:03d}/{EPOCHS}] Loss: {total_loss/len(train_loader):.4f} | Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Best: {best_acc:.2f}% | LR: {curr_lr:.5f} | Time: {epoch_time:.1f}s")
+        
+    
     logging.info(f"\n🎉 훈련 완료! 최종 최고 제로샷 테스트 정확도: {best_acc:.2f}%")

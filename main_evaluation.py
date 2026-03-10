@@ -277,34 +277,42 @@ if __name__ == "__main__":
 
     logging.info(f"\n⏳ 1. Train Subjects ({len(TRAIN_SUBJECTS)}명) 추출 중...")
     X_train_raw, y_train_raw = get_data_for_subjects(TRAIN_SUBJECTS, "Extract Train")
-    logging.info("💡 Data Augmentation 가동 (Train Set 6배 확장)...")
     X_train, y_train = augment_with_sliding_window(X_train_raw, y_train_raw)
     del X_train_raw, y_train_raw
     
     logging.info(f"\n⏳ 2. Test Subjects ({len(TEST_SUBJECTS)}명) 추출 중...")
     X_test_raw, y_test_raw = get_data_for_subjects(TEST_SUBJECTS, "Extract Test")
-    logging.info("💡 Data Augmentation 가동 (Test Set 평가용 윈도우 세팅)...")
     X_test, y_test = augment_with_sliding_window(X_test_raw, y_test_raw)
     del X_test_raw, y_test_raw
     
     gc.collect()
     
-    logging.info(f"✅ Final Train Shape: {X_train.shape} | Final Test Shape: {X_test.shape}")
-    
     workers = min(4, multiprocessing.cpu_count())
     train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True, num_workers=workers, pin_memory=True)
+    # 테스트는 셔플 끄고 순서대로 받아야 다수결 평가가 가능함
     test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False, num_workers=workers, pin_memory=True)
     
     model = UltimateGeoSNN(num_channels=15, num_classes=4, A_norm=A_norm_motor).to(device)
     
-    # 스케줄러 & 옵티마이저 (L2 정규화 1e-4 복구: 체급이 커졌으므로 과적합 방어)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-4)
     criterion = nn.CrossEntropyLoss()
     scaler = GradScaler()
     
+    # 🌟 대수술: OneCycleLR 스케줄러 도입
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=0.01,
+        steps_per_epoch=len(train_loader),
+        epochs=EPOCHS,
+        pct_start=0.3, # 30% 구간까지 서서히 예열 (Warm-up)
+        anneal_strategy='cos'
+    )
+    
     logging.info(f"\n🚀 궁극의 하이브리드 SNN 훈련 시작 (Epochs: {EPOCHS}, Batch: {BATCH_SIZE})")
     best_acc = 0.0
+    
+    # 윈도우 조각 개수 (480스텝, 320윈도우, 32스트라이드 -> 6개 조각)
+    NUM_WINDOWS_PER_TRIAL = 6 
     
     for epoch in range(EPOCHS):
         start_t = time.time()
@@ -324,20 +332,41 @@ if __name__ == "__main__":
             scaler.update()
             total_loss += loss.item()
             
-        scheduler.step()
+            # OneCycleLR은 매 배치 스텝마다 업데이트!
+            scheduler.step()
         
-        # Test Evaluation (Zero-shot)
+        # 🌟 대수술: Test Evaluation - 엄밀한 Trial-based 다수결(Majority Voting) 평가
         model.eval()
         correct, total = 0, 0
+        all_preds = []
+        all_labels = []
+        
         with torch.no_grad():
             for xb, yb in test_loader:
-                xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+                xb = xb.to(device, non_blocking=True)
                 with autocast():
                     outputs = model(xb)
-                correct += (outputs.argmax(dim=1) == yb).sum().item()
-                total += yb.size(0)
+                all_preds.extend(outputs.argmax(dim=1).cpu().numpy())
+                all_labels.extend(yb.cpu().numpy())
+                
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        
+        num_original_trials = len(all_preds) // NUM_WINDOWS_PER_TRIAL
+        
+        for i in range(num_original_trials):
+            start_idx = i * NUM_WINDOWS_PER_TRIAL
+            end_idx = start_idx + NUM_WINDOWS_PER_TRIAL
+            
+            window_preds = all_preds[start_idx:end_idx]
+            final_pred = np.bincount(window_preds).argmax() # 다수결 투표
+            
+            if final_pred == all_labels[start_idx]:
+                correct += 1
+            total += 1
                 
         test_acc = 100 * correct / total
+        
         if test_acc > best_acc: 
             best_acc = test_acc
             torch.save(model.state_dict(), os.path.join(SAVE_DIR, 'best_ultimate_model.pth'))
@@ -345,6 +374,6 @@ if __name__ == "__main__":
         epoch_time = time.time() - start_t
         curr_lr = scheduler.get_last_lr()[0]
         
-        logging.info(f"Epoch [{epoch+1:03d}/{EPOCHS}] Loss: {total_loss/len(train_loader):.4f} | Test Acc: {test_acc:.2f}% | Best: {best_acc:.2f}% | LR: {curr_lr:.5f} | Time: {epoch_time:.1f}s")
+        logging.info(f"Epoch [{epoch+1:03d}/{EPOCHS}] Loss: {total_loss/len(train_loader):.4f} | Trial Acc: {test_acc:.2f}% | Best: {best_acc:.2f}% | LR: {curr_lr:.5f} | Time: {epoch_time:.1f}s")
 
     logging.info(f"\n🎉 훈련 완료! 최종 최고 제로샷 테스트 정확도: {best_acc:.2f}%")

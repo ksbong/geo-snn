@@ -44,7 +44,6 @@ TRAIN_SUBJECTS = VALID_SUBJECTS[:84]
 TEST_SUBJECTS = VALID_SUBJECTS[84:]
 
 EPOCHS = 200
-# 🌟 데이터가 6배로 뻥튀기 되었으므로 BATCH_SIZE를 128로 늘려 학습 속도 확보
 BATCH_SIZE = 128 
 
 # ==========================================
@@ -61,10 +60,7 @@ def euclidean_alignment(X):
     return X_aligned_flat.reshape(channels, trials, time_pts).transpose(1, 0, 2)
 
 def augment_with_sliding_window(features, labels, window_size=320, step_size=32):
-    """
-    480스텝(3초) 데이터를 320스텝(2초) 창문으로 32스텝(0.2초)씩 밀면서 6배 증강
-    
-    """
+    """ 480스텝(3초) 데이터를 320스텝(2초) 창문으로 32스텝(0.2초)씩 밀면서 6배 증강 """
     N, C, T, F = features.shape
     aug_features, aug_labels = [], []
     for start in range(0, T - window_size + 1, step_size):
@@ -79,7 +75,6 @@ def load_local_runs(subject, run_list):
     for run in run_list:
         file_path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf")
         if not os.path.exists(file_path): 
-            # 소문자 이름 시도
             file_path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"s{subject:03d}r{run:02d}.edf")
             if not os.path.exists(file_path): return None
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
@@ -170,35 +165,30 @@ class FastSigmoid(torch.autograd.Function):
 class UltimateGeoSNN(nn.Module):
     def __init__(self, num_channels=15, num_classes=4, A_norm=None):
         super().__init__()
-        # 1. Physical Graph (A_norm)
         self.A_norm = nn.Parameter(A_norm, requires_grad=False)
         self.W_u = nn.Linear(num_channels, num_channels)
         self.W_v = nn.Linear(num_channels, num_channels)
         self.bn_inj = nn.BatchNorm1d(num_channels)
         
-        # 🌟 2. Functional Spatial Filter (Learnable)
         self.spatial_conv = nn.Conv1d(in_channels=num_channels, out_channels=32, kernel_size=1)
         self.bn_spatial = nn.BatchNorm1d(32)
         
-        # 3. Temporal Filter & Spike Preservation (1x1 Shortcut)
         self.conv1 = nn.Conv1d(32, 128, kernel_size=15, padding=7)
         self.bn1 = nn.BatchNorm1d(128)
-        self.shortcut1 = nn.Conv1d(32, 128, kernel_size=1) # 스파이크 소실 방지
+        self.shortcut1 = nn.Conv1d(32, 128, kernel_size=1) 
         
         self.conv2 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
         self.bn2 = nn.BatchNorm1d(256)
-        self.shortcut2 = nn.Conv1d(128, 256, kernel_size=1) # 스파이크 소실 방지
+        self.shortcut2 = nn.Conv1d(128, 256, kernel_size=1) 
         
         self.dp_pool = nn.AvgPool1d(32, 32)
-        # 윈도우 증강으로 인해 time=320 -> pool=10
         self.pre_fc_bn = nn.BatchNorm1d(256 * 10)
-        self.dropout = nn.Dropout(p=0.3) # 체급업으로 인한 과적합 억제 (0.2->0.3)
+        self.dropout = nn.Dropout(p=0.3) 
         self.fc_out = nn.Linear(256 * 10, num_classes)
         
         self.v_th1, self.v_th2, self.v_th3 = 0.15, 0.3, 0.3
         self.tau_base = 35.0
         
-        # Learnable Gamma
         self.g_curv = nn.Parameter(torch.tensor(0.8))
         self.g_tang = nn.Parameter(torch.tensor(0.4))
         self.w_v2 = nn.Parameter(torch.tensor(0.0)) 
@@ -208,7 +198,6 @@ class UltimateGeoSNN(nn.Module):
         b, c, t, _ = x.shape
         device = x.device
         
-        # [Phase 1: Physical Geometry Injection]
         v1 = torch.zeros(b, c, device=device)
         spks1 = []
         for step in range(t):
@@ -221,13 +210,10 @@ class UltimateGeoSNN(nn.Module):
             v1 -= s1 * self.v_th1
             spks1.append(s1)
             
-        s1 = torch.stack(spks1, dim=2) # (Batch, 15, Time)
+        s1_stack = torch.stack(spks1, dim=2)
         
-        # [Phase 2: Functional Spatial Filtering]
-        # 피험자별 15개 채널의 미세 오차를 32개의 최적 조합으로 학습
-        s_spatial = self.bn_spatial(self.spatial_conv(s1))
+        s_spatial = self.bn_spatial(self.spatial_conv(s1_stack))
         
-        # [Phase 3: Temporal Spiking with Residuals]
         c1 = self.bn1(self.conv1(s_spatial)) + self.shortcut1(s_spatial)
         
         v2, spks2 = torch.zeros(b, 128, device=device), []
@@ -238,8 +224,8 @@ class UltimateGeoSNN(nn.Module):
             v2 -= s2 * self.v_th2
             spks2.append(s2)
             
-        s2 = torch.stack(spks2, dim=2)
-        c2 = self.bn2(self.conv2(s2)) + self.shortcut2(s2)
+        s2_stack = torch.stack(spks2, dim=2)
+        c2 = self.bn2(self.conv2(s2_stack)) + self.shortcut2(s2_stack)
         
         v3, spks3 = torch.zeros(b, 256, device=device), []
         decay3 = torch.sigmoid(self.w_v3)
@@ -249,8 +235,14 @@ class UltimateGeoSNN(nn.Module):
             v3 -= s3 * self.v_th3
             spks3.append(s3)
             
-        out = self.pre_fc_bn(self.dp_pool(torch.stack(spks3, dim=2)).view(b, -1))
+        s3_stack = torch.stack(spks3, dim=2)
+        out = self.pre_fc_bn(self.dp_pool(s3_stack).view(b, -1))
         out = self.dropout(out) 
+        
+        # 🌟 디버깅: 훈련 중 5% 확률로 각 레이어의 평균 발화율(Firing Rate) 모니터링
+        if self.training and torch.rand(1).item() < 0.05:
+            logging.info(f"[SNN Firing Rate Debug] L1: {s1_stack.mean().item():.4f} | L2: {s2_stack.mean().item():.4f} | L3: {s3_stack.mean().item():.4f}")
+
         return self.fc_out(out)
 
 # ==========================================
@@ -259,7 +251,6 @@ class UltimateGeoSNN(nn.Module):
 if __name__ == "__main__":
     logging.info(f"🌍 System Ready. Device: {device}")
     
-    # 채널 맵핑 (15채널 Motor-Only)
     _, _, _, sample_ch = load_and_align_subject_data(1)
     target_motor_chs = ['FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'C3', 'C1', 'CZ', 'C2', 'C4', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4']
     motor_indices = [i for i, ch in enumerate(sample_ch) if ch.upper() in target_motor_chs]
@@ -289,29 +280,24 @@ if __name__ == "__main__":
     
     workers = min(4, multiprocessing.cpu_count())
     train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True, num_workers=workers, pin_memory=True)
-    # 테스트는 셔플 끄고 순서대로 받아야 다수결 평가가 가능함
     test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False, num_workers=workers, pin_memory=True)
     
     model = UltimateGeoSNN(num_channels=15, num_classes=4, A_norm=A_norm_motor).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-4)
+    # 🌟 SNN에 맞게 초기 학습률을 0.01에서 0.001로 하향 조정
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     scaler = GradScaler()
     
-    # 🌟 대수술: OneCycleLR 스케줄러 도입
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    # 🌟 폭주하던 OneCycleLR 대신 얌전한 CosineAnnealingLR 도입
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        max_lr=0.01,
-        steps_per_epoch=len(train_loader),
-        epochs=EPOCHS,
-        pct_start=0.3, # 30% 구간까지 서서히 예열 (Warm-up)
-        anneal_strategy='cos'
+        T_max=EPOCHS,
+        eta_min=1e-5
     )
     
     logging.info(f"\n🚀 궁극의 하이브리드 SNN 훈련 시작 (Epochs: {EPOCHS}, Batch: {BATCH_SIZE})")
     best_acc = 0.0
-    
-    # 윈도우 조각 개수 (480스텝, 320윈도우, 32스트라이드 -> 6개 조각)
     NUM_WINDOWS_PER_TRIAL = 6 
     
     for epoch in range(EPOCHS):
@@ -332,10 +318,9 @@ if __name__ == "__main__":
             scaler.update()
             total_loss += loss.item()
             
-            # OneCycleLR은 매 배치 스텝마다 업데이트!
-            scheduler.step()
+        # 🌟 CosineAnnealingLR은 배치가 아니라 에포크 끝에서 업데이트!
+        scheduler.step()
         
-        # 🌟 대수술: Test Evaluation - 엄밀한 Trial-based 다수결(Majority Voting) 평가
         model.eval()
         correct, total = 0, 0
         all_preds = []
@@ -359,7 +344,7 @@ if __name__ == "__main__":
             end_idx = start_idx + NUM_WINDOWS_PER_TRIAL
             
             window_preds = all_preds[start_idx:end_idx]
-            final_pred = np.bincount(window_preds).argmax() # 다수결 투표
+            final_pred = np.bincount(window_preds).argmax() 
             
             if final_pred == all_labels[start_idx]:
                 correct += 1

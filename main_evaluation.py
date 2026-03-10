@@ -188,7 +188,7 @@ class UltimateGeoSNN(nn.Module):
         self.fc_out = nn.Linear(256 * 10, num_classes)
         
         # 🌟 원래 의도를 살린 계층적 임계값 세팅 (1:2:2 비율 유지하며 과발화 억제)
-        self.v_th1, self.v_th2, self.v_th3 = 3.0, 0.5, 0.2
+        self.v_th1, self.v_th2, self.v_th3 = 3.0, 2.0, 1.5
         self.tau_base = 35.0
         
         self.g_curv = nn.Parameter(torch.tensor(0.8))

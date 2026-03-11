@@ -17,9 +17,6 @@ mne.set_log_level('ERROR')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
-# =========================================================
-# [1] 절대 뇌사하지 않는 Robust SNN 모델
-# =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
@@ -65,9 +62,6 @@ class RobustGeoSNN(nn.Module):
         out = self.classifier(fused_features)
         return out, spike_counts
 
-# =========================================================
-# [2] 병렬 데이터 엔진 (결측치 방어 및 인덱싱 버그 완벽 수정)
-# =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
     paths = [os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf"),
@@ -82,7 +76,9 @@ def process_single_subject(sub):
             raws = [mne.io.read_raw_edf(get_local_file_path(sub, r), preload=True, verbose=False) for r in runs if get_local_file_path(sub, r)]
             if not raws: return None
             raw = mne.concatenate_raws(raws); raw.filter(8., 30., verbose=False)
-            raw.rename_channels(lambda x: x.strip('.').upper().replace('Z', 'z'))
+            
+            # [결자해지] 회원님의 오리지널 코드로 복원 (대문자 강제 변환 삭제)
+            mne.datasets.eegbci.standardize(raw)
             raw.set_montage('standard_1005', on_missing='ignore')
             return raw
 
@@ -96,8 +92,9 @@ def process_single_subject(sub):
             t1 = next((v for k, v in ev_id.items() if 'T1' in k), None)
             t2 = next((v for k, v in ev_id.items() if 'T2' in k), None)
             ep = mne.Epochs(raw, evs, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
-            try: csd = mne.preprocessing.compute_current_source_density(raw.copy(), sphere=(0,0,0,0.095))
-            except: csd = raw.copy()
+            
+            # [결자해지] 이제 몽타주가 정상이므로 CSD가 절대 에러를 뿜지 않음
+            csd = mne.preprocessing.compute_current_source_density(raw.copy(), sphere=(0,0,0,0.095))
             ep_c = mne.Epochs(csd, evs, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
             return ep.get_data(), ep_c.get_data(), ep.events[:, 2], t0, t1, t2, ep.ch_names
 
@@ -112,11 +109,9 @@ def process_single_subject(sub):
         
         idx_lh, idx_rh, idx_ft = idx_lh[:min_trials], idx_rh[:min_trials], idx_ft[:min_trials]
         
-        # [핵심 수정 1] 데이터 혼선 방지 완벽 슬라이싱
         d_lh, c_lh = d_lr[idx_lh], c_lr[idx_lh]
         d_rh, c_rh = d_lr[idx_rh], c_lr[idx_rh]
         d_ft, c_ft = d_f[idx_ft], c_f[idx_ft]
-        
         d_rest = np.concatenate([d_lr[idx_rest_lr], d_f[idx_rest_f]])[:min_trials]
         c_rest = np.concatenate([c_lr[idx_rest_lr], c_f[idx_rest_f]])[:min_trials]
         
@@ -137,8 +132,6 @@ def process_single_subject(sub):
         curvature = np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10)
         
         geo_energy = (areal_vel * curvature)[:, :, 80:400] 
-        
-        # [핵심 수정 2] CSD에서 발생한 NaN 폭탄을 0으로 소독하여 임계값 파괴 원천 차단
         geo_energy = np.nan_to_num(geo_energy, nan=0.0, posinf=0.0, neginf=0.0)
         
         th_geo = np.percentile(geo_energy, 85)
@@ -166,7 +159,7 @@ def process_single_subject(sub):
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 버그 완전 박멸. {num_workers}개 코어 병렬 전처리 시작...")
+    print(f"🔥 오리지널 몽타주 복원 완료. {num_workers}개 코어 병렬 전처리 시작...")
     
     results = []
     with Pool(num_workers) as p:
@@ -180,12 +173,9 @@ def get_full_data_parallel(subjects):
     Xt = np.concatenate([r[1] for r in results])
     y = np.concatenate([r[2] for r in results])
     print(f"📊 최종 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
-    print(f"🔍 입력 스파이크 희소성(Sparsity): {Xk.mean():.4f} (약 0.15 정상)")
+    print(f"🔍 입력 스파이크 희소성(Sparsity): {Xk.mean():.4f} (약 0.15 정상 복원)")
     return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long)
 
-# =========================================================
-# [3] 메인 학습 루프
-# =========================================================
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
     Xk, Xt, y = get_full_data_parallel(VALID_SUBS)
@@ -200,7 +190,7 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 SNN 절대 뇌사 불가 모드로 학습 개시 (샘플 수: {len(y)})")
+    print(f"\n🚀 결자해지: 스파이크 활성화 모드로 학습 개시 (샘플 수: {len(y)})")
     best_acc = 0.0
     
     for epoch in range(1, 101):

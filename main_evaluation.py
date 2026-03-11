@@ -34,43 +34,41 @@ class SurrogateSpike(torch.autograd.Function):
 spike_fn = SurrogateSpike.apply
 
 class PhysioNetGeoLIF_4Class(nn.Module):
-    # [수정 1] leak을 0.99로 올려서 네 희소한 스파이크 전압이 안 새어나가게 꽉 잡음
-    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.99, base_thresh=0.2):
+    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4):
         super().__init__()
-        self.leak = leak
-        self.base_thresh = base_thresh
         
-        self.spatial_conv1x1 = nn.Linear(num_eeg_channels, hidden_dim, bias=False)
+        # 1. 공간 차원 융합
+        self.spatial_fc = nn.Linear(num_eeg_channels, hidden_dim, bias=False)
         
-        # [수정 2] 만악의 근원이었던 BatchNorm1d 삭제!!!
-        # [수정 3] 가중치를 강제로 양수(0.1 ~ 0.5)로 초기화해서 무조건 전압이 오르도록 강제
-        nn.init.uniform_(self.spatial_conv1x1.weight, 0.1, 0.5)
+        # 2. TDA를 임계값 조작이 아닌 '어텐션 모듈'로 안전하게 활용
+        self.tda_attention = nn.Linear(150, hidden_dim)
         
-        self.readout = nn.Linear(hidden_dim, num_classes) 
-        self.tda_to_thresh = nn.Linear(150, hidden_dim) 
+        # 3. Readout (출력층)
+        self.readout = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
         
-        # BN 없이 순수하게 네 스파이크 신호만 은닉층으로 투영
-        x_proj = self.spatial_conv1x1(kin_spikes_seq) 
+        # 음수 가중치로 인해 전압이 깎이는 걸 방지하기 위해 ReLU 적용 (오직 양의 전류만 주입)
+        x_proj = torch.relu(self.spatial_fc(kin_spikes_seq)) 
         
         mem = torch.zeros(B, 64, device=kin_spikes_seq.device)
         spike_sum = torch.zeros(B, 64, device=kin_spikes_seq.device)
         
-        # [수정 4] TDA가 임계값을 올리기만 하는 게 아니라, 낮출(-0.2) 수도 있게 변경
-        tda_mod = (torch.sigmoid(self.tda_to_thresh(tda_features)) - 0.5) * 0.4
-        dynamic_thresh = self.base_thresh + tda_mod 
-        
+        # [핵심] Leak 삭제 (순수 Integrate-and-Fire). 네 희소한 스파이크를 무조건 누적시킴
         for t in range(T):
-            mem = self.leak * mem + x_proj[:, t, :]
-            spk = spike_fn(mem - dynamic_thresh)
-            mem = mem * (1.0 - spk) 
-            spike_sum += spk 
+            mem = mem + x_proj[:, t, :] # leak 곱하는 부분 완전히 제거
+            spk = spike_fn(mem - 1.0)   # 고정 임계값 1.0 (안전한 스파이킹)
+            mem = mem * (1.0 - spk)     # 발화 시 리셋
+            spike_sum += spk
             
-        out = self.readout(spike_sum) 
+        # [핵심] 위상수학(TDA) 특징을 64개 은닉 뉴런의 활성도를 조절하는 가중치(Attention)로 사용
+        tda_weight = torch.sigmoid(self.tda_attention(tda_features)) # [B, 64]
+        modulated_spikes = spike_sum * tda_weight # TDA 공간 정보를 스파이크 빈도에 결합
+        
+        out = self.readout(modulated_spikes)
         return out, spike_sum
-
+    
 # =========================================================
 # [2] 병렬 데이터 엔진 (TDA 차원 수정 및 네 원본 기하학 수식 유지)
 # =========================================================

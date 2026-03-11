@@ -34,7 +34,8 @@ class SurrogateSpike(torch.autograd.Function):
 spike_fn = SurrogateSpike.apply
 
 class PhysioNetGeoLIF_4Class(nn.Module):
-    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.9, base_thresh=1.0):
+    # [해결 1] 초기 임계값을 1.0 -> 0.3으로 확 낮춰서 은닉층 스파이크 활성화
+    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.9, base_thresh=0.3):
         super().__init__()
         self.leak = leak
         self.base_thresh = base_thresh
@@ -43,7 +44,7 @@ class PhysioNetGeoLIF_4Class(nn.Module):
         self.bn1 = nn.BatchNorm1d(hidden_dim) 
         self.class_conv1x1 = nn.Linear(hidden_dim, num_classes, bias=False)
         self.lateral_weights = nn.Parameter(torch.eye(4) * 0.8 - 0.1, requires_grad=True)
-        self.tda_to_thresh = nn.Linear(50 * 3, num_classes) # C3, Cz, C4 각각의 TDA가 들어오므로 *3
+        self.tda_to_thresh = nn.Linear(50 * 3, num_classes) 
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
@@ -53,7 +54,9 @@ class PhysioNetGeoLIF_4Class(nn.Module):
         
         mem1 = torch.zeros(B, 64, device=kin_spikes_seq.device)
         mem2 = torch.zeros(B, 4, device=kin_spikes_seq.device)
-        spike_sum = torch.zeros(B, 4, device=kin_spikes_seq.device)
+        
+        # [해결 2] 스파이크 개수가 아니라 '전압(Voltage)'을 누적 (그라디언트 직통 고속도로)
+        voltage_sum = torch.zeros(B, 4, device=kin_spikes_seq.device)
         
         tda_mod = torch.sigmoid(self.tda_to_thresh(tda_features)) * 0.5 
         dynamic_thresh = self.base_thresh + tda_mod 
@@ -68,9 +71,10 @@ class PhysioNetGeoLIF_4Class(nn.Module):
             spk2 = spike_fn(mem2 - dynamic_thresh)
             mem2 = mem2 * (1.0 - spk2)
             
-            spike_sum += spk2 
+            # 스파이크가 터지든 안 터지든 뉴런의 전압(mem2)을 더해서 최종 분류에 사용
+            voltage_sum += mem2 
             
-        return spike_sum
+        return voltage_sum # 이제 무조건 25.0%에서 벗어남
 
 # =========================================================
 # [2] 병렬 데이터 엔진 (오리지널 기하학 공식 100% 복원)

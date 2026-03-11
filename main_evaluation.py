@@ -35,51 +35,38 @@ spike_fn = SurrogateSpike.apply
 class RobustGeoSNN(nn.Module):
     def __init__(self, num_eeg_channels=64, hidden_dim=128, num_classes=4):
         super().__init__()
-        
-        # 스파이크 인코딩 층
         self.spike_fc = nn.Linear(num_eeg_channels, hidden_dim)
-        nn.init.uniform_(self.spike_fc.weight, 0.1, 0.3) # 초기 양수 세팅
+        nn.init.uniform_(self.spike_fc.weight, 0.1, 0.3) 
         if self.spike_fc.bias is not None:
             nn.init.zeros_(self.spike_fc.bias)
             
-        # TDA 독립 처리 층 (150차원 -> 64차원)
         self.tda_net = nn.Sequential(
             nn.Linear(150, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU()
         )
-        
-        # 앙상블 분류기 (SNN 128 + TDA 64 = 192)
         self.classifier = nn.Linear(hidden_dim + 64, num_classes)
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
-        
         mem = torch.zeros(B, 128, device=kin_spikes_seq.device)
         spike_counts = torch.zeros(B, 128, device=kin_spikes_seq.device)
         
         for t in range(T):
-            # [핵심 1] 옵티마이저가 가중치를 음수로 밀어도 무조건 양수로 강제 변환
-            # 네 15% 희소 피처가 들어오면 무조건 전압이 오를 수밖에 없음
             current = torch.relu(self.spike_fc(kin_spikes_seq[:, t, :])) 
-            
-            # [핵심 2] 누수(Leak) 삭제. 시간 지나도 전압 안 깎임 (순수 누적)
             mem = mem + current 
-            spk = spike_fn(mem - 0.5) # 고정 임계값 0.5
-            mem = mem * (1.0 - spk)   # 터지면 리셋
+            spk = spike_fn(mem - 0.5) 
+            mem = mem * (1.0 - spk)   
             spike_counts += spk
             
         tda_out = self.tda_net(tda_features)
-        
-        # SNN 스파이크 빈도수와 TDA 공간 특징을 안전하게 병합
         fused_features = torch.cat([spike_counts, tda_out], dim=1) 
         out = self.classifier(fused_features)
-        
         return out, spike_counts
 
 # =========================================================
-# [2] 병렬 데이터 엔진 (네 오리지널 수식 100% 보존)
+# [2] 병렬 데이터 엔진 (결측치 방어 및 인덱싱 버그 완벽 수정)
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
@@ -124,10 +111,17 @@ def process_single_subject(sub):
         if min_trials == 0: return None
         
         idx_lh, idx_rh, idx_ft = idx_lh[:min_trials], idx_rh[:min_trials], idx_ft[:min_trials]
-        idx_rest = np.concatenate([idx_rest_lr, idx_rest_f + len(y_lr)])[:min_trials]
         
-        xb = np.concatenate([np.concatenate([d_lr, d_f])[idx_lh], np.concatenate([d_lr, d_f])[idx_rh], np.concatenate([d_lr, d_f])[idx_ft], np.concatenate([d_lr, d_f])[idx_rest]])
-        xc = np.concatenate([np.concatenate([c_lr, c_f])[idx_lh], np.concatenate([c_lr, c_f])[idx_rh], np.concatenate([c_lr, c_f])[idx_ft], np.concatenate([c_lr, c_f])[idx_rest]])
+        # [핵심 수정 1] 데이터 혼선 방지 완벽 슬라이싱
+        d_lh, c_lh = d_lr[idx_lh], c_lr[idx_lh]
+        d_rh, c_rh = d_lr[idx_rh], c_lr[idx_rh]
+        d_ft, c_ft = d_f[idx_ft], c_f[idx_ft]
+        
+        d_rest = np.concatenate([d_lr[idx_rest_lr], d_f[idx_rest_f]])[:min_trials]
+        c_rest = np.concatenate([c_lr[idx_rest_lr], c_f[idx_rest_f]])[:min_trials]
+        
+        xb = np.concatenate([d_lh, d_rh, d_ft, d_rest])
+        xc = np.concatenate([c_lh, c_rh, c_ft, c_rest])
         y = np.concatenate([np.zeros(min_trials), np.ones(min_trials), np.full(min_trials, 2), np.full(min_trials, 3)])
 
         win = 51
@@ -143,6 +137,10 @@ def process_single_subject(sub):
         curvature = np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10)
         
         geo_energy = (areal_vel * curvature)[:, :, 80:400] 
+        
+        # [핵심 수정 2] CSD에서 발생한 NaN 폭탄을 0으로 소독하여 임계값 파괴 원천 차단
+        geo_energy = np.nan_to_num(geo_energy, nan=0.0, posinf=0.0, neginf=0.0)
+        
         th_geo = np.percentile(geo_energy, 85)
         kin_spikes = (geo_energy > th_geo).astype(np.float32).transpose(0, 2, 1) 
         
@@ -168,7 +166,7 @@ def process_single_subject(sub):
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 오리지널 데이터 추출. {num_workers}개 코어 병렬 전처리 시작...")
+    print(f"🔥 버그 완전 박멸. {num_workers}개 코어 병렬 전처리 시작...")
     
     results = []
     with Pool(num_workers) as p:
@@ -186,7 +184,7 @@ def get_full_data_parallel(subjects):
     return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long)
 
 # =========================================================
-# [3] 메인 학습 루프 (라인 바이 라인 투명 로깅)
+# [3] 메인 학습 루프
 # =========================================================
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
@@ -231,7 +229,7 @@ if __name__ == "__main__":
         
         pred_unique, pred_counts = np.unique(all_preds, return_counts=True)
         pred_dist = {int(k): int(v) for k, v in zip(pred_unique, pred_counts)}
-        avg_spikes = total_spikes / (tr_t * 128) # 128개 은닉 뉴런의 샘플당 평균 발화 수
+        avg_spikes = total_spikes / (tr_t * 128) 
         
         model.eval()
         ts_c, ts_t = 0, 0

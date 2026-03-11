@@ -148,19 +148,20 @@ def process_single_subject(sub):
         idx_c = [ch_upper.index(n) for n in ['C3', 'CZ', 'C4'] if n in ch_upper]
         if len(idx_c) < 3: return None
         
-        VR = VietorisRipsPersistence(homology_dimensions=[0, 1], n_jobs=1)
+        # [수정] 네 원본 의도대로 1차원(구멍)만 추출하도록 [1]로 변경
+        VR = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1)
         PL = PersistenceLandscape(n_bins=50)
         
         tda_landscapes = []
         for ch_idx in idx_c:
-            # 6차원이 아니라 2차원(u, v)으로 각 채널별 독립적인 궤적(Point Cloud) 생성
-            pt_cloud = np.stack([u[:, ch_idx, 80:400], v[:, ch_idx, 80:400]], axis=-1) # (Trials, Time, 2)
+            pt_cloud = np.stack([u[:, ch_idx, 80:400], v[:, ch_idx, 80:400]], axis=-1) 
             diagrams = VR.fit_transform(pt_cloud)
-            landscapes = PL.fit_transform(diagrams) # (Trials, 50)
+            # [수정] 3D 텐서를 (Trials, 50) 2D로 확실하게 쫙 펴줌
+            landscapes = PL.fit_transform(diagrams).reshape(len(y), -1) 
             tda_landscapes.append(landscapes)
             
-        # 3개 채널의 Landscape를 가로로 이어 붙임 (Trials, 150)
-        tda_final = np.concatenate(tda_landscapes, axis=1).astype(np.float32)
+        # 3개 채널 × 50빈 = (Trials, 150)으로 완벽 결합
+        tda_final = np.concatenate(tda_landscapes, axis=1).astype(np.float32) 
 
         return kin_spikes, tda_final, y
     except Exception as e: 

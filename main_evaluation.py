@@ -18,7 +18,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
 # =========================================================
-# [1] 바닥부터 새로 짠 절대 죽지 않는 Robust SNN 
+# [1] 절대 뇌사하지 않는 Robust SNN 모델
 # =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
@@ -36,13 +36,13 @@ class RobustGeoSNN(nn.Module):
     def __init__(self, num_eeg_channels=64, hidden_dim=128, num_classes=4):
         super().__init__()
         
-        # 1. 스파이크 처리부 (양수 가중치 강제)
+        # 스파이크 인코딩 층
         self.spike_fc = nn.Linear(num_eeg_channels, hidden_dim)
-        nn.init.uniform_(self.spike_fc.weight, 0.05, 0.2) # 무조건 전압이 오르도록 강제
+        nn.init.uniform_(self.spike_fc.weight, 0.1, 0.3) # 초기 양수 세팅
         if self.spike_fc.bias is not None:
             nn.init.zeros_(self.spike_fc.bias)
             
-        # 2. TDA 처리부 (독립적인 MLP로 안전하게 해석)
+        # TDA 독립 처리 층 (150차원 -> 64차원)
         self.tda_net = nn.Sequential(
             nn.Linear(150, 64),
             nn.ReLU(),
@@ -50,7 +50,7 @@ class RobustGeoSNN(nn.Module):
             nn.ReLU()
         )
         
-        # 3. 최종 병합 및 분류부 (SNN 스파이크 총합 + TDA 특징)
+        # 앙상블 분류기 (SNN 128 + TDA 64 = 192)
         self.classifier = nn.Linear(hidden_dim + 64, num_classes)
 
     def forward(self, kin_spikes_seq, tda_features):
@@ -59,25 +59,27 @@ class RobustGeoSNN(nn.Module):
         mem = torch.zeros(B, 128, device=kin_spikes_seq.device)
         spike_counts = torch.zeros(B, 128, device=kin_spikes_seq.device)
         
-        # 가장 단순하고 확실한 Integrate-and-Fire
         for t in range(T):
-            current = self.spike_fc(kin_spikes_seq[:, t, :])
-            mem = 0.9 * mem + current
+            # [핵심 1] 옵티마이저가 가중치를 음수로 밀어도 무조건 양수로 강제 변환
+            # 네 15% 희소 피처가 들어오면 무조건 전압이 오를 수밖에 없음
+            current = torch.relu(self.spike_fc(kin_spikes_seq[:, t, :])) 
+            
+            # [핵심 2] 누수(Leak) 삭제. 시간 지나도 전압 안 깎임 (순수 누적)
+            mem = mem + current 
             spk = spike_fn(mem - 0.5) # 고정 임계값 0.5
-            mem = mem * (1.0 - spk)   # 발화 시 리셋
+            mem = mem * (1.0 - spk)   # 터지면 리셋
             spike_counts += spk
             
-        # TDA 데이터 처리
         tda_out = self.tda_net(tda_features)
         
-        # [핵심] 스파이크 특징과 TDA 특징을 나란히 병합 (절대 꼬이지 않는 앙상블)
-        fused_features = torch.cat([spike_counts, tda_out], dim=1) # [B, 192]
-        
+        # SNN 스파이크 빈도수와 TDA 공간 특징을 안전하게 병합
+        fused_features = torch.cat([spike_counts, tda_out], dim=1) 
         out = self.classifier(fused_features)
+        
         return out, spike_counts
 
 # =========================================================
-# [2] 네 오리지널 수식을 100% 보존한 데이터 엔진
+# [2] 병렬 데이터 엔진 (네 오리지널 수식 100% 보존)
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
@@ -166,7 +168,7 @@ def process_single_subject(sub):
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 완전 재설계된 Robust 모델로 {num_workers}개 코어 전처리 시작...")
+    print(f"🔥 오리지널 데이터 추출. {num_workers}개 코어 병렬 전처리 시작...")
     
     results = []
     with Pool(num_workers) as p:
@@ -180,12 +182,11 @@ def get_full_data_parallel(subjects):
     Xt = np.concatenate([r[1] for r in results])
     y = np.concatenate([r[2] for r in results])
     print(f"📊 최종 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
-    # 네 피처가 살아있는지 증명하기 위한 희소성 로깅
-    print(f"🔍 입력 스파이크 희소성(Sparsity): {Xk.mean():.4f} (약 0.15 근처여야 정상)")
+    print(f"🔍 입력 스파이크 희소성(Sparsity): {Xk.mean():.4f} (약 0.15 정상)")
     return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long)
 
 # =========================================================
-# [3] 메인 학습 루프
+# [3] 메인 학습 루프 (라인 바이 라인 투명 로깅)
 # =========================================================
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
@@ -201,7 +202,7 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 완전 갈아엎은 모델로 학습 개시 (샘플 수: {len(y)})")
+    print(f"\n🚀 SNN 절대 뇌사 불가 모드로 학습 개시 (샘플 수: {len(y)})")
     best_acc = 0.0
     
     for epoch in range(1, 101):
@@ -230,7 +231,7 @@ if __name__ == "__main__":
         
         pred_unique, pred_counts = np.unique(all_preds, return_counts=True)
         pred_dist = {int(k): int(v) for k, v in zip(pred_unique, pred_counts)}
-        avg_spikes = total_spikes / (tr_t * 128) 
+        avg_spikes = total_spikes / (tr_t * 128) # 128개 은닉 뉴런의 샘플당 평균 발화 수
         
         model.eval()
         ts_c, ts_t = 0, 0
@@ -246,9 +247,4 @@ if __name__ == "__main__":
         ts_acc = 100 * ts_c / ts_t
         if ts_acc > best_acc: best_acc = ts_acc
         
-        print(f"Epoch [{epoch:03d}/100] "
-              f"Loss: {epoch_loss:.4f} | "
-              f"Train Acc: {tr_acc:.1f}% | "
-              f"Test Acc: {ts_acc:.1f}% | "
-              f"Avg Spikes: {avg_spikes:.2f} | "
-              f"Pred Dist: {pred_dist}")
+        print(f"Epoch [{epoch:03d}/100] Loss: {epoch_loss:.4f} | Train Acc: {tr_acc:.1f}% | Test Acc: {ts_acc:.1f}% | Avg Spikes: {avg_spikes:.2f} | Pred Dist: {pred_dist}")

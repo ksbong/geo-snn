@@ -33,8 +33,6 @@ class RobustGeoSNN(nn.Module):
     def __init__(self, num_eeg_channels=64, hidden_dim=128, num_classes=4):
         super().__init__()
         self.spike_fc = nn.Linear(num_eeg_channels, hidden_dim)
-        # 억지로 양수 강제하던 거 버림. 
-        # 대신 초기값을 살짝만 높여서 초반 뇌사 방지 + 음수(억제) 허용
         nn.init.normal_(self.spike_fc.weight, mean=0.02, std=0.1) 
         if self.spike_fc.bias is not None:
             nn.init.zeros_(self.spike_fc.bias)
@@ -45,7 +43,16 @@ class RobustGeoSNN(nn.Module):
             nn.Linear(64, 64),
             nn.ReLU()
         )
-        self.classifier = nn.Linear(hidden_dim + 64, num_classes)
+        
+        # [핵심 수정] 멍청한 단일 Linear 층을 딥 MLP로 변경하고 과적합 방지용 Dropout(0.5) 추가
+        # 스파이크 빈도수와 TDA 특징을 더 깊게 융합(Fusion)시킴
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim + 64, 128),
+            nn.BatchNorm1d(128), # 여기 BN은 시간축이 아니라 출력층이라서 안전하고 학습 속도 올려줌
+            nn.ReLU(),
+            nn.Dropout(0.5),     # 뉴런 절반을 무작위로 꺼서 암기(Overfitting) 방지
+            nn.Linear(128, num_classes)
+        )
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
@@ -54,21 +61,14 @@ class RobustGeoSNN(nn.Module):
         
         for t in range(T):
             current = self.spike_fc(kin_spikes_seq[:, t, :]) 
-            
-            # [수정 1] Leaky Integrate-and-Fire 복구 (0.9 곱하기)
-            # 전압이 계속 쌓여서 발작하는 걸 막고, 의미 있는 연속 스파이크만 통과시킴
             mem = 0.9 * mem + current 
-            spk = spike_fn(mem - 1.0) # 정상 임계값 1.0 복구
+            spk = spike_fn(mem - 1.0) 
             mem = mem * (1.0 - spk)   
             spike_counts += spk
             
-        # [수정 2] 스파이크 총합(예: 250)을 T(320)로 나눠서 '발화율(0~1)'로 정규화
-        # 이게 Loss 폭발(51.4)을 막고 정상적으로 학습하게 만드는 SNN 핵심 룰
         firing_rate = spike_counts / T
-        
         tda_out = self.tda_net(tda_features)
         
-        # 250 같은 생짜 숫자가 아니라, 0~1 사이로 안정화된 발화율을 TDA와 병합
         fused_features = torch.cat([firing_rate, tda_out], dim=1) 
         out = self.classifier(fused_features)
         
@@ -198,7 +198,8 @@ if __name__ == "__main__":
     test_loader = DataLoader(TensorDataset(Xk_ts, Xt_ts, y_ts), batch_size=128, shuffle=False)
 
     model = RobustGeoSNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-4) 
+    # optimizer = optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-4) 
+    optimizer = optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 

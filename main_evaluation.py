@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +10,6 @@ import mne
 from scipy.signal import hilbert, savgol_filter
 from gtda.homology import VietorisRipsPersistence
 from gtda.diagrams import PersistenceLandscape
-from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 import warnings
 
@@ -19,7 +19,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
 # =========================================================
-# [1] SNN 모델 (배치 정규화 유지, 임계값 복구)
+# [1] SNN 모델 (Readout 계층 및 내부 스파이크 반환 추가)
 # =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
@@ -34,17 +34,17 @@ class SurrogateSpike(torch.autograd.Function):
 spike_fn = SurrogateSpike.apply
 
 class PhysioNetGeoLIF_4Class(nn.Module):
-    # [해결 1] 초기 임계값을 1.0 -> 0.3으로 확 낮춰서 은닉층 스파이크 활성화
-    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.9, base_thresh=0.3):
+    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.9, base_thresh=0.2):
         super().__init__()
         self.leak = leak
         self.base_thresh = base_thresh
         
         self.spatial_conv1x1 = nn.Linear(num_eeg_channels, hidden_dim, bias=False)
         self.bn1 = nn.BatchNorm1d(hidden_dim) 
-        self.class_conv1x1 = nn.Linear(hidden_dim, num_classes, bias=False)
-        self.lateral_weights = nn.Parameter(torch.eye(4) * 0.8 - 0.1, requires_grad=True)
-        self.tda_to_thresh = nn.Linear(50 * 3, num_classes) 
+        
+        # [핵심] 출력층을 억제망 대신 선형 계층(Readout)으로 변경하여 무조건 기울기가 흐르도록 조치
+        self.readout = nn.Linear(hidden_dim, num_classes) 
+        self.tda_to_thresh = nn.Linear(150, hidden_dim) 
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
@@ -52,32 +52,24 @@ class PhysioNetGeoLIF_4Class(nn.Module):
         x_proj = self.spatial_conv1x1(kin_spikes_seq) 
         x_proj = self.bn1(x_proj.transpose(1, 2)).transpose(1, 2) 
         
-        mem1 = torch.zeros(B, 64, device=kin_spikes_seq.device)
-        mem2 = torch.zeros(B, 4, device=kin_spikes_seq.device)
-        
-        # [해결 2] 스파이크 개수가 아니라 '전압(Voltage)'을 누적 (그라디언트 직통 고속도로)
-        voltage_sum = torch.zeros(B, 4, device=kin_spikes_seq.device)
+        mem = torch.zeros(B, 64, device=kin_spikes_seq.device)
+        spike_sum = torch.zeros(B, 64, device=kin_spikes_seq.device)
         
         tda_mod = torch.sigmoid(self.tda_to_thresh(tda_features)) * 0.5 
         dynamic_thresh = self.base_thresh + tda_mod 
         
         for t in range(T):
-            mem1 = self.leak * mem1 + x_proj[:, t, :]
-            spk1 = spike_fn(mem1 - self.base_thresh)
-            mem1 = mem1 * (1.0 - spk1) 
+            mem = self.leak * mem + x_proj[:, t, :]
+            spk = spike_fn(mem - dynamic_thresh)
+            mem = mem * (1.0 - spk) 
+            spike_sum += spk 
             
-            cur2 = torch.matmul(self.class_conv1x1(spk1), self.lateral_weights)
-            mem2 = self.leak * mem2 + cur2
-            spk2 = spike_fn(mem2 - dynamic_thresh)
-            mem2 = mem2 * (1.0 - spk2)
-            
-            # 스파이크가 터지든 안 터지든 뉴런의 전압(mem2)을 더해서 최종 분류에 사용
-            voltage_sum += mem2 
-            
-        return voltage_sum # 이제 무조건 25.0%에서 벗어남
+        out = self.readout(spike_sum) 
+        # 내부 상태 확인을 위해 스파이크 총합도 같이 반환
+        return out, spike_sum
 
 # =========================================================
-# [2] 병렬 데이터 엔진 (오리지널 기하학 공식 100% 복원)
+# [2] 병렬 데이터 엔진 (TDA 차원 수정 및 네 원본 기하학 수식 유지)
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
@@ -128,7 +120,6 @@ def process_single_subject(sub):
         xc = np.concatenate([np.concatenate([c_lr, c_f])[idx_lh], np.concatenate([c_lr, c_f])[idx_rh], np.concatenate([c_lr, c_f])[idx_ft], np.concatenate([c_lr, c_f])[idx_rest]])
         y = np.concatenate([np.zeros(min_trials), np.ones(min_trials), np.full(min_trials, 2), np.full(min_trials, 3)])
 
-        # --- [복원 1] 오리지널 기하학 피처 연산 로직 (네가 증명한 수식 그대로) ---
         win = 51
         u = savgol_filter(np.abs(hilbert(xb, axis=-1)), win, 3, axis=-1)
         v = savgol_filter(np.abs(hilbert(xc, axis=-1)), win, 3, axis=-1)
@@ -141,18 +132,14 @@ def process_single_subject(sub):
         denom = np.clip((du**2 + dv**2)**(1.5), 1e-6, None)
         curvature = np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10)
         
-        geo_energy = (areal_vel * curvature)[:, :, 80:400] # Edge crop
-        
-        # [복원 2] Z-Score 꼼수 버리고 오리지널 85th Percentile 임계값 적용
+        geo_energy = (areal_vel * curvature)[:, :, 80:400] 
         th_geo = np.percentile(geo_energy, 85)
-        kin_spikes = (geo_energy > th_geo).astype(np.float32).transpose(0, 2, 1) # [Trials, Time, 64]
+        kin_spikes = (geo_energy > th_geo).astype(np.float32).transpose(0, 2, 1) 
         
-        # --- [복원 3] 2D 복소평면 기반 TDA 독립 추출 ---
         ch_upper = [c.upper() for c in chs]
         idx_c = [ch_upper.index(n) for n in ['C3', 'CZ', 'C4'] if n in ch_upper]
         if len(idx_c) < 3: return None
         
-        # [수정] 네 원본 의도대로 1차원(구멍)만 추출하도록 [1]로 변경
         VR = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1)
         PL = PersistenceLandscape(n_bins=50)
         
@@ -160,11 +147,9 @@ def process_single_subject(sub):
         for ch_idx in idx_c:
             pt_cloud = np.stack([u[:, ch_idx, 80:400], v[:, ch_idx, 80:400]], axis=-1) 
             diagrams = VR.fit_transform(pt_cloud)
-            # [수정] 3D 텐서를 (Trials, 50) 2D로 확실하게 쫙 펴줌
             landscapes = PL.fit_transform(diagrams).reshape(len(y), -1) 
             tda_landscapes.append(landscapes)
             
-        # 3개 채널 × 50빈 = (Trials, 150)으로 완벽 결합
         tda_final = np.concatenate(tda_landscapes, axis=1).astype(np.float32) 
 
         return kin_spikes, tda_final, y
@@ -173,17 +158,26 @@ def process_single_subject(sub):
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 오리지널 수식 복원 완료. {num_workers}개 코어로 전처리 시작...")
-    with Pool(num_workers) as p:
-        results = [r for r in list(tqdm(p.imap(process_single_subject, subjects), total=len(subjects), desc="전처리", mininterval=5)) if r is not None]
+    print(f"🔥 오리지널 수식 + Readout 모델. {num_workers}개 코어로 전처리 시작...")
     
+    # 전처리 과정은 진행 상황 파악을 위해 간단히 출력 (tqdm 제거)
+    results = []
+    with Pool(num_workers) as p:
+        for i, r in enumerate(p.imap(process_single_subject, subjects)):
+            if r is not None: results.append(r)
+            if (i + 1) % 10 == 0:
+                print(f"  -> 전처리 진행중: {i+1}/{len(subjects)} 명 완료...")
+                
     if not results: raise ValueError("⚠️ 데이터 추출 실패.")
     Xk = np.concatenate([r[0] for r in results])
     Xt = np.concatenate([r[1] for r in results])
     y = np.concatenate([r[2] for r in results])
-    print(f"📊 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
+    print(f"📊 최종 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
     return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long)
 
+# =========================================================
+# [3] 메인 학습 루프 (Line-by-Line 로깅 구현)
+# =========================================================
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
     Xk, Xt, y = get_full_data_parallel(VALID_SUBS)
@@ -198,31 +192,56 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 진짜 보물 장착 완료. 학습 개시 (샘플 수: {len(y)})")
-    pbar = tqdm(range(100), desc="에포크", mininterval=5)
+    print(f"\n🚀 본격적인 디버깅 로그 모드로 학습 개시 (샘플 수: {len(y)})")
     best_acc = 0.0
     
-    for epoch in pbar:
+    for epoch in range(1, 101):
         model.train()
-        tr_c, tr_t = 0, 0
+        tr_loss, tr_c, tr_t = 0.0, 0, 0
+        total_spikes = 0.0 # 스파이크 발화량 추적
+        all_preds = []     # 예측 쏠림 현상 추적
+        
         for kb, tb, yb in train_loader:
             kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
             optimizer.zero_grad()
-            out = model(kb, tb)
+            
+            out, spike_sum = model(kb, tb)
             loss = criterion(out, yb)
             loss.backward(); optimizer.step()
-            tr_c += out.max(1)[1].eq(yb).sum().item(); tr_t += yb.size(0)
-        
+            
+            preds = out.max(1)[1]
+            tr_loss += loss.item() * yb.size(0)
+            tr_c += preds.eq(yb).sum().item()
+            tr_t += yb.size(0)
+            
+            total_spikes += spike_sum.sum().item()
+            all_preds.extend(preds.cpu().numpy())
+            
         scheduler.step()
+        
+        # 이번 에포크에서 뉴런들이 클래스를 어떻게 찍었는지 분포 계산
+        pred_unique, pred_counts = np.unique(all_preds, return_counts=True)
+        pred_dist = {int(k): int(v) for k, v in zip(pred_unique, pred_counts)}
+        avg_spikes = total_spikes / (tr_t * 64) # 샘플당, 은닉 뉴런당 평균 스파이크 횟수
         
         model.eval()
         ts_c, ts_t = 0, 0
         with torch.no_grad():
             for kb, tb, yb in test_loader:
                 kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
-                ts_c += model(kb, tb).max(1)[1].eq(yb).sum().item(); ts_t += yb.size(0)
+                out, _ = model(kb, tb)
+                ts_c += out.max(1)[1].eq(yb).sum().item()
+                ts_t += yb.size(0)
         
-        cur_acc = 100 * ts_c / ts_t
-        if cur_acc > best_acc: best_acc = cur_acc
+        epoch_loss = tr_loss / tr_t
+        tr_acc = 100 * tr_c / tr_t
+        ts_acc = 100 * ts_c / ts_t
+        if ts_acc > best_acc: best_acc = ts_acc
         
-        pbar.set_postfix(Train=f"{100*tr_c/tr_t:.1f}%", Test=f"{cur_acc:.1f}%", Best=f"{best_acc:.1f}%")
+        # \r 덮어쓰기 없이 라인 바이 라인으로 투명하게 출력
+        print(f"Epoch [{epoch:03d}/100] "
+              f"Loss: {epoch_loss:.4f} | "
+              f"Train Acc: {tr_acc:.1f}% | "
+              f"Test Acc: {ts_acc:.1f}% | "
+              f"Avg Spikes: {avg_spikes:.2f} | "
+              f"Pred Dist: {pred_dist}")

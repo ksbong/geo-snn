@@ -34,28 +34,32 @@ class SurrogateSpike(torch.autograd.Function):
 spike_fn = SurrogateSpike.apply
 
 class PhysioNetGeoLIF_4Class(nn.Module):
-    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.9, base_thresh=0.2):
+    # [수정 1] leak을 0.99로 올려서 네 희소한 스파이크 전압이 안 새어나가게 꽉 잡음
+    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.99, base_thresh=0.2):
         super().__init__()
         self.leak = leak
         self.base_thresh = base_thresh
         
         self.spatial_conv1x1 = nn.Linear(num_eeg_channels, hidden_dim, bias=False)
-        self.bn1 = nn.BatchNorm1d(hidden_dim) 
         
-        # [핵심] 출력층을 억제망 대신 선형 계층(Readout)으로 변경하여 무조건 기울기가 흐르도록 조치
+        # [수정 2] 만악의 근원이었던 BatchNorm1d 삭제!!!
+        # [수정 3] 가중치를 강제로 양수(0.1 ~ 0.5)로 초기화해서 무조건 전압이 오르도록 강제
+        nn.init.uniform_(self.spatial_conv1x1.weight, 0.1, 0.5)
+        
         self.readout = nn.Linear(hidden_dim, num_classes) 
         self.tda_to_thresh = nn.Linear(150, hidden_dim) 
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
         
+        # BN 없이 순수하게 네 스파이크 신호만 은닉층으로 투영
         x_proj = self.spatial_conv1x1(kin_spikes_seq) 
-        x_proj = self.bn1(x_proj.transpose(1, 2)).transpose(1, 2) 
         
         mem = torch.zeros(B, 64, device=kin_spikes_seq.device)
         spike_sum = torch.zeros(B, 64, device=kin_spikes_seq.device)
         
-        tda_mod = torch.sigmoid(self.tda_to_thresh(tda_features)) * 0.5 
+        # [수정 4] TDA가 임계값을 올리기만 하는 게 아니라, 낮출(-0.2) 수도 있게 변경
+        tda_mod = (torch.sigmoid(self.tda_to_thresh(tda_features)) - 0.5) * 0.4
         dynamic_thresh = self.base_thresh + tda_mod 
         
         for t in range(T):
@@ -65,7 +69,6 @@ class PhysioNetGeoLIF_4Class(nn.Module):
             spike_sum += spk 
             
         out = self.readout(spike_sum) 
-        # 내부 상태 확인을 위해 스파이크 총합도 같이 반환
         return out, spike_sum
 
 # =========================================================

@@ -142,16 +142,16 @@ def get_full_data_parallel(subjects):
            torch.tensor(np.concatenate([r[2] for r in results]), dtype=torch.long)
 
 if __name__ == "__main__":
-    VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]] [cite: 310]
+    VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
     Xk, Xt, y = get_full_data_parallel(VALID_SUBS)
-    Xk_tr, Xk_ts, Xt_tr, Xt_ts, y_tr, y_ts = train_test_split(Xk, Xt, y, test_size=0.2, stratify=y, random_state=42) [cite: 323]
+    Xk_tr, Xk_ts, Xt_tr, Xt_ts, y_tr, y_ts = train_test_split(Xk, Xt, y, test_size=0.2, stratify=y, random_state=42)
     
     train_loader = DataLoader(TensorDataset(Xk_tr, Xt_tr, y_tr), batch_size=64, shuffle=True) # 배치 사이즈 소폭 축소
     test_loader = DataLoader(TensorDataset(Xk_ts, Xt_ts, y_ts), batch_size=64, shuffle=False)
 
     model = PhysioNetGeoLIF_4Class().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4) # 안정적인 학습률 [cite: 340]
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100) [cite: 340]
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
     print(f"\n🚀 학습 재시작! 샘플 수: {len(y)}")

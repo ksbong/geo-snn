@@ -1,5 +1,4 @@
 import os
-import gc
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,7 +18,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
 # =========================================================
-# [1] SNN 모델 (Readout 계층 및 내부 스파이크 반환 추가)
+# [1] 바닥부터 새로 짠 절대 죽지 않는 Robust SNN 
 # =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
@@ -33,44 +32,52 @@ class SurrogateSpike(torch.autograd.Function):
 
 spike_fn = SurrogateSpike.apply
 
-class PhysioNetGeoLIF_4Class(nn.Module):
-    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4):
+class RobustGeoSNN(nn.Module):
+    def __init__(self, num_eeg_channels=64, hidden_dim=128, num_classes=4):
         super().__init__()
         
-        # 1. 공간 차원 융합
-        self.spatial_fc = nn.Linear(num_eeg_channels, hidden_dim, bias=False)
+        # 1. 스파이크 처리부 (양수 가중치 강제)
+        self.spike_fc = nn.Linear(num_eeg_channels, hidden_dim)
+        nn.init.uniform_(self.spike_fc.weight, 0.05, 0.2) # 무조건 전압이 오르도록 강제
+        if self.spike_fc.bias is not None:
+            nn.init.zeros_(self.spike_fc.bias)
+            
+        # 2. TDA 처리부 (독립적인 MLP로 안전하게 해석)
+        self.tda_net = nn.Sequential(
+            nn.Linear(150, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
         
-        # 2. TDA를 임계값 조작이 아닌 '어텐션 모듈'로 안전하게 활용
-        self.tda_attention = nn.Linear(150, hidden_dim)
-        
-        # 3. Readout (출력층)
-        self.readout = nn.Linear(hidden_dim, num_classes)
+        # 3. 최종 병합 및 분류부 (SNN 스파이크 총합 + TDA 특징)
+        self.classifier = nn.Linear(hidden_dim + 64, num_classes)
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
         
-        # 음수 가중치로 인해 전압이 깎이는 걸 방지하기 위해 ReLU 적용 (오직 양의 전류만 주입)
-        x_proj = torch.relu(self.spatial_fc(kin_spikes_seq)) 
+        mem = torch.zeros(B, 128, device=kin_spikes_seq.device)
+        spike_counts = torch.zeros(B, 128, device=kin_spikes_seq.device)
         
-        mem = torch.zeros(B, 64, device=kin_spikes_seq.device)
-        spike_sum = torch.zeros(B, 64, device=kin_spikes_seq.device)
-        
-        # [핵심] Leak 삭제 (순수 Integrate-and-Fire). 네 희소한 스파이크를 무조건 누적시킴
+        # 가장 단순하고 확실한 Integrate-and-Fire
         for t in range(T):
-            mem = mem + x_proj[:, t, :] # leak 곱하는 부분 완전히 제거
-            spk = spike_fn(mem - 1.0)   # 고정 임계값 1.0 (안전한 스파이킹)
-            mem = mem * (1.0 - spk)     # 발화 시 리셋
-            spike_sum += spk
+            current = self.spike_fc(kin_spikes_seq[:, t, :])
+            mem = 0.9 * mem + current
+            spk = spike_fn(mem - 0.5) # 고정 임계값 0.5
+            mem = mem * (1.0 - spk)   # 발화 시 리셋
+            spike_counts += spk
             
-        # [핵심] 위상수학(TDA) 특징을 64개 은닉 뉴런의 활성도를 조절하는 가중치(Attention)로 사용
-        tda_weight = torch.sigmoid(self.tda_attention(tda_features)) # [B, 64]
-        modulated_spikes = spike_sum * tda_weight # TDA 공간 정보를 스파이크 빈도에 결합
+        # TDA 데이터 처리
+        tda_out = self.tda_net(tda_features)
         
-        out = self.readout(modulated_spikes)
-        return out, spike_sum
-    
+        # [핵심] 스파이크 특징과 TDA 특징을 나란히 병합 (절대 꼬이지 않는 앙상블)
+        fused_features = torch.cat([spike_counts, tda_out], dim=1) # [B, 192]
+        
+        out = self.classifier(fused_features)
+        return out, spike_counts
+
 # =========================================================
-# [2] 병렬 데이터 엔진 (TDA 차원 수정 및 네 원본 기하학 수식 유지)
+# [2] 네 오리지널 수식을 100% 보존한 데이터 엔진
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
@@ -159,9 +166,8 @@ def process_single_subject(sub):
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 오리지널 수식 + Readout 모델. {num_workers}개 코어로 전처리 시작...")
+    print(f"🔥 완전 재설계된 Robust 모델로 {num_workers}개 코어 전처리 시작...")
     
-    # 전처리 과정은 진행 상황 파악을 위해 간단히 출력 (tqdm 제거)
     results = []
     with Pool(num_workers) as p:
         for i, r in enumerate(p.imap(process_single_subject, subjects)):
@@ -174,10 +180,12 @@ def get_full_data_parallel(subjects):
     Xt = np.concatenate([r[1] for r in results])
     y = np.concatenate([r[2] for r in results])
     print(f"📊 최종 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
+    # 네 피처가 살아있는지 증명하기 위한 희소성 로깅
+    print(f"🔍 입력 스파이크 희소성(Sparsity): {Xk.mean():.4f} (약 0.15 근처여야 정상)")
     return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long)
 
 # =========================================================
-# [3] 메인 학습 루프 (Line-by-Line 로깅 구현)
+# [3] 메인 학습 루프
 # =========================================================
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
@@ -188,19 +196,19 @@ if __name__ == "__main__":
     train_loader = DataLoader(TensorDataset(Xk_tr, Xt_tr, y_tr), batch_size=128, shuffle=True)
     test_loader = DataLoader(TensorDataset(Xk_ts, Xt_ts, y_ts), batch_size=128, shuffle=False)
 
-    model = PhysioNetGeoLIF_4Class().to(device)
+    model = RobustGeoSNN().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-4) 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 본격적인 디버깅 로그 모드로 학습 개시 (샘플 수: {len(y)})")
+    print(f"\n🚀 완전 갈아엎은 모델로 학습 개시 (샘플 수: {len(y)})")
     best_acc = 0.0
     
     for epoch in range(1, 101):
         model.train()
         tr_loss, tr_c, tr_t = 0.0, 0, 0
-        total_spikes = 0.0 # 스파이크 발화량 추적
-        all_preds = []     # 예측 쏠림 현상 추적
+        total_spikes = 0.0
+        all_preds = []
         
         for kb, tb, yb in train_loader:
             kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
@@ -220,10 +228,9 @@ if __name__ == "__main__":
             
         scheduler.step()
         
-        # 이번 에포크에서 뉴런들이 클래스를 어떻게 찍었는지 분포 계산
         pred_unique, pred_counts = np.unique(all_preds, return_counts=True)
         pred_dist = {int(k): int(v) for k, v in zip(pred_unique, pred_counts)}
-        avg_spikes = total_spikes / (tr_t * 64) # 샘플당, 은닉 뉴런당 평균 스파이크 횟수
+        avg_spikes = total_spikes / (tr_t * 128) 
         
         model.eval()
         ts_c, ts_t = 0, 0
@@ -239,7 +246,6 @@ if __name__ == "__main__":
         ts_acc = 100 * ts_c / ts_t
         if ts_acc > best_acc: best_acc = ts_acc
         
-        # \r 덮어쓰기 없이 라인 바이 라인으로 투명하게 출력
         print(f"Epoch [{epoch:03d}/100] "
               f"Loss: {epoch_loss:.4f} | "
               f"Train Acc: {tr_acc:.1f}% | "

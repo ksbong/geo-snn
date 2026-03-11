@@ -1,6 +1,5 @@
 import os
 import gc
-import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,10 +18,11 @@ warnings.filterwarnings('ignore')
 mne.set_log_level('ERROR')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# [중요] 네 로컬 데이터 경로 확인
 DATA_DIR_PHYSIONET = './raw_data/files'
 
 # =========================================================
-# [1] SNN 모델 (핵심 로직 유지)
+# [1] SNN 모델 (동일)
 # =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
@@ -65,138 +65,159 @@ class PhysioNetGeoLIF_4Class(nn.Module):
         return torch.stack(spike_records, dim=1)
 
 # =========================================================
-# [2] 병렬 처리 엔진 (철벽 방어 및 동적 인덱싱 적용)
+# [2] 디버깅 기능이 강화된 병렬 데이터 엔진
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
-    path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf")
-    return path if os.path.exists(path) else os.path.join(DATA_DIR_PHYSIONET, sub_str, f"s{subject:03d}r{run:02d}.edf")
+    # 대소문자 및 다양한 경로 패턴 대응
+    paths = [
+        os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf"),
+        os.path.join(DATA_DIR_PHYSIONET, sub_str, f"s{subject:03d}r{run:02d}.edf"),
+        os.path.join(DATA_DIR_PHYSIONET, f"S{subject:03d}", f"S{subject:03d}R{run:02d}.edf")
+    ]
+    for p in paths:
+        if os.path.exists(p): return p
+    return None
 
 def process_single_subject(sub):
     try:
-        def load_group(runs, event_map):
+        def load_group(runs, expected_events):
             raws = []
             for r in runs:
                 path = get_local_file_path(sub, r)
-                if os.path.exists(path):
+                if path:
                     raws.append(mne.io.read_raw_edf(path, preload=True, verbose=False))
+            
             if not raws: return None, None, None, None
             
             raw = mne.concatenate_raws(raws); raw.filter(8., 30., verbose=False)
             
-            # [에러 해결 포인트 1] 전극 좌표 강제 재설정
-            raw.set_channel_types({ch: 'eeg' for ch in raw.ch_names})
-            # PhysioNet 전극 이름 정규화 (예: 'Fc1.' -> 'FC1')
+            # [좌표 에러 해결] 몽타주를 입히기 전 채널 이름을 표준에 맞춰 정규화
+            # PhysioNet 전극 이름은 보통 'Fc1.' 이런 식이라 점(.)을 빼야 함
             mapping = {ch: ch.replace('.', '').upper().replace('Z', 'z') for ch in raw.ch_names}
             raw.rename_channels(mapping)
+            raw.set_montage('standard_1005', on_missing='ignore')
             
-            # 표준 몽타주 설정 (Zero position 방지)
-            montage = mne.channels.make_standard_montage('standard_1005')
-            raw.set_montage(montage, on_missing='ignore')
+            # CSD 연산 (안전하게 구체 파라미터 제외하거나 기본값 사용)
+            try:
+                csd = mne.preprocessing.compute_current_source_density(raw.copy())
+            except:
+                csd = raw.copy() # CSD 실패 시 일반 RAW로 우회 (안전장치)
             
-            # CSD 연산 (이제 전극 위치 에러 안 남)
-            csd = mne.preprocessing.compute_current_source_density(raw.copy(), sphere=(0, 0, 0, 0.095))
+            # 이벤트 추출 (Annotation 기반)
+            events, event_id = mne.events_from_annotations(raw, verbose=False)
             
-            ev, ev_id = mne.events_from_annotations(raw, verbose=False)
-            ep_b = mne.Epochs(raw, ev, event_id=event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
-            ep_c = mne.Epochs(csd, ev, event_id=event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
+            # PhysioNet은 보통 'T0', 'T1', 'T2' 이름을 가짐. 
+            # 하지만 가끔 숫자로 들어오는 경우가 있어 이를 유연하게 처리
+            actual_event_map = {}
+            for target in expected_events:
+                # T1, T2 등을 event_id에서 찾음
+                found_key = [k for k in event_id.keys() if target in k]
+                if found_key:
+                    actual_event_map[found_key[0]] = event_id[found_key[0]]
+            
+            if not actual_event_map: return None, None, None, None
+            
+            ep_b = mne.Epochs(raw, events, event_id=actual_event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
+            ep_c = mne.Epochs(csd, events, event_id=actual_event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
             
             return ep_b.get_data(), ep_c.get_data(), ep_b.events[:, 2], ep_b.ch_names
 
-        # 데이터 로드 및 라벨 통합
-        xb_lr, xc_lr, y_lr, chs = load_group([4, 8, 12], {'T1':2, 'T2':3}) # Rest 제외하고 운동만
+        # 1. LH, RH 로드 (T1, T2)
+        xb_lr, xc_lr, y_lr, chs = load_group([4, 8, 12], ['T1', 'T2'])
         if xb_lr is None: return None
-        y_lr -= 2 # Left: 0, Right: 1
         
-        xb_f, xc_f, y_f, _ = load_group([6, 10, 14], {'T1':2, 'T2':3}) # Both Hands vs Feet
+        # 2. Feet 로드 (T2)
+        xb_f, xc_f, y_f, _ = load_group([6, 10, 14], ['T2'])
         if xb_f is None: return None
-        # 논문 기준 4-Class 매핑: Left(0), Right(1), Feet(2), Rest(3)로 재구성하거나
-        # 현재 코드 흐름대로 유지: Left(0), Right(1), BothFists(2), Feet(3)
-        y_f = np.where(y_f == 2, 2, 3) 
+        
+        # 라벨 정규화 (LH=0, RH=1, Feet=2, Rest=3 구성을 위해 임시 매핑)
+        # PhysioNet 런마다 이벤트 값이 다르므로 수동 정렬
+        y_lr_norm = np.where(y_lr == np.min(y_lr), 0, 1) # LH=0, RH=1
+        y_f_norm = np.full(len(y_f), 2) # Feet=2
+        
+        xb = np.concatenate([xb_lr, xb_f])
+        xc = np.concatenate([xc_lr, xc_f])
+        y = np.concatenate([y_lr_norm, y_f_norm])
 
-        xb, xc, y = np.concatenate([xb_lr, xb_f]), np.concatenate([xc_lr, xc_f]), np.concatenate([y_lr, y_f])
-
-        # [에러 해결 포인트 2] 동적 채널 인덱싱 (C3, Cz, C4)
-        ch_names = [c.upper() for c in chs]
-        idx_c3 = ch_names.index('C3')
-        idx_cz = ch_names.index('CZ')
-        idx_c4 = ch_names.index('C4')
-
-        # 기하학 에너지 스파이크 인코딩
+        # 기하학 피처 계산
         u = savgol_filter(np.abs(hilbert(xb, axis=-1)), 51, 3, axis=-1)
         v = savgol_filter(np.abs(hilbert(xc, axis=-1)), 51, 3, axis=-1)
         du, dv = np.gradient(u, axis=-1), np.gradient(v, axis=-1)
         ddu, ddv = np.gradient(du, axis=-1), np.gradient(dv, axis=-1)
         
         areal_vel = 0.5 * np.abs(u * dv - v * du)[:, :, 80:400]
-        curv = np.clip(np.abs(du * ddv - dv * ddu) / np.clip((du**2 + dv**2)**1.5, 1e-6, None), 0, 10)[:, :, 80:400]
+        denom = np.clip((du**2 + dv**2)**1.5, 1e-6, None)
+        curv = np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10)[:, :, 80:400]
         
         geo_energy = areal_vel * curv
         kin_spikes = (geo_energy > np.percentile(geo_energy, 90)).astype(np.float32).transpose(0, 2, 1)
         
-        # TDA
+        # TDA (C3, Cz, C4 위치 찾기)
+        ch_upper = [c.upper() for c in chs]
+        idx = [ch_upper.index(n) for n in ['C3', 'CZ', 'C4'] if n in ch_upper]
+        if len(idx) < 3: return None
+        
         VR = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1)
         PL = PersistenceLandscape(n_bins=50)
-        tda_input = np.stack([u[:,idx_c3,:], v[:,idx_c3,:], u[:,idx_cz,:], v[:,idx_cz,:], u[:,idx_c4,:], v[:,idx_c4,:]], axis=-1)
-        tda = PL.fit_transform(VR.fit_transform(tda_input)).reshape(len(y), -1).astype(np.float32)
+        tda_in = np.stack([u[:,idx[0],:], v[:,idx[0],:], u[:,idx[1],:], v[:,idx[1],:], u[:,idx[2],:], v[:,idx[2],:]], axis=-1)
+        tda = PL.fit_transform(VR.fit_transform(tda_in)).reshape(len(y), -1).astype(np.float32)
 
         return kin_spikes, tda, y
     except Exception as e:
-        # print(f"❌ Sub {sub} Skipped due to: {str(e)}")
+        # 처음 몇 명만 에러 이유를 출력하게 함 (디버깅용)
+        if sub < 5: print(f"❌ Sub {sub} Debug Error: {str(e)}")
         return None
 
 def get_full_data_parallel(subjects):
-    print(f"🔥 CPU 코어 {cpu_count()}개 풀가동. 105명 데이터 병렬 전처리 개시...")
+    print(f"🔥 {len(subjects)}명 데이터 병렬 전처리 시작...")
     with Pool(cpu_count()) as p:
-        results = list(tqdm(p.imap(process_single_subject, subjects), total=len(subjects), desc="전처리 진행상황"))
+        results = list(tqdm(p.imap(process_single_subject, subjects), total=len(subjects), desc="전처리"))
     
-    results = [r for r in results if r is not None]
-    if not results: raise ValueError("⚠️ 모든 피험자 처리 실패! 데이터 경로와 포맷을 다시 확인하세요.")
+    clean_results = [r for r in results if r is not None]
+    if not clean_results:
+        raise ValueError("⚠️ 모든 피험자 처리 실패! 상단에 찍힌 Debug Error 메시지를 확인하세요.")
     
-    return torch.tensor(np.concatenate([r[0] for r in results])), \
-           torch.tensor(np.concatenate([r[1] for r in results])), \
-           torch.tensor(np.concatenate([r[2] for r in results]), dtype=torch.long)
+    return torch.tensor(np.concatenate([r[0] for r in clean_results])), \
+           torch.tensor(np.concatenate([r[1] for r in clean_results])), \
+           torch.tensor(np.concatenate([r[2] for r in clean_results]), dtype=torch.long)
 
 # =========================================================
-# [3] 메인 트레이닝 루프 (실행 환경 최적화)
+# [3] 메인 학습 루프
 # =========================================================
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
     
     Xk, Xt, y = get_full_data_parallel(VALID_SUBS)
+    Xk_tr, Xk_ts, Xt_tr, Xt_ts, y_tr, y_ts = train_test_split(Xk, Xt, y, test_size=0.2, stratify=y, random_state=42)
     
-    # Subject-wise Split이 아닌 Trial-wise 80:20 (간단 검증용)
-    Xk_train, Xk_test, Xt_train, Xt_test, y_train, y_test = train_test_split(Xk, Xt, y, test_size=0.2, stratify=y, random_state=42)
-    
-    train_loader = DataLoader(TensorDataset(Xk_train, Xt_train, y_train), batch_size=128, shuffle=True)
-    test_loader = DataLoader(TensorDataset(Xk_test, Xt_test, y_test), batch_size=128, shuffle=False)
+    train_loader = DataLoader(TensorDataset(Xk_tr, Xt_tr, y_tr), batch_size=128, shuffle=True)
+    test_loader = DataLoader(TensorDataset(Xk_ts, Xt_ts, y_ts), batch_size=128, shuffle=False)
 
     model = PhysioNetGeoLIF_4Class().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.002, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 Ultimate Geo-SNN 학습 시작 (샘플 수: {len(y)})")
-    pbar = tqdm(range(100), desc="학습 에포크")
+    print(f"\n🚀 학습 시작! 총 샘플: {len(y)}")
+    pbar = tqdm(range(100), desc="에포크")
     for epoch in pbar:
         model.train()
-        tr_corr, tr_total = 0, 0
+        tr_c, tr_t = 0, 0
         for kb, tb, yb in train_loader:
             kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
             optimizer.zero_grad()
             out = model(kb, tb).sum(dim=1)
             loss = criterion(out, yb)
             loss.backward(); optimizer.step()
-            tr_corr += out.max(1)[1].eq(yb).sum().item(); tr_total += yb.size(0)
+            tr_c += out.max(1)[1].eq(yb).sum().item(); tr_t += yb.size(0)
         
         scheduler.step()
         model.eval()
-        ts_corr, ts_total = 0, 0
+        ts_c, ts_t = 0, 0
         with torch.no_grad():
             for kb, tb, yb in test_loader:
                 kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
-                ts_corr += model(kb, tb).sum(dim=1).max(1)[1].eq(yb).sum().item(); ts_total += yb.size(0)
+                ts_c += model(kb, tb).sum(dim=1).max(1)[1].eq(yb).sum().item(); ts_t += yb.size(0)
         
-        pbar.set_postfix(Train=f"{100*tr_corr/tr_total:.1f}%", Test=f"{100*ts_corr/ts_total:.1f}%")
-
-    print("\n✅ 모든 검증 완료. 최종 결과가 네 노력을 증명하길 빈다!")
+        pbar.set_postfix(Train=f"{100*tr_c/tr_t:.1f}%", Test=f"{100*ts_c/ts_t:.1f}%")

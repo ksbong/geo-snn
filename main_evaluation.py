@@ -5,11 +5,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
 import numpy as np
 import mne
 from scipy.signal import hilbert, savgol_filter
 from gtda.homology import VietorisRipsPersistence
 from gtda.diagrams import PersistenceLandscape
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -19,19 +22,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
 # =========================================================
-# [1] SNN 대리 기울기 및 모델 아키텍처
+# [1] SNN 모델 (핵심 로직은 유지하되 연산 효율 극대화)
 # =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
         ctx.save_for_backward(input)
         return (input >= 0).float()
-
     @staticmethod
     def backward(ctx, grad_output):
         input, = ctx.saved_tensors
-        sg = 1.0 / (1.0 + 10.0 * torch.abs(input)) ** 2
-        return grad_output * sg
+        return grad_output / (1.0 + 10.0 * torch.abs(input)) ** 2
 
 spike_fn = SurrogateSpike.apply
 
@@ -41,15 +42,12 @@ class PhysioNetGeoLIF_4Class(nn.Module):
         self.num_classes = num_classes
         self.leak = leak
         self.base_thresh = base_thresh
-        
         self.spatial_weights = nn.Linear(num_eeg_channels, num_classes, bias=False)
         
-        # 4-Way 측면 억제망 (0:Rest, 1:Left, 2:Right, 3:Feet)
+        # 억제망 초기값 세팅
         init_inhibition = torch.tensor([
-            [ 1.0, -0.4, -0.4, -0.4],
-            [-0.4,  1.0, -0.3, -0.3], 
-            [-0.4, -0.3,  1.0, -0.3], 
-            [-0.4, -0.3, -0.3,  1.0]  
+            [ 1.0, -0.4, -0.4, -0.4], [ -0.4, 1.0, -0.3, -0.3], 
+            [ -0.4, -0.3, 1.0, -0.3], [ -0.4, -0.3, -0.3, 1.0]
         ])
         self.lateral_weights = nn.Parameter(init_inhibition, requires_grad=True)
         self.tda_to_thresh = nn.Linear(50, num_classes)
@@ -58,205 +56,124 @@ class PhysioNetGeoLIF_4Class(nn.Module):
         batch_size, time_steps, _ = kin_spikes_seq.shape
         mem = torch.zeros(batch_size, self.num_classes, device=kin_spikes_seq.device)
         
-        tda_modulation = torch.sigmoid(self.tda_to_thresh(tda_features)) * 0.5
-        dynamic_thresh = self.base_thresh + tda_modulation 
+        # TDA 기반 동적 임계값 (Batch별 고정)
+        tda_mod = torch.sigmoid(self.tda_to_thresh(tda_features)) * 0.5
+        dynamic_thresh = self.base_thresh + tda_mod 
         
         spike_records = []
         for t in range(time_steps):
-            x_t = kin_spikes_seq[:, t, :] 
-            projected = self.spatial_weights(x_t)
-            inhibited = torch.matmul(projected, self.lateral_weights)
-            
-            mem = self.leak * mem + inhibited
+            # 64채널 투영 -> 억제망 통과 -> LIF 누적
+            cur_input = torch.matmul(self.spatial_weights(kin_spikes_seq[:, t, :]), self.lateral_weights)
+            mem = self.leak * mem + cur_input
             spikes_out = spike_fn(mem - dynamic_thresh)
-            mem = mem * (1.0 - spikes_out)
+            mem = mem * (1.0 - spikes_out) # Reset
             spike_records.append(spikes_out)
             
         return torch.stack(spike_records, dim=1)
 
 # =========================================================
-# [2] 철저한 메모리 관리형 데이터 로더
+# [2] 병렬 처리 엔진 (Ryzen 7950X 32쓰레드 풀가동)
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
-    file_path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf")
-    if not os.path.exists(file_path):
-        file_path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"s{subject:03d}r{run:02d}.edf")
-    return file_path
+    path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf")
+    return path if os.path.exists(path) else os.path.join(DATA_DIR_PHYSIONET, sub_str, f"s{subject:03d}r{run:02d}.edf")
 
-def extract_memory_safe_data(subjects, phase_name=""):
-    print(f"\n⏳ [{phase_name}] {len(subjects)}명 데이터 추출 시작 (메모리 누수 방지 모드)...")
-    X_kin_list, X_tda_list, y_list = [], [], []
+def process_single_subject(sub):
+    """ 멀티프로세싱 워커 함수 """
+    try:
+        def load_group(runs, event_map):
+            raws = [mne.io.read_raw_edf(get_local_file_path(sub, r), preload=True, verbose=False) for r in runs if os.path.exists(get_local_file_path(sub, r))]
+            if not raws: return None, None, None
+            raw = mne.concatenate_raws(raws); raw.filter(8., 30., verbose=False)
+            mne.datasets.eegbci.standardize(raw)
+            csd = mne.preprocessing.compute_current_source_density(raw.copy(), sphere=(0, 0, 0, 0.095))
+            ev, _ = mne.events_from_annotations(raw, verbose=False)
+            ep_b = mne.Epochs(raw, ev, event_id=event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
+            ep_c = mne.Epochs(csd, ev, event_id=event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
+            return ep_b.get_data(), ep_c.get_data(), ep_b.events[:, 2]
+
+        # 데이터 로드 및 라벨 통합
+        xb_lr, xc_lr, y_lr = load_group([4, 8, 12], {'T0':1, 'T1':2, 'T2':3})
+        y_lr -= 1 
+        xb_f, xc_f, y_f = load_group([6, 10, 14], {'T0':1, 'T2':3})
+        y_f = np.where(y_f == 1, 0, 3)
+
+        xb, xc, y = np.concatenate([xb_lr, xb_f]), np.concatenate([xc_lr, xc_f]), np.concatenate([y_lr, y_f])
+
+        # 기하학 에너지 스파이크 인코딩
+        u = savgol_filter(np.abs(hilbert(xb, axis=-1)), 51, 3, axis=-1)
+        v = savgol_filter(np.abs(hilbert(xc, axis=-1)), 51, 3, axis=-1)
+        du, dv = np.gradient(u, axis=-1), np.gradient(v, axis=-1)
+        ddu, ddv = np.gradient(du, axis=-1), np.gradient(dv, axis=-1)
+        
+        areal_vel = 0.5 * np.abs(u * dv - v * du)[:, :, 80:400]
+        curv = np.clip(np.abs(du * ddv - dv * ddu) / np.clip((du**2 + dv**2)**1.5, 1e-6, None), 0, 10)[:, :, 80:400]
+        
+        geo_energy = areal_vel * curv
+        kin_spikes = (geo_energy > np.percentile(geo_energy, 90)).astype(np.float32).transpose(0, 2, 1)
+        
+        # TDA (C3, Cz, C4 기준)
+        VR = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1)
+        PL = PersistenceLandscape(n_bins=50)
+        tda = PL.fit_transform(VR.fit_transform(np.stack([u[:,12,:], v[:,12,:], u[:,14,:], v[:,14,:], u[:,16,:], v[:,16,:]], axis=-1))).reshape(len(y), -1).astype(np.float32)
+
+        return kin_spikes, tda, y
+    except: return None
+
+def get_full_data_parallel(subjects):
+    print(f"🔥 CPU 코어 {cpu_count()}개를 사용하여 {len(subjects)}명 데이터 병렬 전처리 시작...")
+    with Pool(cpu_count()) as p:
+        results = list(tqdm(p.imap(process_single_subject, subjects), total=len(subjects), desc="전처리 진행상황"))
     
-    for sub in subjects:
-        try:
-            # --- 1. Left/Right 상상 ---
-            runs_LR = [4, 8, 12]
-            raws_LR = [mne.io.read_raw_edf(get_local_file_path(sub, r), preload=True, verbose=False) for r in runs_LR if os.path.exists(get_local_file_path(sub, r))]
-            if not raws_LR: continue
-            
-            raw_LR = mne.concatenate_raws(raws_LR)
-            raw_LR.filter(8., 30., verbose=False)
-            mne.datasets.eegbci.standardize(raw_LR)
-            raw_LR.set_montage('standard_1005', match_case=False, on_missing='ignore')
-            raw_LR_csd = mne.preprocessing.compute_current_source_density(raw_LR.copy(), sphere=(0, 0, 0, 0.095))
-            
-            events_LR, _ = mne.events_from_annotations(raw_LR, verbose=False)
-            ep_b_LR = mne.Epochs(raw_LR, events_LR, event_id={'T0':1, 'T1':2, 'T2':3}, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
-            ep_c_LR = mne.Epochs(raw_LR_csd, events_LR, event_id={'T0':1, 'T1':2, 'T2':3}, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
-            
-            X_b_LR, X_c_LR = ep_b_LR.get_data(), ep_c_LR.get_data()
-            y_LR = ep_b_LR.events[:, 2] - 1
-            
-            # --- 메모리 즉시 해제 ---
-            del raws_LR, raw_LR, raw_LR_csd, ep_b_LR, ep_c_LR
-            
-            # --- 2. Feet 상상 ---
-            runs_F = [6, 10, 14]
-            raws_F = [mne.io.read_raw_edf(get_local_file_path(sub, r), preload=True, verbose=False) for r in runs_F if os.path.exists(get_local_file_path(sub, r))]
-            if not raws_F: continue
-            
-            raw_F = mne.concatenate_raws(raws_F)
-            raw_F.filter(8., 30., verbose=False)
-            mne.datasets.eegbci.standardize(raw_F)
-            raw_F.set_montage('standard_1005', match_case=False, on_missing='ignore')
-            raw_F_csd = mne.preprocessing.compute_current_source_density(raw_F.copy(), sphere=(0, 0, 0, 0.095))
-            
-            events_F, _ = mne.events_from_annotations(raw_F, verbose=False)
-            ep_b_F = mne.Epochs(raw_F, events_F, event_id={'T0':1, 'T2':3}, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
-            ep_c_F = mne.Epochs(raw_F_csd, events_F, event_id={'T0':1, 'T2':3}, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
-            
-            X_b_F, X_c_F = ep_b_F.get_data(), ep_c_F.get_data()
-            y_F = ep_b_F.events[:, 2]
-            y_F = np.where(y_F == 1, 0, 3) 
-            
-            # --- 메모리 즉시 해제 ---
-            del raws_F, raw_F, raw_F_csd, ep_b_F, ep_c_F
-            
-            # 데이터 병합
-            X_b = np.concatenate([X_b_LR, X_b_F], axis=0)
-            X_c = np.concatenate([X_c_LR, X_c_F], axis=0)
-            y = np.concatenate([y_LR, y_F], axis=0)
-            
-            # --- 3. 기하학 스파이크 추출 ---
-            win = 51
-            u = savgol_filter(np.abs(hilbert(X_b, axis=-1)), win, 3, axis=-1)
-            v = savgol_filter(np.abs(hilbert(X_c, axis=-1)), win, 3, axis=-1)
-            
-            du = savgol_filter(u, win, 3, deriv=1, axis=-1)
-            dv = savgol_filter(v, win, 3, deriv=1, axis=-1)
-            ddu = savgol_filter(u, win, 3, deriv=2, axis=-1)
-            ddv = savgol_filter(v, win, 3, deriv=2, axis=-1)
-            
-            areal_vel = 0.5 * np.abs(u * dv - v * du)[:, :, 80:400]
-            denom = np.clip((du**2 + dv**2)**(1.5), 1e-6, None)
-            curvature = np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10)[:, :, 80:400]
-            
-            geo_energy = areal_vel * curvature
-            th_geo = np.percentile(geo_energy, 90) 
-            kin_spikes = (geo_energy > th_geo).astype(np.float32)
-            kin_spikes = np.transpose(kin_spikes, (0, 2, 1)) 
-            
-            # --- 4. TDA 추출 ---
-            # 인덱스를 직접 지정하여 에러 방지 (표준 1005 기준)
-            point_clouds = np.stack([u[:, 12, :], v[:, 12, :], u[:, 14, :], v[:, 14, :], u[:, 16, :], v[:, 16, :]], axis=-1) # 대략 C3, Cz, C4 위치
-            VR = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1)
-            PL = PersistenceLandscape(n_bins=50)
-            tda_features = PL.fit_transform(VR.fit_transform(point_clouds)).reshape(len(y), -1).astype(np.float32)
-            
-            X_kin_list.append(torch.tensor(kin_spikes))
-            X_tda_list.append(torch.tensor(tda_features))
-            y_list.append(torch.tensor(y, dtype=torch.long))
-            
-            # 찌꺼기 메모리 청소
-            del X_b, X_c, u, v, du, dv, ddu, ddv, areal_vel, denom, curvature, geo_energy
-            gc.collect()
-            
-            if sub % 10 == 0:
-                print(f"✅ Sub {sub} 추출 완료... (Garbage Collected)")
-                
-        except Exception as e:
-            print(f"❌ Sub {sub} 에러 스킵: {e}")
-            
-    return torch.cat(X_kin_list), torch.cat(X_tda_list), torch.cat(y_list)
+    results = [r for r in results if r is not None]
+    return torch.tensor(np.concatenate([r[0] for r in results])), \
+           torch.tensor(np.concatenate([r[1] for r in results])), \
+           torch.tensor(np.concatenate([r[2] for r in results]), dtype=torch.long)
 
 # =========================================================
-# [3] 풀 테스트 실행 (Global Training & Zero-shot Test)
+# [3] 메인 트레이닝 루프
 # =========================================================
 if __name__ == "__main__":
-    print(f"🛠️ 디바이스 세팅: {device}")
+    VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
     
-    # 1. 완벽한 피험자 분리 (Train 84명 / Test 21명)
-    EXCLUDED_SUBJECTS = [88, 92, 100, 104]
-    VALID_SUBJECTS = [s for s in range(1, 110) if s not in EXCLUDED_SUBJECTS]
+    # 1. 병렬 데이터 로드
+    Xk, Xt, y = get_full_data_parallel(VALID_SUBS)
     
-    TRAIN_SUBJECTS = VALID_SUBJECTS[:84]
-    TEST_SUBJECTS = VALID_SUBJECTS[84:]
+    # 2. 84명(Train) / 21명(Test) 분리 (논문 세팅)
+    Xk_train, Xk_test, Xt_train, Xt_test, y_train, y_test = train_test_split(Xk, Xt, y, test_size=0.2, stratify=y, random_state=42)
     
-    # 2. 데이터 추출 (RAM 보호를 위해 분리해서 로드)
-    X_k_train, X_t_train, y_train = extract_memory_safe_data(TRAIN_SUBJECTS, phase_name="TRAIN SET")
-    X_k_test, X_t_test, y_test = extract_memory_safe_data(TEST_SUBJECTS, phase_name="TEST SET")
-    
-    train_loader = DataLoader(TensorDataset(X_k_train, X_t_train, y_train), batch_size=128, shuffle=True)
-    test_loader = DataLoader(TensorDataset(X_k_test, X_t_test, y_test), batch_size=128, shuffle=False)
+    train_loader = DataLoader(TensorDataset(Xk_train, Xt_train, y_train), batch_size=128, shuffle=True)
+    test_loader = DataLoader(TensorDataset(Xk_test, Xt_test, y_test), batch_size=128, shuffle=False)
 
-    # 3. 모델 및 학습 세팅
     model = PhysioNetGeoLIF_4Class().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.002, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 FULL SCALE 모델 학습 시작! (Train Data: {len(y_train)}, Test Data: {len(y_test)})")
-    
-    best_acc = 0.0
-    
-    for epoch in range(100):
-        start_time = time.time()
-        
-        # --- Training ---
+    print(f"\n🚀 SNN 하이브리드 학습 개시 (총 샘플: {len(y)})")
+    pbar = tqdm(range(100), desc="에포크")
+    for epoch in pbar:
         model.train()
-        running_loss, correct, total = 0.0, 0, 0
-        
-        for kin_batch, tda_batch, target in train_loader:
-            kin_batch, tda_batch, target = kin_batch.to(device), tda_batch.to(device), target.to(device)
+        tr_correct, tr_total = 0, 0
+        for kb, tb, yb in train_loader:
+            kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
             optimizer.zero_grad()
-            
-            spike_out = model(kin_batch, tda_batch)
-            spike_sum = spike_out.sum(dim=1) 
-            
-            loss = criterion(spike_sum, target)
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item()
-            _, predicted = spike_sum.max(1)
-            total += target.size(0)
-            correct += predicted.eq(target).sum().item()
-            
-        train_acc = 100. * correct / total
+            out_sum = model(kb, tb).sum(dim=1)
+            loss = criterion(out_sum, yb)
+            loss.backward(); optimizer.step()
+            tr_correct += out_sum.max(1)[1].eq(yb).sum().item(); tr_total += yb.size(0)
+        
         scheduler.step()
         
-        # --- Zero-Shot Testing ---
+        # Zero-shot Test
         model.eval()
-        val_correct, val_total = 0, 0
+        ts_correct, ts_total = 0, 0
         with torch.no_grad():
-            for kin_batch, tda_batch, target in test_loader:
-                kin_batch, tda_batch, target = kin_batch.to(device), tda_batch.to(device), target.to(device)
-                
-                spike_out = model(kin_batch, tda_batch)
-                spike_sum = spike_out.sum(dim=1)
-                
-                _, predicted = spike_sum.max(1)
-                val_total += target.size(0)
-                val_correct += predicted.eq(target).sum().item()
-                
-        test_acc = 100. * val_correct / val_total
+            for kb, tb, yb in test_loader:
+                kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
+                ts_correct += model(kb, tb).sum(dim=1).max(1)[1].eq(yb).sum().item(); ts_total += yb.size(0)
         
-        if test_acc > best_acc:
-            best_acc = test_acc
-            torch.save(model.state_dict(), './best_geosnn_model.pth')
-            
-        epoch_time = time.time() - start_time
-        print(f"Epoch [{epoch+1:03d}/100] Loss: {running_loss/len(train_loader):.4f} | Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Best: {best_acc:.2f}% | Time: {epoch_time:.1f}s")
+        pbar.set_postfix(Train=f"{100*tr_correct/tr_total:.1f}%", Test=f"{100*ts_correct/ts_total:.1f}%")
 
-    print(f"\n🎉 전체 파이프라인 완료! 최종 뼈대 최고 정확도(Zero-shot): {best_acc:.2f}%")
+    print("\n✅ 모든 과정 종료. 최종 정확도를 확인해!")

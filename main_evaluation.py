@@ -1,5 +1,4 @@
 import os
-import gc
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -20,7 +19,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
 # =========================================================
-# [1] Ultimate Geo-SNN 모델 (발화 임계값 대폭 완화)
+# [1] SNN 모델 (배치 정규화 유지, 임계값 복구)
 # =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
@@ -35,18 +34,16 @@ class SurrogateSpike(torch.autograd.Function):
 spike_fn = SurrogateSpike.apply
 
 class PhysioNetGeoLIF_4Class(nn.Module):
-    # [수정 포인트 1] base_thresh를 1.0에서 0.2로 확 낮춰서 뉴런이 쉽게 반응하게 함
-    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.9, base_thresh=0.2):
+    def __init__(self, num_eeg_channels=64, hidden_dim=64, num_classes=4, leak=0.9, base_thresh=1.0):
         super().__init__()
         self.leak = leak
         self.base_thresh = base_thresh
         
         self.spatial_conv1x1 = nn.Linear(num_eeg_channels, hidden_dim, bias=False)
         self.bn1 = nn.BatchNorm1d(hidden_dim) 
-        
         self.class_conv1x1 = nn.Linear(hidden_dim, num_classes, bias=False)
         self.lateral_weights = nn.Parameter(torch.eye(4) * 0.8 - 0.1, requires_grad=True)
-        self.tda_to_thresh = nn.Linear(50, num_classes)
+        self.tda_to_thresh = nn.Linear(50 * 3, num_classes) # C3, Cz, C4 각각의 TDA가 들어오므로 *3
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
@@ -76,7 +73,7 @@ class PhysioNetGeoLIF_4Class(nn.Module):
         return spike_sum
 
 # =========================================================
-# [2] 병렬 데이터 엔진 (스파이크 유입량 증가)
+# [2] 병렬 데이터 엔진 (오리지널 기하학 공식 100% 복원)
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
@@ -105,7 +102,6 @@ def process_single_subject(sub):
             t0 = next((v for k, v in ev_id.items() if 'T0' in k), None)
             t1 = next((v for k, v in ev_id.items() if 'T1' in k), None)
             t2 = next((v for k, v in ev_id.items() if 'T2' in k), None)
-            
             ep = mne.Epochs(raw, evs, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
             try: csd = mne.preprocessing.compute_current_source_density(raw.copy(), sphere=(0,0,0,0.095))
             except: csd = raw.copy()
@@ -115,11 +111,8 @@ def process_single_subject(sub):
         d_lr, c_lr, y_lr, lr0, lr1, lr2, chs = get_epochs(raw_lr)
         d_f, c_f, y_f, f0, f1, f2, _ = get_epochs(raw_f)
         
-        idx_lh = np.where(y_lr == lr1)[0] 
-        idx_rh = np.where(y_lr == lr2)[0] 
-        idx_ft = np.where(y_f == f2)[0]   
-        idx_rest_lr = np.where(y_lr == lr0)[0]
-        idx_rest_f = np.where(y_f == f0)[0]
+        idx_lh, idx_rh, idx_ft = np.where(y_lr == lr1)[0], np.where(y_lr == lr2)[0], np.where(y_f == f2)[0]
+        idx_rest_lr, idx_rest_f = np.where(y_lr == lr0)[0], np.where(y_f == f0)[0]
         
         min_trials = min(len(idx_lh), len(idx_rh), len(idx_ft), len(idx_rest_lr) + len(idx_rest_f))
         if min_trials == 0: return None
@@ -127,57 +120,65 @@ def process_single_subject(sub):
         idx_lh, idx_rh, idx_ft = idx_lh[:min_trials], idx_rh[:min_trials], idx_ft[:min_trials]
         idx_rest = np.concatenate([idx_rest_lr, idx_rest_f + len(y_lr)])[:min_trials]
         
-        d_all = np.concatenate([d_lr, d_f])
-        c_all = np.concatenate([c_lr, c_f])
-        
-        xb = np.concatenate([d_all[idx_lh], d_all[idx_rh], d_all[idx_ft], d_all[idx_rest]])
-        xc = np.concatenate([c_all[idx_lh], c_all[idx_rh], c_all[idx_ft], c_all[idx_rest]])
-        
+        xb = np.concatenate([np.concatenate([d_lr, d_f])[idx_lh], np.concatenate([d_lr, d_f])[idx_rh], np.concatenate([d_lr, d_f])[idx_ft], np.concatenate([d_lr, d_f])[idx_rest]])
+        xc = np.concatenate([np.concatenate([c_lr, c_f])[idx_lh], np.concatenate([c_lr, c_f])[idx_rh], np.concatenate([c_lr, c_f])[idx_ft], np.concatenate([c_lr, c_f])[idx_rest]])
         y = np.concatenate([np.zeros(min_trials), np.ones(min_trials), np.full(min_trials, 2), np.full(min_trials, 3)])
 
-        u = savgol_filter(np.abs(hilbert(xb, axis=-1)), 51, 3, axis=-1)
-        v = savgol_filter(np.abs(hilbert(xc, axis=-1)), 51, 3, axis=-1)
-        du, dv = np.gradient(u, axis=-1), np.gradient(v, axis=-1)
+        # --- [복원 1] 오리지널 기하학 피처 연산 로직 (네가 증명한 수식 그대로) ---
+        win = 51
+        u = savgol_filter(np.abs(hilbert(xb, axis=-1)), win, 3, axis=-1)
+        v = savgol_filter(np.abs(hilbert(xc, axis=-1)), win, 3, axis=-1)
+        du = savgol_filter(u, win, 3, deriv=1, axis=-1)
+        dv = savgol_filter(v, win, 3, deriv=1, axis=-1)
+        ddu = savgol_filter(u, win, 3, deriv=2, axis=-1)
+        ddv = savgol_filter(v, win, 3, deriv=2, axis=-1)
         
-        geo = (0.5 * np.abs(u * dv - v * du) * np.abs(u*dv - v*du)/(np.clip((du**2 + dv**2)**1.5, 1e-6, None)))[:, :, 80:400]
-        geo_norm = (geo - geo.mean(axis=(1,2), keepdims=True)) / (geo.std(axis=(1,2), keepdims=True) + 1e-6)
+        areal_vel = 0.5 * np.abs(u * dv - v * du)
+        denom = np.clip((du**2 + dv**2)**(1.5), 1e-6, None)
+        curvature = np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10)
         
-        # [수정 포인트 2] 스파이크 유입량을 확 늘림 (Z > 1.0 -> Z > 0.5)
-        kin_spikes = (geo_norm > 0.5).astype(np.float32).transpose(0, 2, 1)
+        geo_energy = (areal_vel * curvature)[:, :, 80:400] # Edge crop
         
+        # [복원 2] Z-Score 꼼수 버리고 오리지널 85th Percentile 임계값 적용
+        th_geo = np.percentile(geo_energy, 85)
+        kin_spikes = (geo_energy > th_geo).astype(np.float32).transpose(0, 2, 1) # [Trials, Time, 64]
+        
+        # --- [복원 3] 2D 복소평면 기반 TDA 독립 추출 ---
         ch_upper = [c.upper() for c in chs]
         idx_c = [ch_upper.index(n) for n in ['C3', 'CZ', 'C4'] if n in ch_upper]
         if len(idx_c) < 3: return None
         
-        VR = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1)
+        VR = VietorisRipsPersistence(homology_dimensions=[0, 1], n_jobs=1)
         PL = PersistenceLandscape(n_bins=50)
-        tda_in = np.stack([u[:,idx_c[0],:], v[:,idx_c[0],:], u[:,idx_c[1],:], v[:,idx_c[1],:], u[:,idx_c[2],:], v[:,idx_c[2],:]], axis=-1)
-        tda = PL.fit_transform(VR.fit_transform(tda_in)).reshape(len(y), -1).astype(np.float32)
+        
+        tda_landscapes = []
+        for ch_idx in idx_c:
+            # 6차원이 아니라 2차원(u, v)으로 각 채널별 독립적인 궤적(Point Cloud) 생성
+            pt_cloud = np.stack([u[:, ch_idx, 80:400], v[:, ch_idx, 80:400]], axis=-1) # (Trials, Time, 2)
+            diagrams = VR.fit_transform(pt_cloud)
+            landscapes = PL.fit_transform(diagrams) # (Trials, 50)
+            tda_landscapes.append(landscapes)
+            
+        # 3개 채널의 Landscape를 가로로 이어 붙임 (Trials, 150)
+        tda_final = np.concatenate(tda_landscapes, axis=1).astype(np.float32)
 
-        return kin_spikes, tda, y
+        return kin_spikes, tda_final, y
     except Exception as e: 
         return None
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 CPU 코어 {num_workers}개 사용. 데이터 전처리 및 밸런싱 시작...")
-    
+    print(f"🔥 오리지널 수식 복원 완료. {num_workers}개 코어로 전처리 시작...")
     with Pool(num_workers) as p:
         results = [r for r in list(tqdm(p.imap(process_single_subject, subjects), total=len(subjects), desc="전처리", mininterval=5)) if r is not None]
     
     if not results: raise ValueError("⚠️ 데이터 추출 실패.")
-    
     Xk = np.concatenate([r[0] for r in results])
     Xt = np.concatenate([r[1] for r in results])
     y = np.concatenate([r[2] for r in results])
-    
-    unique, counts = np.unique(y, return_counts=True)
-    print(f"📊 [완벽한 클래스 분포] LH(0): {counts[0]}, RH(1): {counts[1]}, Feet(2): {counts[2]}, Rest(3): {counts[3]}")
+    print(f"📊 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
     return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long)
 
-# =========================================================
-# [3] 메인 학습 루프
-# =========================================================
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
     Xk, Xt, y = get_full_data_parallel(VALID_SUBS)
@@ -192,7 +193,7 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 진짜 보물 사냥 시작! 샘플 수: {len(y)}")
+    print(f"\n🚀 진짜 보물 장착 완료. 학습 개시 (샘플 수: {len(y)})")
     pbar = tqdm(range(100), desc="에포크", mininterval=5)
     best_acc = 0.0
     

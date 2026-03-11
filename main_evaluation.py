@@ -67,17 +67,23 @@ def augment_with_sliding_window(features, labels, window_size=320, step_size=32)
     return torch.cat(aug_features, dim=0), torch.cat(aug_labels, dim=0)
 
 def load_local_runs(subject, run_list):
+    sub_str = f"S{subject:03d}"
     raws = []
     for run in run_list:
+        file_path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf")
+        if not os.path.exists(file_path): 
+            file_path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"s{subject:03d}r{run:02d}.edf")
+            if not os.path.exists(file_path): return None
+            
         try:
-            raw_path = mne.datasets.eegbci.load_data(subject, run, update_path=False, verbose=False)[0]
-            raw = mne.io.read_raw_edf(raw_path, preload=True, verbose=False)
+            raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
             raw.filter(l_freq=8., h_freq=30., fir_design='firwin', verbose=False) 
             mne.datasets.eegbci.standardize(raw)
             raw.set_montage('standard_1005', match_case=False, on_missing='ignore')
             raws.append(raw)
         except Exception as e:
             return None
+            
     return mne.concatenate_raws(raws) if raws else None
 
 def load_and_align_subject_data(subject):

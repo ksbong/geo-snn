@@ -456,5 +456,3 @@ if __name__ == "__main__":
         logging.info(f"[SSTL Fine-tuning] Epoch [{epoch+1:02d}/{FT_EPOCHS}] | Target Test Acc: {ft_acc:.2f}% (Best: {best_ft_acc:.2f}%)")
         
     logging.info(f"Phase 2 Complete. Best SSTL Target Accuracy: {best_ft_acc:.2f}%")
-    
-    os.system("sleep 60 && runpodctl stop pod $RUNPOD_POD_ID")

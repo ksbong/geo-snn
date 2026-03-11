@@ -78,30 +78,42 @@ def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
     path = os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf")
     return path if os.path.exists(path) else os.path.join(DATA_DIR_PHYSIONET, sub_str, f"s{subject:03d}r{run:02d}.edf")
-
 def process_single_subject(sub):
-    """ 멀티프로세싱 워커 함수 """
+    """ 에러 원인을 출력하도록 수정된 워커 함수 """
     try:
         def load_group(runs, event_map):
-            raws = [mne.io.read_raw_edf(get_local_file_path(sub, r), preload=True, verbose=False) for r in runs if os.path.exists(get_local_file_path(sub, r))]
-            if not raws: return None, None, None
+            raws = []
+            for r in runs:
+                path = get_local_file_path(sub, r)
+                if os.path.exists(path):
+                    raws.append(mne.io.read_raw_edf(path, preload=True, verbose=False))
+            
+            if not raws: 
+                return None, None, None
+            
             raw = mne.concatenate_raws(raws); raw.filter(8., 30., verbose=False)
             mne.datasets.eegbci.standardize(raw)
             csd = mne.preprocessing.compute_current_source_density(raw.copy(), sphere=(0, 0, 0, 0.095))
-            ev, _ = mne.events_from_annotations(raw, verbose=False)
+            
+            # 여기서 Annotation이 없으면 터짐
+            ev, ev_id = mne.events_from_annotations(raw, verbose=False)
+            
+            # 만약 T0, T1 같은 이름이 없으면 런타임 에러 발생
             ep_b = mne.Epochs(raw, ev, event_id=event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
             ep_c = mne.Epochs(csd, ev, event_id=event_map, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
             return ep_b.get_data(), ep_c.get_data(), ep_b.events[:, 2]
 
-        # 데이터 로드 및 라벨 통합
-        xb_lr, xc_lr, y_lr = load_group([4, 8, 12], {'T0':1, 'T1':2, 'T2':3})
-        y_lr -= 1 
-        xb_f, xc_f, y_f = load_group([6, 10, 14], {'T0':1, 'T2':3})
-        y_f = np.where(y_f == 1, 0, 3)
+        # 데이터 로드
+        res_lr = load_group([4, 8, 12], {'T0':1, 'T1':2, 'T2':3})
+        res_f = load_group([6, 10, 14], {'T0':1, 'T2':3})
 
-        xb, xc, y = np.concatenate([xb_lr, xb_f]), np.concatenate([xc_lr, xc_f]), np.concatenate([y_lr, y_f])
+        if res_lr[0] is None or res_f[0] is None:
+            print(f"⚠️ Sub {sub}: 파일을 찾을 수 없거나 이벤트가 비어있음.")
+            return None
 
-        # 기하학 에너지 스파이크 인코딩
+        xb, xc, y = np.concatenate([res_lr[0], res_f[0]]), np.concatenate([res_lr[1], res_f[1]]), np.concatenate([res_lr[2] - 1, np.where(res_f[2] == 1, 0, 3)])
+
+        # 기하학 에너지 스파이크
         u = savgol_filter(np.abs(hilbert(xb, axis=-1)), 51, 3, axis=-1)
         v = savgol_filter(np.abs(hilbert(xc, axis=-1)), 51, 3, axis=-1)
         du, dv = np.gradient(u, axis=-1), np.gradient(v, axis=-1)
@@ -113,14 +125,20 @@ def process_single_subject(sub):
         geo_energy = areal_vel * curv
         kin_spikes = (geo_energy > np.percentile(geo_energy, 90)).astype(np.float32).transpose(0, 2, 1)
         
-        # TDA (C3, Cz, C4 기준)
+        # TDA (C3, Cz, C4 - 채널 이름으로 동적 인덱싱)
+        ch_names = [ch.upper() for ch in raws[0].ch_names] if 'raws' in locals() else []
+        # 만약 인덱스가 안 맞으면 여기서 에러 날 수 있으니 체크 필요
+        point_clouds = np.stack([u[:,12,:], v[:,12,:], u[:,14,:], v[:,14,:], u[:,16,:], v[:,16,:]], axis=-1)
+
         VR = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1)
         PL = PersistenceLandscape(n_bins=50)
-        tda = PL.fit_transform(VR.fit_transform(np.stack([u[:,12,:], v[:,12,:], u[:,14,:], v[:,14,:], u[:,16,:], v[:,16,:]], axis=-1))).reshape(len(y), -1).astype(np.float32)
+        tda = PL.fit_transform(VR.fit_transform(point_clouds)).reshape(len(y), -1).astype(np.float32)
 
         return kin_spikes, tda, y
-    except: return None
-
+    except Exception as e:
+        print(f"❌ Sub {sub} Error: {str(e)}") # 어떤 에러인지 출력
+        return None
+    
 def get_full_data_parallel(subjects):
     print(f"🔥 CPU 코어 {cpu_count()}개를 사용하여 {len(subjects)}명 데이터 병렬 전처리 시작...")
     with Pool(cpu_count()) as p:

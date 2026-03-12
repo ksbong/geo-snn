@@ -32,11 +32,21 @@ spike_fn = SurrogateSpike.apply
 class RobustGeoSNN(nn.Module):
     def __init__(self, num_eeg_channels=64, hidden_dim=128, num_classes=4):
         super().__init__()
-        self.spike_fc = nn.Linear(num_eeg_channels, hidden_dim)
-        nn.init.normal_(self.spike_fc.weight, mean=0.02, std=0.1) 
-        if self.spike_fc.bias is not None:
-            nn.init.zeros_(self.spike_fc.bias)
-            
+        
+        # [복원] 네가 예전에 썼던 CNN 기반 공간/시간 특징 추출기 (진짜 뇌 주름 생성)
+        # 시간축(T)을 따라 1D Conv를 돌려서 희소한 스파이크에서 풍부한 패턴 전류를 뽑아냄
+        self.cnn_extractor = nn.Sequential(
+            nn.Conv1d(num_eeg_channels, hidden_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim), # CNN에는 BN을 써도 스파이크 뇌사가 안 일어남!
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        
+        # [심층 SNN] 1층짜리 쓰레기 버리고 2단 Deep SNN으로 변경
+        self.snn_layer1 = nn.Linear(hidden_dim, hidden_dim)
+        self.snn_layer2 = nn.Linear(hidden_dim, hidden_dim)
+        
+        # TDA 독립 처리 층
         self.tda_net = nn.Sequential(
             nn.Linear(150, 64),
             nn.ReLU(),
@@ -44,31 +54,52 @@ class RobustGeoSNN(nn.Module):
             nn.ReLU()
         )
         
-        # [핵심 수정] 멍청한 단일 Linear 층을 딥 MLP로 변경하고 과적합 방지용 Dropout(0.5) 추가
-        # 스파이크 빈도수와 TDA 특징을 더 깊게 융합(Fusion)시킴
+        # 앙상블 분류기
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim + 64, 128),
-            nn.BatchNorm1d(128), # 여기 BN은 시간축이 아니라 출력층이라서 안전하고 학습 속도 올려줌
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.5),     # 뉴런 절반을 무작위로 꺼서 암기(Overfitting) 방지
+            nn.Dropout(0.4), 
             nn.Linear(128, num_classes)
         )
 
     def forward(self, kin_spikes_seq, tda_features):
         B, T, _ = kin_spikes_seq.shape
-        mem = torch.zeros(B, 128, device=kin_spikes_seq.device)
+        
+        # CNN 처리를 위해 차원 변경: [B, T, 64] -> [B, 64, T]
+        x_cnn = kin_spikes_seq.transpose(1, 2)
+        
+        # 희소 스파이크 -> 풍부한 연속 전류로 변환
+        current_features = self.cnn_extractor(x_cnn) # [B, 128, T]
+        
+        # 다시 SNN 입력을 위해 시간축 복구: [B, 128, T] -> [B, T, 128]
+        current_seq = current_features.transpose(1, 2)
+        
+        # 1층, 2층 SNN 전압 독립 관리
+        mem1 = torch.zeros(B, 128, device=kin_spikes_seq.device)
+        mem2 = torch.zeros(B, 128, device=kin_spikes_seq.device)
         spike_counts = torch.zeros(B, 128, device=kin_spikes_seq.device)
         
         for t in range(T):
-            current = self.spike_fc(kin_spikes_seq[:, t, :]) 
-            mem = 0.9 * mem + current 
-            spk = spike_fn(mem - 1.0) 
-            mem = mem * (1.0 - spk)   
-            spike_counts += spk
+            # 1층 SNN
+            cur1 = self.snn_layer1(current_seq[:, t, :])
+            mem1 = 0.9 * mem1 + cur1
+            spk1 = spike_fn(mem1 - 1.0)
+            mem1 = mem1 * (1.0 - spk1)
             
+            # 2층 SNN (1층의 스파이크를 입력으로 받음)
+            cur2 = self.snn_layer2(spk1)
+            mem2 = 0.9 * mem2 + cur2
+            spk2 = spike_fn(mem2 - 1.0)
+            mem2 = mem2 * (1.0 - spk2)
+            
+            spike_counts += spk2
+            
+        # 발화율 정규화
         firing_rate = spike_counts / T
-        tda_out = self.tda_net(tda_features)
         
+        # TDA 병합 및 최종 분류
+        tda_out = self.tda_net(tda_features)
         fused_features = torch.cat([firing_rate, tda_out], dim=1) 
         out = self.classifier(fused_features)
         

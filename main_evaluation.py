@@ -35,18 +35,23 @@ spike_fn = SurrogateSpike.apply
 # [2] Temporal Conv + HR-SNN 구조
 # =========================================================
 class GeoHRSNN(nn.Module):
-    def __init__(self, in_ch=64, temp_hid=32, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
+    # temp_hid를 128로 늘려 전극당 2개의 독립적인 시간 특징을 뽑아냄
+    def __init__(self, in_ch=64, temp_hid=128, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
         super().__init__()
         self.L_DP = L_DP 
         self.N_DP = N_DP 
         
-        # [핵심] LSTM을 완벽히 대체하는 1D Temporal Conv (시간축 패턴 추출)
+        # [오버피팅 방지 핵심 1] Depthwise 1D Conv (채널 독립적 시간 패턴 추출)
+        # groups=in_ch 로 설정하여 64개 채널이 절대 섞이지 않고 각자의 시간 흐름만 분석함!
         self.temp_conv = nn.Sequential(
-            nn.Conv1d(in_ch, temp_hid, kernel_size=15, padding=7),
+            nn.Conv1d(in_ch, temp_hid, kernel_size=15, padding=7, groups=in_ch),
             nn.BatchNorm1d(temp_hid),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(0.4) # 시간 특징에 강한 드롭아웃을 걸어 암기 방지
         )
         
+        # [오버피팅 방지 핵심 2] 공간 매핑 (Pointwise 역할)
+        # 여기서 비로소 각 전극의 시간 정보를 종합하여 공간 특징을 만들어냄
         self.spatial_fc = nn.Linear(temp_hid, hid_ch)
         nn.init.normal_(self.spatial_fc.weight, mean=0.05, std=0.1) 
         
@@ -54,14 +59,14 @@ class GeoHRSNN(nn.Module):
         
         self.tda_net = nn.Sequential(
             nn.Linear(150, 64), nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4), # TDA도 피험자 특성을 타기 쉬우므로 드롭아웃 강화
             nn.Linear(64, 32), nn.ReLU()
         )
         
         self.dp_out_dim = (320 // L_DP) * hid_ch
         
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
+            nn.Dropout(0.5), # 빡센 정규화
             nn.Linear(self.dp_out_dim + 32, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
@@ -72,10 +77,12 @@ class GeoHRSNN(nn.Module):
     def forward(self, x, tda):
         B, T, _ = x.shape
         
-        # [Temporal Conv] B, T, C -> B, C, T
+        # 입력 스파이크 자체에도 임의의 노이즈(드롭아웃)를 살짝 줘서 센서 노이즈에 대한 강건함 부여
+        x = nn.functional.dropout(x, p=0.1, training=self.training)
+        
         x_t = x.transpose(1, 2)
-        x_t = self.temp_conv(x_t) # [B, temp_hid, T]
-        x_t = x_t.transpose(1, 2) # [B, T, temp_hid]
+        x_t = self.temp_conv(x_t) 
+        x_t = x_t.transpose(1, 2) 
         
         mem_fast = torch.zeros(B, 64, device=x.device)
         mem_slow = torch.zeros(B, 64, device=x.device)
@@ -110,7 +117,7 @@ class GeoHRSNN(nn.Module):
         tda_feat = self.tda_net(tda) 
         out = self.classifier(torch.cat([dp_feat, tda_feat], dim=-1))
         return out
-
+    
 # =========================================================
 # [3] 병렬 데이터 엔진 (논문 방식대로 피험자 ID 함께 반환)
 # =========================================================

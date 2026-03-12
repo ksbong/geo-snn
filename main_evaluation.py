@@ -17,9 +17,6 @@ mne.set_log_level('ERROR')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
-# =========================================================
-# [1] Surrogate 스파이크
-# =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
@@ -32,26 +29,23 @@ class SurrogateSpike(torch.autograd.Function):
 spike_fn = SurrogateSpike.apply
 
 # =========================================================
-# [2] Temporal Conv + HR-SNN 구조
+# [1] 모델 구조 (입력 채널 64 -> 128로 확장)
 # =========================================================
 class GeoHRSNN(nn.Module):
-    # temp_hid를 128로 늘려 전극당 2개의 독립적인 시간 특징을 뽑아냄
-    def __init__(self, in_ch=64, temp_hid=128, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
+    # 면적속도(64) + 곡률(64) = 128채널 입력
+    def __init__(self, in_ch=128, temp_hid=128, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
         super().__init__()
         self.L_DP = L_DP 
         self.N_DP = N_DP 
         
-        # [오버피팅 방지 핵심 1] Depthwise 1D Conv (채널 독립적 시간 패턴 추출)
-        # groups=in_ch 로 설정하여 64개 채널이 절대 섞이지 않고 각자의 시간 흐름만 분석함!
+        # 각 면적속도와 곡률 채널을 섞지 않고 독립적으로 시간 패턴을 추출 (groups=128)
         self.temp_conv = nn.Sequential(
             nn.Conv1d(in_ch, temp_hid, kernel_size=15, padding=7, groups=in_ch),
             nn.BatchNorm1d(temp_hid),
             nn.ReLU(),
-            nn.Dropout(0.4) # 시간 특징에 강한 드롭아웃을 걸어 암기 방지
+            nn.Dropout(0.4) 
         )
         
-        # [오버피팅 방지 핵심 2] 공간 매핑 (Pointwise 역할)
-        # 여기서 비로소 각 전극의 시간 정보를 종합하여 공간 특징을 만들어냄
         self.spatial_fc = nn.Linear(temp_hid, hid_ch)
         nn.init.normal_(self.spatial_fc.weight, mean=0.05, std=0.1) 
         
@@ -59,14 +53,14 @@ class GeoHRSNN(nn.Module):
         
         self.tda_net = nn.Sequential(
             nn.Linear(150, 64), nn.ReLU(),
-            nn.Dropout(0.4), # TDA도 피험자 특성을 타기 쉬우므로 드롭아웃 강화
+            nn.Dropout(0.4), 
             nn.Linear(64, 32), nn.ReLU()
         )
         
         self.dp_out_dim = (320 // L_DP) * hid_ch
         
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5), # 빡센 정규화
+            nn.Dropout(0.5), 
             nn.Linear(self.dp_out_dim + 32, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
@@ -76,8 +70,6 @@ class GeoHRSNN(nn.Module):
 
     def forward(self, x, tda):
         B, T, _ = x.shape
-        
-        # 입력 스파이크 자체에도 임의의 노이즈(드롭아웃)를 살짝 줘서 센서 노이즈에 대한 강건함 부여
         x = nn.functional.dropout(x, p=0.1, training=self.training)
         
         x_t = x.transpose(1, 2)
@@ -117,9 +109,9 @@ class GeoHRSNN(nn.Module):
         tda_feat = self.tda_net(tda) 
         out = self.classifier(torch.cat([dp_feat, tda_feat], dim=-1))
         return out
-    
+
 # =========================================================
-# [3] 병렬 데이터 엔진 (논문 방식대로 피험자 ID 함께 반환)
+# [2] 병렬 데이터 엔진 (네 아이디어: 피처 분리 탑재)
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
@@ -162,7 +154,6 @@ def process_single_subject(sub):
         if min_trials == 0: return None
         
         idx_lh, idx_rh, idx_ft = idx_lh[:min_trials], idx_rh[:min_trials], idx_ft[:min_trials]
-        
         d_lh, c_lh = d_lr[idx_lh], c_lr[idx_lh]
         d_rh, c_rh = d_lr[idx_rh], c_lr[idx_rh]
         d_ft, c_ft = d_f[idx_ft], c_f[idx_ft]
@@ -172,8 +163,6 @@ def process_single_subject(sub):
         xb = np.concatenate([d_lh, d_rh, d_ft, d_rest])
         xc = np.concatenate([c_lh, c_rh, c_ft, c_rest])
         y = np.concatenate([np.zeros(min_trials), np.ones(min_trials), np.full(min_trials, 2), np.full(min_trials, 3)])
-        
-        # 논문 평가를 위한 피험자 ID 배열
         subjects_arr = np.full(len(y), sub)
 
         win = 51
@@ -184,19 +173,31 @@ def process_single_subject(sub):
         ddu = savgol_filter(u, win, 3, deriv=2, axis=-1)
         ddv = savgol_filter(v, win, 3, deriv=2, axis=-1)
         
-        areal_vel = 0.5 * np.abs(u * dv - v * du)
+        # [핵심 변경] 면적속도와 곡률을 곱하지 않고 완전히 독립적으로 계산
+        areal_vel = (0.5 * np.abs(u * dv - v * du))[:, :, 80:400]
         denom = np.clip((du**2 + dv**2)**(1.5), 1e-6, None)
-        curvature = np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10)
+        curvature = (np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10))[:, :, 80:400]
         
-        geo_energy = (areal_vel * curvature)[:, :, 80:400] 
-        geo_energy = np.nan_to_num(geo_energy, nan=0.0, posinf=0.0, neginf=0.0)
+        areal_vel = np.nan_to_num(areal_vel, nan=0.0, posinf=0.0, neginf=0.0)
+        curvature = np.nan_to_num(curvature, nan=0.0, posinf=0.0, neginf=0.0)
         
-        geo_mean = np.mean(geo_energy, axis=(1, 2), keepdims=True)
-        geo_std = np.std(geo_energy, axis=(1, 2), keepdims=True) + 1e-8
-        geo_norm = (geo_energy - geo_mean) / geo_std
+        # 1. 면적속도 독립 정규화 및 스파이크 발화
+        vel_mean = np.mean(areal_vel, axis=(1, 2), keepdims=True)
+        vel_std = np.std(areal_vel, axis=(1, 2), keepdims=True) + 1e-8
+        vel_norm = (areal_vel - vel_mean) / vel_std
+        th_vel = np.percentile(vel_norm, 85)
+        spikes_vel = (vel_norm > th_vel).astype(np.float32) # [Trials, 64, 320]
         
-        th_geo = np.percentile(geo_norm, 85)
-        kin_spikes = (geo_norm > th_geo).astype(np.float32).transpose(0, 2, 1) 
+        # 2. 곡률 독립 정규화 및 스파이크 발화
+        curv_mean = np.mean(curvature, axis=(1, 2), keepdims=True)
+        curv_std = np.std(curvature, axis=(1, 2), keepdims=True) + 1e-8
+        curv_norm = (curvature - curv_mean) / curv_std
+        th_curv = np.percentile(curv_norm, 85)
+        spikes_curv = (curv_norm > th_curv).astype(np.float32) # [Trials, 64, 320]
+        
+        # 3. 면적속도(64)와 곡률(64)을 채널 축으로 이어붙임 -> 총 128채널
+        kin_features = np.concatenate([spikes_vel, spikes_curv], axis=1) # [Trials, 128, 320]
+        kin_spikes = kin_features.transpose(0, 2, 1) # 모델 입력을 위해 [Trials, 320, 128]로 변환
         
         ch_upper = [c.upper() for c in chs]
         idx_c = [ch_upper.index(n) for n in ['C3', 'CZ', 'C4'] if n in ch_upper]
@@ -220,7 +221,7 @@ def process_single_subject(sub):
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 오리지널 몽타주 복원 + 정규화 완료. 병렬 전처리 시작...")
+    print(f"🔥 피처 뭉개짐 해결 (면적속도/곡률 분리). 병렬 전처리 시작...")
     results = []
     with Pool(num_workers) as p:
         for i, r in enumerate(p.imap(process_single_subject, subjects)):
@@ -233,13 +234,14 @@ def get_full_data_parallel(subjects):
     y = np.concatenate([r[2] for r in results])
     subs = np.concatenate([r[3] for r in results])
     print(f"📊 최종 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
+    # 희소성이 128채널 전체에 걸쳐 0.15로 잘 유지되는지 확인
+    print(f"🔍 입력 스파이크 희소성(Sparsity): {Xk.mean():.4f} (약 0.15 정상 복원)")
     return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long), subs
 
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
     Xk, Xt, y, subs = get_full_data_parallel(VALID_SUBS)
     
-    # [핵심] 논문의 Global Training 방식: 피험자 기준으로 80:20 완전히 분할
     unique_subs = np.unique(subs)
     train_subs, test_subs = train_test_split(unique_subs, test_size=0.2, random_state=42)
     
@@ -254,16 +256,12 @@ if __name__ == "__main__":
 
     model = GeoHRSNN().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=0.005, weight_decay=0.01)
-    # [수정] 튀어오르는 현상을 없애기 위해 부드러운 코사인 스케줄러로 변경
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 피험자 독립 분할(Global Training) 방식 적용 완료. 학습 개시")
+    print(f"\n🚀 분리된 128채널 기하학 피처로 Global Training 개시")
     print(f"Train 피험자: {len(train_subs)}명, Test 피험자: {len(test_subs)}명")
     best_acc = 0.0
-    
-    history_train_loss, history_train_acc, history_test_acc = [], [], []
-    final_preds, final_trues = [], []
     
     for epoch in range(1, 101):
         model.train()
@@ -286,7 +284,6 @@ if __name__ == "__main__":
         
         model.eval()
         ts_c, ts_t = 0, 0
-        epoch_preds, epoch_trues = [], []
         with torch.no_grad():
             for kb, tb, yb in test_loader:
                 kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
@@ -295,29 +292,10 @@ if __name__ == "__main__":
                 ts_c += preds.eq(yb).sum().item()
                 ts_t += yb.size(0)
                 
-                epoch_preds.extend(preds.cpu().numpy())
-                epoch_trues.extend(yb.cpu().numpy())
-        
         epoch_loss = tr_loss / tr_t
         tr_acc = 100 * tr_c / tr_t
         ts_acc = 100 * ts_c / ts_t
         
-        history_train_loss.append(epoch_loss)
-        history_train_acc.append(tr_acc)
-        history_test_acc.append(ts_acc)
+        if ts_acc > best_acc: best_acc = ts_acc
         
-        if ts_acc > best_acc: 
-            best_acc = ts_acc
-            final_preds = epoch_preds
-            final_trues = epoch_trues
-            torch.save(model.state_dict(), "best_geohrsnn.pth")
-        
-        print(f"Epoch [{epoch:03d}/100] Loss: {epoch_loss:.4f} | Train Acc: {tr_acc:.1f}% | Test Acc: {ts_acc:.1f}% | Best: {best_acc:.1f}%")
-
-    np.savez('experiment_results.npz', 
-             train_loss=history_train_loss, 
-             train_acc=history_train_acc, 
-             test_acc=history_test_acc,
-             best_preds=final_preds,
-             trues=final_trues)
-    print("\n💾 학습이 완료되었습니다. 결과가 'experiment_results.npz'에 저장되었습니다.")
+        print(f"Epoch [{epoch:03d}/100] Loss: {epoch_loss:.4f} | Train Acc: {tr_acc:.1f}% | Test Acc: {ts_acc:.1f}% | Best Test Acc: {best_acc:.1f}%")

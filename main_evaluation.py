@@ -32,90 +32,87 @@ class SurrogateSpike(torch.autograd.Function):
 spike_fn = SurrogateSpike.apply
 
 # =========================================================
-# [2] HR-SNN 구조 (LSTM 제외, DP-Pooling & HR-Module 탑재)
+# [2] Temporal Conv + HR-SNN 구조
 # =========================================================
 class GeoHRSNN(nn.Module):
-    def __init__(self, in_ch=64, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
+    def __init__(self, in_ch=64, temp_hid=32, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
         super().__init__()
-        self.L_DP = L_DP # 윈도우 길이
-        self.N_DP = N_DP # 전압 차이 계산 길이
+        self.L_DP = L_DP 
+        self.N_DP = N_DP 
         
-        # 공간 특징 추출
-        self.spatial_fc = nn.Linear(in_ch, hid_ch)
+        # [핵심] LSTM을 완벽히 대체하는 1D Temporal Conv (시간축 패턴 추출)
+        self.temp_conv = nn.Sequential(
+            nn.Conv1d(in_ch, temp_hid, kernel_size=15, padding=7),
+            nn.BatchNorm1d(temp_hid),
+            nn.ReLU()
+        )
+        
+        self.spatial_fc = nn.Linear(temp_hid, hid_ch)
         nn.init.normal_(self.spatial_fc.weight, mean=0.05, std=0.1) 
         
-        # Leaky Integrator (LI) Layer: 스파이크를 발화하지 않고 전압만 누적하는 디코더용 계층
         self.li_fc = nn.Linear(hid_ch * 2, hid_ch)
         
-        # TDA 처리기
         self.tda_net = nn.Sequential(
             nn.Linear(150, 64), nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(64, 32), nn.ReLU()
         )
         
-        # DP-Pooling 결과 차원 계산 (T=320, 320/32 = 10개 윈도우)
         self.dp_out_dim = (320 // L_DP) * hid_ch
         
-        # 최종 분류기 (DP-Pooling 640 + TDA 32 = 672)
         self.classifier = nn.Sequential(
-            nn.Dropout(0.4),
+            nn.Dropout(0.5),
             nn.Linear(self.dp_out_dim + 32, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(128, out_ch)
         )
 
     def forward(self, x, tda):
         B, T, _ = x.shape
         
-        # HR Module을 위한 두 가지 LIF 뉴런 전압
+        # [Temporal Conv] B, T, C -> B, C, T
+        x_t = x.transpose(1, 2)
+        x_t = self.temp_conv(x_t) # [B, temp_hid, T]
+        x_t = x_t.transpose(1, 2) # [B, T, temp_hid]
+        
         mem_fast = torch.zeros(B, 64, device=x.device)
         mem_slow = torch.zeros(B, 64, device=x.device)
         mem_li = torch.zeros(B, 64, device=x.device)
-        
         li_seq = []
         
         for t in range(T):
-            cur = self.spatial_fc(x[:, t, :])
+            cur = self.spatial_fc(x_t[:, t, :])
             
-            # [HR-Module] Branch 1: 빠른 반응 (낮은 임계값, 빠른 감쇠)
             mem_fast = 0.5 * mem_fast + cur
             spk_fast = spike_fn(mem_fast - 0.5)
             mem_fast = mem_fast * (1.0 - spk_fast)
             
-            # [HR-Module] Branch 2: 느린 반응 (높은 임계값, 느린 감쇠)
             mem_slow = 0.9 * mem_slow + cur
             spk_slow = spike_fn(mem_slow - 1.0)
             mem_slow = mem_slow * (1.0 - spk_slow)
             
-            spk_cat = torch.cat([spk_fast, spk_slow], dim=-1) # [B, 128]
+            spk_cat = torch.cat([spk_fast, spk_slow], dim=-1)
             
-            # [LI Layer] 스파이크 없이 순수 전압(Potential)만 누적
             cur_li = self.li_fc(spk_cat)
             mem_li = 0.9 * mem_li + cur_li
             li_seq.append(mem_li.unsqueeze(1))
             
-        li_seq = torch.cat(li_seq, dim=1) # [B, 320, 64]
+        li_seq = torch.cat(li_seq, dim=1)
         
-        # ==========================================
-        # [DP-Pooling Decoder] 시간 구간별 전압 차이 계산
-        # ==========================================
-        # [B, 320, 64] -> [B, 10, 32, 64]
         windows = li_seq.view(B, T // self.L_DP, self.L_DP, -1)
-        
-        # 윈도우의 앞 N_DP 평균과 뒤 N_DP 평균의 차이를 계산 (Temporal Dynamics 추출)
         start_mean = windows[:, :, :self.N_DP, :].mean(dim=2)
         end_mean = windows[:, :, -self.N_DP:, :].mean(dim=2)
-        dp_feat = end_mean - start_mean # [B, 10, 64]
-        dp_feat = dp_feat.view(B, -1)   # [B, 640]
+        dp_feat = end_mean - start_mean 
+        dp_feat = dp_feat.view(B, -1)   
         
-        tda_feat = self.tda_net(tda) # [B, 32]
-        
+        tda_feat = self.tda_net(tda) 
         out = self.classifier(torch.cat([dp_feat, tda_feat], dim=-1))
         return out
 
 # =========================================================
-# [3] 병렬 데이터 엔진 (정규화 로직 완벽 적용)
+# [3] 병렬 데이터 엔진 (논문 방식대로 피험자 ID 함께 반환)
 # =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
@@ -168,6 +165,9 @@ def process_single_subject(sub):
         xb = np.concatenate([d_lh, d_rh, d_ft, d_rest])
         xc = np.concatenate([c_lh, c_rh, c_ft, c_rest])
         y = np.concatenate([np.zeros(min_trials), np.ones(min_trials), np.full(min_trials, 2), np.full(min_trials, 3)])
+        
+        # 논문 평가를 위한 피험자 ID 배열
+        subjects_arr = np.full(len(y), sub)
 
         win = 51
         u = savgol_filter(np.abs(hilbert(xb, axis=-1)), win, 3, axis=-1)
@@ -184,7 +184,6 @@ def process_single_subject(sub):
         geo_energy = (areal_vel * curvature)[:, :, 80:400] 
         geo_energy = np.nan_to_num(geo_energy, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # [수정] 논문처럼 Spike 변환 전 확실한 Z-Score 정규화 적용
         geo_mean = np.mean(geo_energy, axis=(1, 2), keepdims=True)
         geo_std = np.std(geo_energy, axis=(1, 2), keepdims=True) + 1e-8
         geo_norm = (geo_energy - geo_mean) / geo_std
@@ -208,7 +207,7 @@ def process_single_subject(sub):
             
         tda_final = np.concatenate(tda_landscapes, axis=1).astype(np.float32) 
 
-        return kin_spikes, tda_final, y
+        return kin_spikes, tda_final, y, subjects_arr
     except Exception as e: 
         return None
 
@@ -225,32 +224,37 @@ def get_full_data_parallel(subjects):
     Xk = np.concatenate([r[0] for r in results])
     Xt = np.concatenate([r[1] for r in results])
     y = np.concatenate([r[2] for r in results])
+    subs = np.concatenate([r[3] for r in results])
     print(f"📊 최종 클래스 분포: {dict(zip(*np.unique(y, return_counts=True)))}")
-    print(f"🔍 입력 스파이크 희소성(Sparsity): {Xk.mean():.4f} (약 0.15 정상 복원)")
-    return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long)
+    return torch.tensor(Xk), torch.tensor(Xt), torch.tensor(y, dtype=torch.long), subs
 
 if __name__ == "__main__":
     VALID_SUBS = [s for s in range(1, 110) if s not in [88, 92, 100, 104]]
-    Xk, Xt, y = get_full_data_parallel(VALID_SUBS)
+    Xk, Xt, y, subs = get_full_data_parallel(VALID_SUBS)
     
-    Xk_tr, Xk_ts, Xt_tr, Xt_ts, y_tr, y_ts = train_test_split(Xk, Xt, y, test_size=0.2, stratify=y, random_state=42)
+    # [핵심] 논문의 Global Training 방식: 피험자 기준으로 80:20 완전히 분할
+    unique_subs = np.unique(subs)
+    train_subs, test_subs = train_test_split(unique_subs, test_size=0.2, random_state=42)
+    
+    train_idx = np.isin(subs, train_subs)
+    test_idx = np.isin(subs, test_subs)
+    
+    Xk_tr, Xt_tr, y_tr = Xk[train_idx], Xt[train_idx], y[train_idx]
+    Xk_ts, Xt_ts, y_ts = Xk[test_idx], Xt[test_idx], y[test_idx]
     
     train_loader = DataLoader(TensorDataset(Xk_tr, Xt_tr, y_tr), batch_size=128, shuffle=True)
     test_loader = DataLoader(TensorDataset(Xk_ts, Xt_ts, y_ts), batch_size=128, shuffle=False)
 
     model = GeoHRSNN().to(device)
-    
-    # [수정] 최고의 성능을 위한 고급 옵티마이저 AdamW 적용
     optimizer = optim.AdamW(model.parameters(), lr=0.005, weight_decay=0.01)
-    
-    # [수정] 학습률이 주기적으로 튀어오르며 지역 최솟값을 탈출하게 돕는 스케줄러
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
+    # [수정] 튀어오르는 현상을 없애기 위해 부드러운 코사인 스케줄러로 변경
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 SOTA 기법(DP-Pooling, HR-Module) 적용 완료. 학습 개시 (샘플 수: {len(y)})")
+    print(f"\n🚀 피험자 독립 분할(Global Training) 방식 적용 완료. 학습 개시")
+    print(f"Train 피험자: {len(train_subs)}명, Test 피험자: {len(test_subs)}명")
     best_acc = 0.0
     
-    # 논문용 Figure를 위한 기록 배열
     history_train_loss, history_train_acc, history_test_acc = [], [], []
     final_preds, final_trues = [], []
     
@@ -303,7 +307,6 @@ if __name__ == "__main__":
         
         print(f"Epoch [{epoch:03d}/100] Loss: {epoch_loss:.4f} | Train Acc: {tr_acc:.1f}% | Test Acc: {ts_acc:.1f}% | Best: {best_acc:.1f}%")
 
-    # 학습 종료 후 논문 Figure용 데이터 저장
     np.savez('experiment_results.npz', 
              train_loss=history_train_loss, 
              train_acc=history_train_acc, 

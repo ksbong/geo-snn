@@ -32,57 +32,55 @@ spike_fn = SurrogateSpike.apply
 # [1] 모델 구조 (입력 채널 64 -> 128로 확장)
 # =========================================================
 class GeoHRSNN(nn.Module):
-    def __init__(self, in_ch=128, hid_ch=64, out_ch=4):
+    def __init__(self, in_ch=128, hid_ch=32, out_ch=4): # hid_ch를 64에서 32로 줄여서 억지로 암기력 압수
         super().__init__()
         
-        # 공간 피처 매핑
+        # [핵심 1] Spatial Dropout (RF의 Feature Subsampling과 완벽히 동일한 원리)
+        # 일반 Dropout이 아니라, 128개 채널 중 '50%의 전극을 통째로' 블라인드 처리함
+        # 매 배치마다 피험자 지문 노이즈가 사라지므로, 모델은 진짜 뇌파에만 집중할 수밖에 없음
+        self.spatial_dropout = nn.Dropout1d(p=0.5)
+        
         self.spatial_fc = nn.Linear(in_ch, hid_ch)
         nn.init.normal_(self.spatial_fc.weight, mean=0.05, std=0.1)
         
-        # LI (Leaky Integrator) Layer
         self.li_fc = nn.Linear(hid_ch * 2, hid_ch)
         
-        # TDA 네트워크
+        # TDA(150차원)는 C3, Cz, C4에서만 뽑았으므로 가장 순수한 '알짜배기 피처'임. 
         self.tda_net = nn.Sequential(
-            nn.Linear(150, 64), nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(64, 32), nn.ReLU()
+            nn.Linear(150, 32), 
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.4)
         )
         
-        # 최종 분류기 (SNN 거시적 특징 64 + TDA 32 = 96)
+        # [핵심 2] 병목(Bottleneck) 분류기
+        # SNN(32) + TDA(32) = 64차원의 아주 좁은 통로로만 예측하게 만듦
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(hid_ch + 32, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, out_ch)
+            nn.Linear(32, out_ch)
         )
 
     def forward(self, x, tda):
         B, T, C = x.shape
-        x = nn.functional.dropout(x, p=0.1, training=self.training)
         
-        # [핵심 솔루션: 시간 뭉개기 (Temporal Binning)]
-        # 차원 변경: [B, 320, 128] -> [B, 128, 320]
-        x = x.transpose(1, 2)
+        # [시간 뭉개기] 320 -> 20 스텝 (타이밍 오차 완벽 방어)
+        x = x.transpose(1, 2) # [B, 128, 320]
+        x = torch.nn.functional.avg_pool1d(x, kernel_size=16, stride=16) # [B, 128, 20]
         
-        # 320스텝을 16단위로 묶어 평균 밀도를 구함 -> 20스텝으로 압축
-        # 뾰족한 스파이크가 부드럽고 거시적인 연속 전류로 변환됨 (RF의 강력함을 차용)
-        x = torch.nn.functional.avg_pool1d(x, kernel_size=16, stride=16) 
+        # 여기서 채널(128개) 중 절반을 무작위로 완전히 꺼버림 (RF 트릭)
+        x = self.spatial_dropout(x) 
         
-        # SNN 입력을 위해 복구: [B, 128, 20] -> [B, 20, 128]
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2) # [B, 20, 128]
+        new_T = x.shape[1]
         
-        new_T = x.shape[1] # 20 스텝
+        mem_fast = torch.zeros(B, 32, device=x.device)
+        mem_slow = torch.zeros(B, 32, device=x.device)
+        mem_li = torch.zeros(B, 32, device=x.device)
+        li_sum = torch.zeros(B, 32, device=x.device)
         
-        mem_fast = torch.zeros(B, 64, device=x.device)
-        mem_slow = torch.zeros(B, 64, device=x.device)
-        mem_li = torch.zeros(B, 64, device=x.device)
-        
-        li_sum = torch.zeros(B, 64, device=x.device)
-        
-        # 단 20번만 루프를 돌기 때문에 속도는 16배 빨라지고 타이밍 오차는 완벽히 방어됨
         for t in range(new_T):
             cur = self.spatial_fc(x[:, t, :])
             
@@ -100,14 +98,12 @@ class GeoHRSNN(nn.Module):
             mem_li = 0.9 * mem_li + cur_li
             li_sum += mem_li
             
-        # 20스텝 동안 누적된 거시적 에너지의 평균을 추출
         snn_feat = li_sum / new_T
-        
         tda_feat = self.tda_net(tda) 
-        out = self.classifier(torch.cat([snn_feat, tda_feat], dim=-1))
         
+        out = self.classifier(torch.cat([snn_feat, tda_feat], dim=-1))
         return out
-    
+        
 # =========================================================
 # [2] 병렬 데이터 엔진 (네 아이디어: 피처 분리 탑재)
 # =========================================================

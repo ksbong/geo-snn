@@ -32,57 +32,59 @@ spike_fn = SurrogateSpike.apply
 # [1] 모델 구조 (입력 채널 64 -> 128로 확장)
 # =========================================================
 class GeoHRSNN(nn.Module):
-    # 면적속도(64) + 곡률(64) = 128채널 입력
-    def __init__(self, in_ch=128, temp_hid=128, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
+    def __init__(self, in_ch=128, hid_ch=64, out_ch=4):
         super().__init__()
-        self.L_DP = L_DP 
-        self.N_DP = N_DP 
         
-        # 각 면적속도와 곡률 채널을 섞지 않고 독립적으로 시간 패턴을 추출 (groups=128)
-        self.temp_conv = nn.Sequential(
-            nn.Conv1d(in_ch, temp_hid, kernel_size=15, padding=7, groups=in_ch),
-            nn.BatchNorm1d(temp_hid),
-            nn.ReLU(),
-            nn.Dropout(0.4) 
-        )
+        # 공간 피처 매핑
+        self.spatial_fc = nn.Linear(in_ch, hid_ch)
+        nn.init.normal_(self.spatial_fc.weight, mean=0.05, std=0.1)
         
-        self.spatial_fc = nn.Linear(temp_hid, hid_ch)
-        nn.init.normal_(self.spatial_fc.weight, mean=0.05, std=0.1) 
-        
+        # LI (Leaky Integrator) Layer
         self.li_fc = nn.Linear(hid_ch * 2, hid_ch)
         
+        # TDA 네트워크
         self.tda_net = nn.Sequential(
             nn.Linear(150, 64), nn.ReLU(),
-            nn.Dropout(0.4), 
+            nn.Dropout(0.4),
             nn.Linear(64, 32), nn.ReLU()
         )
         
-        self.dp_out_dim = (320 // L_DP) * hid_ch
-        
+        # 최종 분류기 (SNN 거시적 특징 64 + TDA 32 = 96)
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5), 
-            nn.Linear(self.dp_out_dim + 32, 128),
-            nn.BatchNorm1d(128),
+            nn.Dropout(0.5),
+            nn.Linear(hid_ch + 32, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, out_ch)
+            nn.Linear(64, out_ch)
         )
 
     def forward(self, x, tda):
-        B, T, _ = x.shape
+        B, T, C = x.shape
         x = nn.functional.dropout(x, p=0.1, training=self.training)
         
-        x_t = x.transpose(1, 2)
-        x_t = self.temp_conv(x_t) 
-        x_t = x_t.transpose(1, 2) 
+        # [핵심 솔루션: 시간 뭉개기 (Temporal Binning)]
+        # 차원 변경: [B, 320, 128] -> [B, 128, 320]
+        x = x.transpose(1, 2)
+        
+        # 320스텝을 16단위로 묶어 평균 밀도를 구함 -> 20스텝으로 압축
+        # 뾰족한 스파이크가 부드럽고 거시적인 연속 전류로 변환됨 (RF의 강력함을 차용)
+        x = torch.nn.functional.avg_pool1d(x, kernel_size=16, stride=16) 
+        
+        # SNN 입력을 위해 복구: [B, 128, 20] -> [B, 20, 128]
+        x = x.transpose(1, 2)
+        
+        new_T = x.shape[1] # 20 스텝
         
         mem_fast = torch.zeros(B, 64, device=x.device)
         mem_slow = torch.zeros(B, 64, device=x.device)
         mem_li = torch.zeros(B, 64, device=x.device)
-        li_seq = []
         
-        for t in range(T):
-            cur = self.spatial_fc(x_t[:, t, :])
+        li_sum = torch.zeros(B, 64, device=x.device)
+        
+        # 단 20번만 루프를 돌기 때문에 속도는 16배 빨라지고 타이밍 오차는 완벽히 방어됨
+        for t in range(new_T):
+            cur = self.spatial_fc(x[:, t, :])
             
             mem_fast = 0.5 * mem_fast + cur
             spk_fast = spike_fn(mem_fast - 0.5)
@@ -96,20 +98,16 @@ class GeoHRSNN(nn.Module):
             
             cur_li = self.li_fc(spk_cat)
             mem_li = 0.9 * mem_li + cur_li
-            li_seq.append(mem_li.unsqueeze(1))
+            li_sum += mem_li
             
-        li_seq = torch.cat(li_seq, dim=1)
-        
-        windows = li_seq.view(B, T // self.L_DP, self.L_DP, -1)
-        start_mean = windows[:, :, :self.N_DP, :].mean(dim=2)
-        end_mean = windows[:, :, -self.N_DP:, :].mean(dim=2)
-        dp_feat = end_mean - start_mean 
-        dp_feat = dp_feat.view(B, -1)   
+        # 20스텝 동안 누적된 거시적 에너지의 평균을 추출
+        snn_feat = li_sum / new_T
         
         tda_feat = self.tda_net(tda) 
-        out = self.classifier(torch.cat([dp_feat, tda_feat], dim=-1))
+        out = self.classifier(torch.cat([snn_feat, tda_feat], dim=-1))
+        
         return out
-
+    
 # =========================================================
 # [2] 병렬 데이터 엔진 (네 아이디어: 피처 분리 탑재)
 # =========================================================

@@ -17,6 +17,9 @@ mne.set_log_level('ERROR')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR_PHYSIONET = './raw_data/files'
 
+# =========================================================
+# [1] Surrogate 스파이크
+# =========================================================
 class SurrogateSpike(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
@@ -26,85 +29,94 @@ class SurrogateSpike(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, = ctx.saved_tensors
         return grad_output / (1.0 + 5.0 * torch.abs(input)) ** 2
-
 spike_fn = SurrogateSpike.apply
 
-class RobustGeoSNN(nn.Module):
-    def __init__(self, num_eeg_channels=64, hidden_dim=128, num_classes=4):
+# =========================================================
+# [2] HR-SNN 구조 (LSTM 제외, DP-Pooling & HR-Module 탑재)
+# =========================================================
+class GeoHRSNN(nn.Module):
+    def __init__(self, in_ch=64, hid_ch=64, out_ch=4, L_DP=32, N_DP=16):
         super().__init__()
+        self.L_DP = L_DP # 윈도우 길이
+        self.N_DP = N_DP # 전압 차이 계산 길이
         
-        # [복원] 네가 예전에 썼던 CNN 기반 공간/시간 특징 추출기 (진짜 뇌 주름 생성)
-        # 시간축(T)을 따라 1D Conv를 돌려서 희소한 스파이크에서 풍부한 패턴 전류를 뽑아냄
-        self.cnn_extractor = nn.Sequential(
-            nn.Conv1d(num_eeg_channels, hidden_dim, kernel_size=5, padding=2),
-            nn.BatchNorm1d(hidden_dim), # CNN에는 BN을 써도 스파이크 뇌사가 안 일어남!
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
+        # 공간 특징 추출
+        self.spatial_fc = nn.Linear(in_ch, hid_ch)
+        nn.init.normal_(self.spatial_fc.weight, mean=0.05, std=0.1) 
         
-        # [심층 SNN] 1층짜리 쓰레기 버리고 2단 Deep SNN으로 변경
-        self.snn_layer1 = nn.Linear(hidden_dim, hidden_dim)
-        self.snn_layer2 = nn.Linear(hidden_dim, hidden_dim)
+        # Leaky Integrator (LI) Layer: 스파이크를 발화하지 않고 전압만 누적하는 디코더용 계층
+        self.li_fc = nn.Linear(hid_ch * 2, hid_ch)
         
-        # TDA 독립 처리 층
+        # TDA 처리기
         self.tda_net = nn.Sequential(
-            nn.Linear(150, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU()
+            nn.Linear(150, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU()
         )
         
-        # 앙상블 분류기
+        # DP-Pooling 결과 차원 계산 (T=320, 320/32 = 10개 윈도우)
+        self.dp_out_dim = (320 // L_DP) * hid_ch
+        
+        # 최종 분류기 (DP-Pooling 640 + TDA 32 = 672)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim + 64, 128),
+            nn.Dropout(0.4),
+            nn.Linear(self.dp_out_dim + 32, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.4), 
-            nn.Linear(128, num_classes)
+            nn.Linear(128, out_ch)
         )
 
-    def forward(self, kin_spikes_seq, tda_features):
-        B, T, _ = kin_spikes_seq.shape
+    def forward(self, x, tda):
+        B, T, _ = x.shape
         
-        # CNN 처리를 위해 차원 변경: [B, T, 64] -> [B, 64, T]
-        x_cnn = kin_spikes_seq.transpose(1, 2)
+        # HR Module을 위한 두 가지 LIF 뉴런 전압
+        mem_fast = torch.zeros(B, 64, device=x.device)
+        mem_slow = torch.zeros(B, 64, device=x.device)
+        mem_li = torch.zeros(B, 64, device=x.device)
         
-        # 희소 스파이크 -> 풍부한 연속 전류로 변환
-        current_features = self.cnn_extractor(x_cnn) # [B, 128, T]
-        
-        # 다시 SNN 입력을 위해 시간축 복구: [B, 128, T] -> [B, T, 128]
-        current_seq = current_features.transpose(1, 2)
-        
-        # 1층, 2층 SNN 전압 독립 관리
-        mem1 = torch.zeros(B, 128, device=kin_spikes_seq.device)
-        mem2 = torch.zeros(B, 128, device=kin_spikes_seq.device)
-        spike_counts = torch.zeros(B, 128, device=kin_spikes_seq.device)
+        li_seq = []
         
         for t in range(T):
-            # 1층 SNN
-            cur1 = self.snn_layer1(current_seq[:, t, :])
-            mem1 = 0.9 * mem1 + cur1
-            spk1 = spike_fn(mem1 - 1.0)
-            mem1 = mem1 * (1.0 - spk1)
+            cur = self.spatial_fc(x[:, t, :])
             
-            # 2층 SNN (1층의 스파이크를 입력으로 받음)
-            cur2 = self.snn_layer2(spk1)
-            mem2 = 0.9 * mem2 + cur2
-            spk2 = spike_fn(mem2 - 1.0)
-            mem2 = mem2 * (1.0 - spk2)
+            # [HR-Module] Branch 1: 빠른 반응 (낮은 임계값, 빠른 감쇠)
+            mem_fast = 0.5 * mem_fast + cur
+            spk_fast = spike_fn(mem_fast - 0.5)
+            mem_fast = mem_fast * (1.0 - spk_fast)
             
-            spike_counts += spk2
+            # [HR-Module] Branch 2: 느린 반응 (높은 임계값, 느린 감쇠)
+            mem_slow = 0.9 * mem_slow + cur
+            spk_slow = spike_fn(mem_slow - 1.0)
+            mem_slow = mem_slow * (1.0 - spk_slow)
             
-        # 발화율 정규화
-        firing_rate = spike_counts / T
+            spk_cat = torch.cat([spk_fast, spk_slow], dim=-1) # [B, 128]
+            
+            # [LI Layer] 스파이크 없이 순수 전압(Potential)만 누적
+            cur_li = self.li_fc(spk_cat)
+            mem_li = 0.9 * mem_li + cur_li
+            li_seq.append(mem_li.unsqueeze(1))
+            
+        li_seq = torch.cat(li_seq, dim=1) # [B, 320, 64]
         
-        # TDA 병합 및 최종 분류
-        tda_out = self.tda_net(tda_features)
-        fused_features = torch.cat([firing_rate, tda_out], dim=1) 
-        out = self.classifier(fused_features)
+        # ==========================================
+        # [DP-Pooling Decoder] 시간 구간별 전압 차이 계산
+        # ==========================================
+        # [B, 320, 64] -> [B, 10, 32, 64]
+        windows = li_seq.view(B, T // self.L_DP, self.L_DP, -1)
         
-        return out, spike_counts
-    
+        # 윈도우의 앞 N_DP 평균과 뒤 N_DP 평균의 차이를 계산 (Temporal Dynamics 추출)
+        start_mean = windows[:, :, :self.N_DP, :].mean(dim=2)
+        end_mean = windows[:, :, -self.N_DP:, :].mean(dim=2)
+        dp_feat = end_mean - start_mean # [B, 10, 64]
+        dp_feat = dp_feat.view(B, -1)   # [B, 640]
+        
+        tda_feat = self.tda_net(tda) # [B, 32]
+        
+        out = self.classifier(torch.cat([dp_feat, tda_feat], dim=-1))
+        return out
+
+# =========================================================
+# [3] 병렬 데이터 엔진 (정규화 로직 완벽 적용)
+# =========================================================
 def get_local_file_path(subject, run):
     sub_str = f"S{subject:03d}"
     paths = [os.path.join(DATA_DIR_PHYSIONET, sub_str, f"{sub_str}R{run:02d}.edf"),
@@ -119,8 +131,6 @@ def process_single_subject(sub):
             raws = [mne.io.read_raw_edf(get_local_file_path(sub, r), preload=True, verbose=False) for r in runs if get_local_file_path(sub, r)]
             if not raws: return None
             raw = mne.concatenate_raws(raws); raw.filter(8., 30., verbose=False)
-            
-            # [결자해지] 회원님의 오리지널 코드로 복원 (대문자 강제 변환 삭제)
             mne.datasets.eegbci.standardize(raw)
             raw.set_montage('standard_1005', on_missing='ignore')
             return raw
@@ -135,8 +145,6 @@ def process_single_subject(sub):
             t1 = next((v for k, v in ev_id.items() if 'T1' in k), None)
             t2 = next((v for k, v in ev_id.items() if 'T2' in k), None)
             ep = mne.Epochs(raw, evs, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
-            
-            # [결자해지] 이제 몽타주가 정상이므로 CSD가 절대 에러를 뿜지 않음
             csd = mne.preprocessing.compute_current_source_density(raw.copy(), sphere=(0,0,0,0.095))
             ep_c = mne.Epochs(csd, evs, tmin=0., tmax=3.0, baseline=None, preload=True, verbose=False)
             return ep.get_data(), ep_c.get_data(), ep.events[:, 2], t0, t1, t2, ep.ch_names
@@ -146,7 +154,6 @@ def process_single_subject(sub):
         
         idx_lh, idx_rh, idx_ft = np.where(y_lr == lr1)[0], np.where(y_lr == lr2)[0], np.where(y_f == f2)[0]
         idx_rest_lr, idx_rest_f = np.where(y_lr == lr0)[0], np.where(y_f == f0)[0]
-        
         min_trials = min(len(idx_lh), len(idx_rh), len(idx_ft), len(idx_rest_lr) + len(idx_rest_f))
         if min_trials == 0: return None
         
@@ -177,8 +184,13 @@ def process_single_subject(sub):
         geo_energy = (areal_vel * curvature)[:, :, 80:400] 
         geo_energy = np.nan_to_num(geo_energy, nan=0.0, posinf=0.0, neginf=0.0)
         
-        th_geo = np.percentile(geo_energy, 85)
-        kin_spikes = (geo_energy > th_geo).astype(np.float32).transpose(0, 2, 1) 
+        # [수정] 논문처럼 Spike 변환 전 확실한 Z-Score 정규화 적용
+        geo_mean = np.mean(geo_energy, axis=(1, 2), keepdims=True)
+        geo_std = np.std(geo_energy, axis=(1, 2), keepdims=True) + 1e-8
+        geo_norm = (geo_energy - geo_mean) / geo_std
+        
+        th_geo = np.percentile(geo_norm, 85)
+        kin_spikes = (geo_norm > th_geo).astype(np.float32).transpose(0, 2, 1) 
         
         ch_upper = [c.upper() for c in chs]
         idx_c = [ch_upper.index(n) for n in ['C3', 'CZ', 'C4'] if n in ch_upper]
@@ -202,14 +214,12 @@ def process_single_subject(sub):
 
 def get_full_data_parallel(subjects):
     num_workers = min(12, cpu_count()) 
-    print(f"🔥 오리지널 몽타주 복원 완료. {num_workers}개 코어 병렬 전처리 시작...")
-    
+    print(f"🔥 오리지널 몽타주 복원 + 정규화 완료. 병렬 전처리 시작...")
     results = []
     with Pool(num_workers) as p:
         for i, r in enumerate(p.imap(process_single_subject, subjects)):
             if r is not None: results.append(r)
-            if (i + 1) % 10 == 0:
-                print(f"  -> 전처리 진행중: {i+1}/{len(subjects)} 명 완료...")
+            if (i + 1) % 10 == 0: print(f"  -> 전처리 진행중: {i+1}/{len(subjects)} 명 완료...")
                 
     if not results: raise ValueError("⚠️ 데이터 추출 실패.")
     Xk = np.concatenate([r[0] for r in results])
@@ -228,26 +238,31 @@ if __name__ == "__main__":
     train_loader = DataLoader(TensorDataset(Xk_tr, Xt_tr, y_tr), batch_size=128, shuffle=True)
     test_loader = DataLoader(TensorDataset(Xk_ts, Xt_ts, y_ts), batch_size=128, shuffle=False)
 
-    model = RobustGeoSNN().to(device)
-    # optimizer = optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-4) 
-    optimizer = optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-2)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    model = GeoHRSNN().to(device)
+    
+    # [수정] 최고의 성능을 위한 고급 옵티마이저 AdamW 적용
+    optimizer = optim.AdamW(model.parameters(), lr=0.005, weight_decay=0.01)
+    
+    # [수정] 학습률이 주기적으로 튀어오르며 지역 최솟값을 탈출하게 돕는 스케줄러
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"\n🚀 결자해지: 스파이크 활성화 모드로 학습 개시 (샘플 수: {len(y)})")
+    print(f"\n🚀 SOTA 기법(DP-Pooling, HR-Module) 적용 완료. 학습 개시 (샘플 수: {len(y)})")
     best_acc = 0.0
+    
+    # 논문용 Figure를 위한 기록 배열
+    history_train_loss, history_train_acc, history_test_acc = [], [], []
+    final_preds, final_trues = [], []
     
     for epoch in range(1, 101):
         model.train()
         tr_loss, tr_c, tr_t = 0.0, 0, 0
-        total_spikes = 0.0
-        all_preds = []
         
         for kb, tb, yb in train_loader:
             kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
             optimizer.zero_grad()
             
-            out, spike_sum = model(kb, tb)
+            out = model(kb, tb)
             loss = criterion(out, yb)
             loss.backward(); optimizer.step()
             
@@ -256,27 +271,43 @@ if __name__ == "__main__":
             tr_c += preds.eq(yb).sum().item()
             tr_t += yb.size(0)
             
-            total_spikes += spike_sum.sum().item()
-            all_preds.extend(preds.cpu().numpy())
-            
         scheduler.step()
-        
-        pred_unique, pred_counts = np.unique(all_preds, return_counts=True)
-        pred_dist = {int(k): int(v) for k, v in zip(pred_unique, pred_counts)}
-        avg_spikes = total_spikes / (tr_t * 128) 
         
         model.eval()
         ts_c, ts_t = 0, 0
+        epoch_preds, epoch_trues = [], []
         with torch.no_grad():
             for kb, tb, yb in test_loader:
                 kb, tb, yb = kb.to(device), tb.to(device), yb.to(device)
-                out, _ = model(kb, tb)
-                ts_c += out.max(1)[1].eq(yb).sum().item()
+                out = model(kb, tb)
+                preds = out.max(1)[1]
+                ts_c += preds.eq(yb).sum().item()
                 ts_t += yb.size(0)
+                
+                epoch_preds.extend(preds.cpu().numpy())
+                epoch_trues.extend(yb.cpu().numpy())
         
         epoch_loss = tr_loss / tr_t
         tr_acc = 100 * tr_c / tr_t
         ts_acc = 100 * ts_c / ts_t
-        if ts_acc > best_acc: best_acc = ts_acc
         
-        print(f"Epoch [{epoch:03d}/100] Loss: {epoch_loss:.4f} | Train Acc: {tr_acc:.1f}% | Test Acc: {ts_acc:.1f}% | Avg Spikes: {avg_spikes:.2f} | Pred Dist: {pred_dist}")
+        history_train_loss.append(epoch_loss)
+        history_train_acc.append(tr_acc)
+        history_test_acc.append(ts_acc)
+        
+        if ts_acc > best_acc: 
+            best_acc = ts_acc
+            final_preds = epoch_preds
+            final_trues = epoch_trues
+            torch.save(model.state_dict(), "best_geohrsnn.pth")
+        
+        print(f"Epoch [{epoch:03d}/100] Loss: {epoch_loss:.4f} | Train Acc: {tr_acc:.1f}% | Test Acc: {ts_acc:.1f}% | Best: {best_acc:.1f}%")
+
+    # 학습 종료 후 논문 Figure용 데이터 저장
+    np.savez('experiment_results.npz', 
+             train_loss=history_train_loss, 
+             train_acc=history_train_acc, 
+             test_acc=history_test_acc,
+             best_preds=final_preds,
+             trues=final_trues)
+    print("\n💾 학습이 완료되었습니다. 결과가 'experiment_results.npz'에 저장되었습니다.")

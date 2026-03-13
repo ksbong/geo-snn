@@ -1,5 +1,4 @@
 import os
-import copy
 import time
 import numpy as np
 import mne
@@ -9,7 +8,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import flax
 import flax.linen as nn
 from flax.training import train_state
 import optax
@@ -18,7 +16,7 @@ from sklearn.model_selection import train_test_split, KFold
 warnings.filterwarnings('ignore')
 mne.set_log_level('ERROR')
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # JAX는 자동 할당되지만 기존 호환성을 위해 냅둠
+# ⚠️ torch 관련 코드 싹 다 폐기 완료 (JAX가 GPU 메모리를 자동 관리함)
 
 DATA_DIR_PHYSIONET = './raw_data/files/'
 if not os.path.exists(DATA_DIR_PHYSIONET):
@@ -86,7 +84,7 @@ class Geo_ALIF_SNN(nn.Module):
         
         geo_mod = nn.sigmoid(self.geo_mod(x_geo)) 
         
-        # 🚀 JAX XLA 가속의 핵심: 파이썬 for문 대신 lax.scan으로 C++ 단에서 통째로 루프 처리
+        # 🚀 XLA 가속 루프 (시간축 320번을 C++ 수준에서 한방에 컴파일)
         def scan_fn(carry, inputs):
             mem_alif, eta, mem_li, prev_spike = carry
             cur_eeg, cur_geo_mod = inputs
@@ -113,7 +111,7 @@ class Geo_ALIF_SNN(nn.Module):
         _, mem_li_seq = jax.lax.scan(scan_fn, init_carry, inputs)
         
         mem_li_seq = jnp.swapaxes(mem_li_seq, 0, 1) 
-        mem_li_seq = jnp.swapaxes(mem_li_seq, 1, 2) # [B, 16, 320]
+        mem_li_seq = jnp.swapaxes(mem_li_seq, 1, 2) 
         
         windows = mem_li_seq.reshape((B, self.hid_ch, 10, 32))
         start_mean = jnp.mean(windows[:, :, :, :16], axis=-1) 
@@ -128,9 +126,8 @@ class Geo_ALIF_SNN(nn.Module):
         return out
 
 # =========================================================
-# [3] Optax TrainState 확장 (에러 수정 완료)
+# [3] Optax TrainState & JIT Training Steps
 # =========================================================
-# 🔥 NameError 방지 및 버전 호환성을 위해 Any 사용
 class TrainState(train_state.TrainState):
     batch_stats: Any
 
@@ -138,7 +135,6 @@ def create_train_state(rng, model, eeg_shape, geo_shape, learning_rate, weight_d
     eeg_dummy = jnp.ones(eeg_shape)
     geo_dummy = jnp.ones(geo_shape)
     
-    # 모델 초기화 시 파라미터와 드롭아웃 PRNG 동시 제공
     variables = model.init({'params': rng, 'dropout': rng}, eeg_dummy, geo_dummy, train=False)
     params = variables['params']
     batch_stats = variables['batch_stats']
@@ -175,7 +171,6 @@ def train_step(state, x_eeg, x_geo, y, dropout_rng):
     state = state.apply_gradients(grads=grads)
     state = state.replace(batch_stats=updates['batch_stats'])
     
-    # 소수점 오차 방지를 위해 mean 대신 맞춘 갯수(sum)를 반환
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
     return state, loss, correct_count, new_dropout_rng
 
@@ -188,17 +183,18 @@ def eval_step(state, x_eeg, x_geo, y):
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
     return correct_count
 
-def get_batches(x_eeg, x_geo, y, batch_size, rng=None, shuffle=True):
+# 🔥 PyTorch DataLoader를 완벽하게 대체하는 NumPy 기반 배치 제너레이터
+def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True):
     num_samples = len(y)
-    indices = jnp.arange(num_samples)
-    if shuffle and rng is not None:
-        indices = jax.random.permutation(rng, indices)
+    indices = np.arange(num_samples)
+    if shuffle:
+        np.random.shuffle(indices)
     for start_idx in range(0, num_samples, batch_size):
         batch_idx = indices[start_idx:start_idx + batch_size]
         yield x_eeg[batch_idx], x_geo[batch_idx], y[batch_idx]
 
 # =========================================================
-# [4] 데이터 전처리 (이전과 완전 동일)
+# [4] 데이터 전처리 (운동 피질 집중 + 105명 스케일)
 # =========================================================
 EXCLUDE_SUBS = [88, 92, 100, 104]
 VALID_SUBS = [s for s in range(1, 110) if s not in EXCLUDE_SUBS]
@@ -284,7 +280,7 @@ def process_single_subject_dual(sub):
         return None
 
 if __name__ == "__main__":
-    print(f"🔥 Geo-ALIF SNN [JAX 초고속 XLA 컴파일 버전] 파이프라인 시작...\n")
+    print(f"🔥 Geo-ALIF SNN [100% 퓨어 JAX/Flax XLA 최적화 버전] 시작...\n")
     
     subject_data = {}
     valid_loaded_subs = []
@@ -300,7 +296,6 @@ if __name__ == "__main__":
     print(f"\n✅ 데이터 로드 완료! (유효 피험자: {len(valid_subs_arr)}명)")
     
     sample_geo_ch = subject_data[valid_subs_arr[0]][1].shape[-1]
-    print(f"📊 추출된 기하학적 피처 차원: {sample_geo_ch}채널 (순도 100% 운동 피질)")
     
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     results_acc = {}
@@ -334,12 +329,12 @@ if __name__ == "__main__":
         
         for epoch in range(1, 41):
             epoch_start = time.time()
-            rng, shuffle_rng = jax.random.split(rng)
             
             tr_loss, tr_c, tr_t = 0.0, 0, 0
             
-            # Global Train 배치는 통신 오버헤드를 막기 위해 512까지 늘려도 3090에서 널널함
-            for batch_idx, (xb_eeg, xb_geo, yb) in enumerate(get_batches(X_eeg_g, X_geo_g, y_g, batch_size=256, rng=shuffle_rng, shuffle=True), 1):
+            # 🔥 DataLoader 대신 get_batches 사용
+            for batch_idx, (xb_eeg, xb_geo, yb) in enumerate(get_batches(X_eeg_g, X_geo_g, y_g, batch_size=256, shuffle=True), 1):
+                # JAX Array로 변환 후 GPU 연산 태움
                 xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)
                 
                 state, loss, correct_count, dropout_rng = train_step(state, xb_eeg, xb_geo, yb, dropout_rng)
@@ -357,19 +352,18 @@ if __name__ == "__main__":
             X_eeg_sub, X_geo_sub, y_sub = subject_data[sub]
             tr_idx, ts_idx = train_test_split(np.arange(len(y_sub)), test_size=0.2, stratify=y_sub, random_state=42)
             
-            # 🔥 여기서 터질 뻔한 걸 미리 수정함: Learning Rate 변경 시 optax state도 완전 갱신
             sstl_tx = optax.chain(optax.add_decayed_weights(1e-4), optax.adamw(learning_rate=0.0005))
             sstl_opt_state = sstl_tx.init(state.params) 
             sstl_state = state.replace(tx=sstl_tx, opt_state=sstl_opt_state)
             
             best_test_acc = 0.0
             for epoch in range(1, 11): 
-                rng, shuffle_rng = jax.random.split(rng)
-                for xb_eeg, xb_geo, yb in get_batches(X_eeg_sub[tr_idx], X_geo_sub[tr_idx], y_sub[tr_idx], batch_size=8, rng=shuffle_rng, shuffle=True):
+                # 파인튜닝 학습
+                for xb_eeg, xb_geo, yb in get_batches(X_eeg_sub[tr_idx], X_geo_sub[tr_idx], y_sub[tr_idx], batch_size=8, shuffle=True):
                     xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)
                     sstl_state, _, _, dropout_rng = train_step(sstl_state, xb_eeg, xb_geo, yb, dropout_rng)
                 
-                # Test Evaluation
+                # Test 평가
                 ts_c, ts_t = 0, 0
                 for xb_eeg, xb_geo, yb in get_batches(X_eeg_sub[ts_idx], X_geo_sub[ts_idx], y_sub[ts_idx], batch_size=32, shuffle=False):
                     xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)

@@ -1,10 +1,10 @@
 import os
-import glob
+import shutil
 import mne
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import TensorDataset, DataLoader, Subset
+from torch.utils.data import TensorDataset, DataLoader
 from scipy.fft import fft, ifft, fftfreq
 from scipy.linalg import sqrtm, logm, inv
 from sklearn.model_selection import KFold
@@ -13,7 +13,7 @@ from snntorch import surrogate
 from tqdm import tqdm
 
 # =====================================================================
-# 1. 기하학적 특징 추출 함수 (Hardy Space & SPD)
+# 1. 기하학적 특징 추출
 # =====================================================================
 def project_to_hardy_space(data, sfreq, l_freq=8.0, h_freq=30.0):
     n_times = data.shape[-1]
@@ -29,31 +29,31 @@ def compute_spd_cov(envelope):
     return cov + np.eye(cov.shape[0]) * epsilon
 
 # =====================================================================
-# 2. 전처리 & 텐서 저장 (RAM 폭발 방지 및 Riemannian Alignment)
+# 2. 전처리 & 텐서 저장 (Sliding Window로 Temporal Dynamics 추출)
 # =====================================================================
-DATA_DIR = './raw_data/files/'
+DATA_DIR = '/kaggle/input/datasets/sangbongkim/full-physionet/07_Data'
 if not os.path.exists(DATA_DIR):
-    DATA_DIR = './raw_data/files'
+    DATA_DIR = '/kaggle/input/full-physionet/07_Data'
 
-SAVE_DIR = './processed_tensors'
+SAVE_DIR = './processed_tensors_seq'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# HR-SNN 논문 기준 제외 피험자 4명 (S088, S092, S100, S104) 
 exclude_subjects = ['S088', 'S092', 'S100', 'S104']
 all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
 
 def process_and_save_subject(subj):
     save_path_X = f"{SAVE_DIR}/{subj}_X.pt"
     save_path_y = f"{SAVE_DIR}/{subj}_y.pt"
-    if os.path.exists(save_path_X): 
-        return # 이미 처리됐으면 패스
+    if os.path.exists(save_path_X): return
         
     runs_hands = ['R04', 'R08', 'R12']
     runs_feet = ['R06', 'R10', 'R14']
     epochs_list = []
     
+    import warnings
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
+    
     try:
-        # 손 상상
         for run in runs_hands:
             path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
             if not os.path.exists(path): continue
@@ -63,13 +63,11 @@ def process_and_save_subject(subj):
                             tmin=1.0, tmax=4.0, baseline=None, preload=True, verbose=False)
             epochs_list.append(ep)
 
-        # 발 상상
         for run in runs_feet:
             path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
             if not os.path.exists(path): continue
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
             evs, ev_dict = mne.events_from_annotations(raw, verbose=False)
-            
             events_fixed = evs.copy()
             events_fixed[events_fixed[:, 2] == ev_dict['T2'], 2] = 4
             ep = mne.Epochs(raw, events_fixed, {'Rest': ev_dict['T0'], 'Both Feet': 4}, 
@@ -80,71 +78,73 @@ def process_and_save_subject(subj):
         epochs_all = mne.concatenate_epochs(epochs_list, verbose=False)
         
         data = epochs_all.get_data() * 1e6  
-        labels = np.array(epochs_all.events[:, 2]) - 1 # 0:Rest, 1:Left, 2:Right, 3:Feet
+        labels = np.array(epochs_all.events[:, 2]) - 1 
         sfreq = epochs_all.info['sfreq']
 
-        # Hardy Space & 공분산
+        # 전체 3초 신호에 대해 한 번에 Hardy Space 변환 (FFT 아티팩트 방지)
         hardy_signals = project_to_hardy_space(data, sfreq)
         envelopes = np.abs(hardy_signals)
-        X_covs = np.array([compute_spd_cov(env) for env in envelopes])
+        
+        # 💡 Sliding Window 설정 (1초 길이, 0.5초 겹침 -> 총 5 시퀀스)
+        win_len = 160
+        stride = 80
+        num_windows = 5
+        
+        X_covs_seq = []
+        for w in range(num_windows):
+            start = w * stride
+            end = start + win_len
+            env_win = envelopes[:, :, start:end]
+            covs = np.array([compute_spd_cov(env) for env in env_win])
+            X_covs_seq.append(covs)
+            
+        X_covs_seq = np.stack(X_covs_seq, axis=1) # Shape: (Epochs, 5, 64, 64)
 
-        # 💡 피험자 개인의 Rest(0) 데이터만 모아서 개인 맞춤형 기준점 계산
-        rest_covs = X_covs[labels == 0]
-        p_rest = np.mean(rest_covs, axis=0) 
+        # 피험자별 Rest 상태 매핑 기준점 계산 (전체 윈도우 평균)
+        rest_covs = X_covs_seq[labels == 0]
+        p_rest = np.mean(rest_covs, axis=(0, 1)) 
         p_rest_sqrt = sqrtm(p_rest).real
         p_rest_inv_sqrt = inv(p_rest_sqrt)
 
+        # Tangent Space 매핑
         features = []
-        for cov in X_covs:
-            inner = p_rest_inv_sqrt @ cov @ p_rest_inv_sqrt
-            tangent = p_rest_sqrt @ logm(inner).real @ p_rest_sqrt
-            features.append(tangent)
+        for ep_idx in range(X_covs_seq.shape[0]):
+            ep_feats = []
+            for w in range(num_windows):
+                inner = p_rest_inv_sqrt @ X_covs_seq[ep_idx, w] @ p_rest_inv_sqrt
+                tangent = p_rest_sqrt @ logm(inner).real @ p_rest_sqrt
+                ep_feats.append(tangent)
+            features.append(ep_feats)
         
         features = np.array(features)
         
-        # 개인 스케일링
+        # 스케일링
         scale_factor = np.max(np.abs(features))
         if scale_factor > 0: features = features / scale_factor
 
-        torch.save(torch.tensor(features, dtype=torch.float32).unsqueeze(1), save_path_X)
+        # SNN Spatial Conv를 위해 채널 차원 추가 -> (Epochs, 5, 1, 64, 64)
+        torch.save(torch.tensor(features, dtype=torch.float32).unsqueeze(2), save_path_X)
         torch.save(torch.tensor(labels, dtype=torch.long), save_path_y)
         
     except Exception as e:
-        print(f"Error processing {subj}: {e}")
+        pass
 
-print("🚀 1단계: 전체 피험자 특징 추출 및 텐서 저장 시작 (Riemannian Alignment 적용)")
+print("🚀 1단계: Temporal Dynamics 추출 및 텐서 저장 시작")
 for subj in tqdm(all_subjects):
     process_and_save_subject(subj)
-print("✅ 텐서 저장 완료!")
 
 # =====================================================================
-# 3. 데이터 로더 및 Global / SSTL 분할
+# 3. 데이터 로드 및 모델 구조 (Spatio-Temporal Injection)
 # =====================================================================
 def load_subjects_data(subject_list):
     X_list, y_list = [], []
     for subj in subject_list:
         if os.path.exists(f"{SAVE_DIR}/{subj}_X.pt"):
-            X_list.append(torch.load(f"{SAVE_DIR}/{subj}_X.pt"))
-            y_list.append(torch.load(f"{SAVE_DIR}/{subj}_y.pt"))
+            X_list.append(torch.load(f"{SAVE_DIR}/{subj}_X.pt", weights_only=True))
+            y_list.append(torch.load(f"{SAVE_DIR}/{subj}_y.pt", weights_only=True))
     if not X_list: return None, None
     return torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
-# 논문 기준: 84명 Global Train, 21명 Global Test (SSTL 대상)
-np.random.seed(42)
-shuffled_subjects = np.random.permutation(all_subjects)
-global_train_subjs = shuffled_subjects[:84]
-global_test_subjs = shuffled_subjects[84:]
-
-print(f"\n📁 Global Train 피험자 수: {len(global_train_subjs)}명")
-print(f"📁 SSTL(Test) 피험자 수: {len(global_test_subjs)}명")
-
-X_global, y_global = load_subjects_data(global_train_subjs)
-global_dataset = TensorDataset(X_global, y_global)
-global_loader = DataLoader(global_dataset, batch_size=128, shuffle=True)
-
-# =====================================================================
-# 4. SNN 모델 구조 (FC 파라미터 분리를 위해 구조 정비)
-# =====================================================================
 class RiemannianSNN(nn.Module):
     def __init__(self, num_steps=15):
         super().__init__()
@@ -152,12 +152,10 @@ class RiemannianSNN(nn.Module):
         spike_grad = surrogate.fast_sigmoid(slope=25) 
         beta = 0.9  
         
-        # 특징 추출부 (Global 모델에서 뼈대를 잡음)
         self.feature_extractor = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=5, padding=2),
             nn.BatchNorm2d(16),
             nn.MaxPool2d(2),
-            # SNN 모듈은 Sequential 안에 바로 못 넣으니 forward에서 처리
         )
         self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
         
@@ -167,30 +165,33 @@ class RiemannianSNN(nn.Module):
         self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad)
         
         self.flatten = nn.Flatten()
-        
-        # 💡 분류기(Classifier): SSTL 단계에서 여기만 파인튜닝함
         self.classifier = nn.Linear(32 * 16 * 16, 4) 
         self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad, output=True)
 
     def forward(self, x):
-        x = x * 10.0 # 강제 전류 증폭
+        # x shape: [Batch, 5, 1, 64, 64]
+        x = x * 10.0 
         
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
         mem_out = self.lif_out.init_leaky()
         
         mem_out_rec = []
+        steps_per_window = self.num_steps // 5 # 15스텝 중 3스텝마다 행렬 변경
         
         for step in range(self.num_steps):
-            # 1 layer
-            cur1 = self.feature_extractor(x)
+            w_idx = step // steps_per_window
+            if w_idx >= 5: w_idx = 4
+            
+            # 💡 시간에 맞춰 변화하는 기하학적 피처 주입
+            current_x = x[:, w_idx] 
+            
+            cur1 = self.feature_extractor(current_x)
             spk1, mem1 = self.lif1(cur1, mem1)
             
-            # 2 layer
             cur2 = self.pool2(self.bn2(self.conv2(spk1)))
             spk2, mem2 = self.lif2(cur2, mem2)
             
-            # Output layer
             cur_out = self.classifier(self.flatten(spk2))
             spk_out, mem_out = self.lif_out(cur_out, mem_out)
             
@@ -199,132 +200,109 @@ class RiemannianSNN(nn.Module):
         return torch.stack(mem_out_rec)
 
 # =====================================================================
-# 5. Global Training (84명 전체 학습)
+# 4. 5-Fold 교차 검증 (Global Training -> True Global Acc -> SSTL)
 # =====================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-net = RiemannianSNN(num_steps=15).to(device)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
 
-num_epochs_global = 30 # 시간이 없으면 15 정도로 줄여서 테스트
-print("-" * 50)
-print(f"🌍 Global Training (84명, 데이터 수: {len(global_dataset)}) 시작")
-print("-" * 50)
+kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
+global_acc_list = []
+sstl_acc_list = []
 
-for epoch in range(num_epochs_global):
+print("\n" + "="*50)
+print("🌍 본격적인 5-Fold 논문 파이프라인 가동 (시간 정보 포함)")
+print("="*50)
+
+for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
+    print(f"\n🚀 [Fold {fold + 1}/5] 시작")
+    global_train_subjs = [all_subjects[i] for i in train_idx]
+    global_test_subjs = [all_subjects[i] for i in test_idx]
+    
+    # 1. Global Training
+    X_train, y_train = load_subjects_data(global_train_subjs)
+    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=128, shuffle=True)
+    
+    net = RiemannianSNN(num_steps=15).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+    
     net.train()
-    total_loss, correct, total = 0, 0, 0
+    for epoch in range(20): # 빠른 검증을 위해 20 에폭 (필요시 30으로 증가)
+        for data, targets in train_loader:
+            data, targets = data.to(device), targets.to(device)
+            m_mean = net(data).mean(dim=0)
+            loss = criterion(m_mean, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+    # 2. 진짜 Global Test Accuracy (Unseen Subjects) 측정
+    X_unseen, y_unseen = load_subjects_data(global_test_subjs)
+    unseen_loader = DataLoader(TensorDataset(X_unseen, y_unseen), batch_size=128, shuffle=False)
     
-    for data, targets in global_loader:
-        data, targets = data.to(device), targets.to(device)
-        mem_rec = net(data) 
-        m_mean = mem_rec.mean(dim=0) 
-        loss = criterion(m_mean, targets)
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        _, predicted = m_mean.max(1)
-        total += targets.size(0)
-        correct += (predicted == targets).sum().item()
-        
-    if (epoch + 1) % 5 == 0 or epoch == 0:
-        print(f"Global Epoch {epoch+1}/{num_epochs_global} | Loss: {total_loss/len(global_loader):.4f} | Acc: {100*correct/total:.2f}%")
-        
-
-# =====================================================================
-# 5.5 진짜 Global Test Accuracy 측정 (SSTL 하기 직전 단계)
-# =====================================================================
-print("-" * 50)
-print("🧐 진짜 Global Test Accuracy (본 적 없는 21명 대상) 측정 시작")
-print("-" * 50)
-
-# 테스트용 21명 데이터 로드
-X_unseen, y_unseen = load_subjects_data(global_test_subjs)
-unseen_dataset = TensorDataset(X_unseen, y_unseen)
-unseen_loader = DataLoader(unseen_dataset, batch_size=128, shuffle=False)
-
-net.eval()
-unseen_correct = 0
-unseen_total = 0
-
-with torch.no_grad():
-    for data, targets in unseen_loader:
-        data, targets = data.to(device), targets.to(device)
-        mem_rec = net(data)
-        m_mean = mem_rec.mean(dim=0)
-        _, predicted = m_mean.max(1)
-        unseen_total += targets.size(0)
-        unseen_correct += (predicted == targets).sum().item()
-
-true_global_test_acc = 100 * unseen_correct / unseen_total
-print(f"🔥 진짜 Global Test Accuracy (p0): {true_global_test_acc:.2f}%")
-print(f"📄 논문 목표치 (p0): 67.24%")
-print("-" * 50)
-# =====================================================================
-# 6. SSTL (Subject-Specific Transfer Learning) - 수정된 버전
-# =====================================================================
-print("-" * 50)
-print("🚀 SSTL (개인 맞춤형 전이 학습) 시작")
-print("-" * 50)
-
-# Global Model의 가중치를 CPU로 미리 빼둠 (안전한 복사를 위해)
-global_model_state = net.state_dict()
-
-sstl_accuracies = []
-
-for subj in global_test_subjs:
-    # weights_only=True 추가해서 보안 경고 해결
-    X_sub, y_sub = load_subjects_data([subj]) 
-    if X_sub is None: continue
+    net.eval()
+    unseen_correct, unseen_total = 0, 0
+    with torch.no_grad():
+        for data, targets in unseen_loader:
+            data, targets = data.to(device), targets.to(device)
+            m_mean = net(data).mean(dim=0)
+            _, predicted = m_mean.max(1)
+            unseen_total += targets.size(0)
+            unseen_correct += (predicted == targets).sum().item()
+            
+    true_global_acc = 100 * unseen_correct / unseen_total
+    global_acc_list.append(true_global_acc)
+    print(f"🔥 Fold {fold + 1} 진짜 Global Test Acc (p0): {true_global_acc:.2f}%")
     
-    kf = KFold(n_splits=4, shuffle=True, random_state=42)
-    subj_fold_accs = []
+    # 3. SSTL 진행
+    global_model_state = net.state_dict()
+    fold_sstl_accs = []
     
-    for train_idx, test_idx in kf.split(X_sub):
-        # 💡 수정된 부분: deepcopy 대신 새로운 인스턴스 생성 후 가중치 로드
-        sstl_net = RiemannianSNN(num_steps=15).to(device)
-        sstl_net.load_state_dict(global_model_state)
+    for subj in global_test_subjs:
+        X_sub, y_sub = load_subjects_data([subj])
+        if X_sub is None: continue
         
-        # Classifier(FC 레이어) 파라미터만 업데이트 허용, 나머지는 동결
-        for name, param in sstl_net.named_parameters():
-            if 'classifier' not in name:
-                param.requires_grad = False
-                
-        sstl_optimizer = torch.optim.Adam(sstl_net.classifier.parameters(), lr=5e-4)
+        kf_sub = KFold(n_splits=4, shuffle=True, random_state=42)
+        subj_fold_accs = []
         
-        # (이하 학습 및 평가 루틴은 동일)
-        sub_train_loader = DataLoader(TensorDataset(X_sub[train_idx], y_sub[train_idx]), batch_size=32, shuffle=True)
-        sub_test_loader = DataLoader(TensorDataset(X_sub[test_idx], y_sub[test_idx]), batch_size=32, shuffle=False)
+        for sub_train_idx, sub_test_idx in kf_sub.split(X_sub):
+            sstl_net = RiemannianSNN(num_steps=15).to(device)
+            sstl_net.load_state_dict(global_model_state)
+            
+            # 파인튜닝: Classifier만 열어줌
+            for name, param in sstl_net.named_parameters():
+                if 'classifier' not in name: param.requires_grad = False
+                    
+            sstl_optimizer = torch.optim.Adam(sstl_net.classifier.parameters(), lr=5e-4)
+            
+            sub_train_loader = DataLoader(TensorDataset(X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=32, shuffle=True)
+            sub_test_loader = DataLoader(TensorDataset(X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=32, shuffle=False)
+            
+            sstl_net.train()
+            for _ in range(10): # 💡 개인이 적응할 수 있도록 에폭을 5->10으로 살짝 늘림
+                for data, targets in sub_train_loader:
+                    data, targets = data.to(device), targets.to(device)
+                    loss = criterion(sstl_net(data).mean(dim=0), targets)
+                    sstl_optimizer.zero_grad()
+                    loss.backward()
+                    sstl_optimizer.step()
+                    
+            sstl_net.eval()
+            corr, tot = 0, 0
+            with torch.no_grad():
+                for data, targets in sub_test_loader:
+                    data, targets = data.to(device), targets.to(device)
+                    _, predicted = sstl_net(data).mean(dim=0).max(1)
+                    tot += targets.size(0)
+                    corr += (predicted == targets).sum().item()
+            subj_fold_accs.append(100 * corr / tot)
+            
+        fold_sstl_accs.append(np.mean(subj_fold_accs))
         
-        sstl_net.train()
-        for _ in range(5): # 딱 5 에폭만 학습 [cite: 327]
-            for data, targets in sub_train_loader:
-                data, targets = data.to(device), targets.to(device)
-                m_mean = sstl_net(data).mean(dim=0)
-                loss = criterion(m_mean, targets)
-                sstl_optimizer.zero_grad()
-                loss.backward()
-                sstl_optimizer.step()
-                
-        sstl_net.eval()
-        correct, total = 0, 0
-        with torch.no_grad():
-            for data, targets in sub_test_loader:
-                data, targets = data.to(device), targets.to(device)
-                m_mean = sstl_net(data).mean(dim=0)
-                _, predicted = m_mean.max(1)
-                total += targets.size(0)
-                correct += (predicted == targets).sum().item()
-        
-        subj_fold_accs.append(100 * correct / total)
-    
-    subj_acc = np.mean(subj_fold_accs)
-    sstl_accuracies.append(subj_acc)
-    print(f"피험자 {subj} SSTL Accuracy: {subj_acc:.2f}%")
+    avg_sstl_fold = np.mean(fold_sstl_accs)
+    sstl_acc_list.append(avg_sstl_fold)
+    print(f"🎯 Fold {fold + 1} SSTL 평균 정확도 (ps): {avg_sstl_fold:.2f}%")
 
-print("-" * 50)
-print(f"🎯 최종 SSTL 평균 정확도 (21명 대상): {np.mean(sstl_accuracies):.2f}%")
-print("-" * 50)
+print("\n" + "="*50)
+print(f"🏆 5-Fold 최종 평균 Global Test Acc (p0): {np.mean(global_acc_list):.2f}%")
+print(f"🏆 5-Fold 최종 평균 SSTL Acc (ps): {np.mean(sstl_acc_list):.2f}%")
+print("="*50)

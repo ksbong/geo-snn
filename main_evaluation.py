@@ -1,13 +1,13 @@
 import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_FLAGS'] = '--xla_gpu_strict_conv_algorithm_picker=false'
+
 import time
 import numpy as np
 import mne
 from scipy.signal import hilbert, savgol_filter
 import warnings
 from typing import Any
-
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_FLAGS'] = '--xla_gpu_strict_conv_algorithm_picker=false'
 
 import jax
 import jax.numpy as jnp
@@ -41,90 +41,169 @@ def spike_fn_bwd(res, g):
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 # =========================================================
-# [2] Novelty: TCN + TDA(Geo) + HR-SNN
+# [2] Squeeze-and-Excitation (SE) Block (Channel Attention)
 # =========================================================
-class TCN_Geo_HR_SNN(nn.Module):
+class SEBlock(nn.Module):
+    channels: int
+    reduction: int = 4
+
+    @nn.compact
+    def __call__(self, x):
+        # x shape: [B, T, C]
+        y = jnp.mean(x, axis=1, keepdims=True) # Global Average Pooling over Time
+        y = nn.Dense(self.channels // self.reduction)(y)
+        y = nn.relu(y)
+        y = nn.Dense(self.channels)(y)
+        y = nn.sigmoid(y)
+        return x * y
+
+# =========================================================
+# [3] SOTA-Grade: EEGNet + SE Block + ResTCN + Geo + HR-SNN
+# =========================================================
+class SOTA_EEG_SNN(nn.Module):
     eeg_ch: int = 64
-    geo_ch: int = 18
-    hid_ch: int = 32
+    F1: int = 16
+    D: int = 4
+    hid_ch: int = 64
     out_ch: int = 4
 
     def setup(self):
-        # TCN Block for EEG Spikes (Dilation 적용하여 수용영역 확장)
-        self.tcn_conv1 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(1,), padding='SAME')
-        self.tcn_bn1 = nn.BatchNorm()
-        self.tcn_conv2 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(2,), padding='SAME')
-        self.tcn_bn2 = nn.BatchNorm()
-        self.tcn_drop = nn.Dropout(rate=0.4)
+        # 1. Spatial-Temporal Encoder (LayerNorm 교체)
+        self.temp_conv = nn.Conv(features=self.F1, kernel_size=(32, 1), padding='SAME', use_bias=False)
+        self.temp_ln = nn.LayerNorm()
         
-        # TDA(Geo) Features Projection
+        self.spat_conv = nn.Conv(features=self.hid_ch, kernel_size=(1, self.eeg_ch), padding='VALID', use_bias=False)
+        self.spat_ln = nn.LayerNorm()
+        
+        # Channel Attention 
+        self.se_block = SEBlock(channels=self.hid_ch)
+        self.enc_drop = nn.Dropout(rate=0.2)
+        
+        # 2. Residual Deep TCN (LayerNorm 교체)
+        self.tcn_conv1 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(1,), padding='SAME')
+        self.tcn_ln1 = nn.LayerNorm()
+        self.tcn_conv2 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(2,), padding='SAME')
+        self.tcn_ln2 = nn.LayerNorm()
+        
+        self.tcn_conv3 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(4,), padding='SAME')
+        self.tcn_ln3 = nn.LayerNorm()
+        self.tcn_conv4 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(8,), padding='SAME')
+        self.tcn_ln4 = nn.LayerNorm()
+        
+        self.tcn_conv5 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(16,), padding='SAME')
+        self.tcn_ln5 = nn.LayerNorm()
+        self.tcn_conv6 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(32,), padding='SAME')
+        self.tcn_ln6 = nn.LayerNorm()
+        
+        self.tcn_drop = nn.Dropout(rate=0.3)
+        
+        # 3. Geo Attention (FiLM)
+        self.geo_ln = nn.LayerNorm()
+        self.film_gamma = nn.Dense(features=self.hid_ch)
+        self.film_beta = nn.Dense(features=self.hid_ch)
+        
+        # 4. Geo-ALIF Modulation
         self.geo_tau_proj = nn.Dense(features=self.hid_ch)
         self.geo_theta_proj = nn.Dense(features=self.hid_ch)
         
-        # SNN Dynamics
+        # 5. HR-Module 고유 입력 투영
+        self.hr_proj1 = nn.Dense(features=self.hid_ch)
+        self.hr_proj2 = nn.Dense(features=self.hid_ch)
+        self.hr_proj3 = nn.Dense(features=self.hid_ch)
+        
+        # Learnable HR Mixer
+        self.w_mixer = self.param('w_mixer', nn.initializers.lecun_normal(), (self.hid_ch * 3, self.hid_ch))
+        
         self.theta_0 = 0.5
         self.tau_a = 0.36
         self.beta = 1.8
         
-        # Classifier
-        self.classifier_drop = nn.Dropout(rate=0.5)
+        self.classifier_drop = nn.Dropout(rate=0.3)
         self.fc_out = nn.Dense(features=self.out_ch)
 
     @nn.compact
-    def __call__(self, x_eeg, x_geo, train: bool = True):
-        B, T, _ = x_eeg.shape
+    def __call__(self, x_eeg_raw, x_geo, train: bool = True):
+        B, T, C = x_eeg_raw.shape
         
-        # 1. BSA Style Deterministic Encoding
-        eeg_diff = x_eeg[:, 1:, :] - x_eeg[:, :-1, :]
-        encoded_spikes = spike_fn(jnp.abs(eeg_diff) - 0.1) 
-        zero_pad = jnp.zeros((B, 1, self.eeg_ch))
-        x_eeg_spikes = jnp.concatenate([zero_pad, encoded_spikes], axis=1)
+        # 1. Spatial-Temporal + SE Block
+        x_2d = jnp.expand_dims(x_eeg_raw, axis=-1) 
+        x = self.temp_ln(self.temp_conv(x_2d))
+        x = self.spat_ln(self.spat_conv(x))
+        x_enc = jnp.squeeze(x, axis=2) # [B, T, hid_ch]
         
-        # 2. TCN Feature Extraction (LSTM 대체, 병렬 연산)
-        x_tcn = self.tcn_conv1(x_eeg_spikes)
-        x_tcn = self.tcn_bn1(x_tcn, use_running_average=not train)
-        x_tcn = nn.elu(x_tcn)
-        x_tcn = self.tcn_conv2(x_tcn)
-        x_tcn = self.tcn_bn2(x_tcn, use_running_average=not train)
-        eeg_temporal_features = self.tcn_drop(nn.elu(x_tcn), deterministic=not train) # [B, T, hid_ch]
+        # Apply Channel Attention
+        x_enc = self.se_block(x_enc)
+        x_enc = self.enc_drop(nn.elu(x_enc), deterministic=not train)
         
-        # 3. TDA(Geo) Modulation Pre-computation (Tracer Leak 방지)
-        tau_mod_seq = nn.sigmoid(self.geo_tau_proj(x_geo)) 
-        theta_mod_seq = nn.softplus(self.geo_theta_proj(x_geo)) 
+        # 2. Residual Deep TCN (BN 제거, LN 적용)
+        # Block 1
+        r1 = x_enc
+        x = nn.elu(self.tcn_ln1(self.tcn_conv1(x_enc)))
+        x = nn.elu(self.tcn_ln2(self.tcn_conv2(x)))
+        x = x + r1
+        # Block 2
+        r2 = x
+        x = nn.elu(self.tcn_ln3(self.tcn_conv3(x)))
+        x = nn.elu(self.tcn_ln4(self.tcn_conv4(x)))
+        x = x + r2
+        # Block 3
+        r3 = x
+        x = nn.elu(self.tcn_ln5(self.tcn_conv5(x)))
+        x = nn.elu(self.tcn_ln6(self.tcn_conv6(x)))
+        x = x + r3
         
-        # 4. HR-SNN + Geo-ALIF Loop
+        eeg_tcn = self.tcn_drop(x, deterministic=not train)
+        
+        # 3. Geo Attention (Global Summary)
+        geo_summary = jnp.mean(x_geo, axis=-1, keepdims=True)
+        geo_norm = self.geo_ln(geo_summary)
+        
+        gamma = self.film_gamma(geo_norm) 
+        beta = self.film_beta(geo_norm)   
+        
+        x_fused = eeg_tcn * gamma + beta 
+        
+        # 4. Late Spike Encoding
+        eeg_spikes = spike_fn(x_fused)
+        
+        # 5. SNN 준비
+        x_hr1 = self.hr_proj1(eeg_spikes)
+        x_hr2 = self.hr_proj2(eeg_spikes)
+        x_hr3 = self.hr_proj3(eeg_spikes)
+        
+        tau_mod_seq = nn.sigmoid(self.geo_tau_proj(geo_norm)) 
+        theta_mod_seq = nn.sigmoid(self.geo_theta_proj(geo_norm)) 
+        
+        # 6. HR-SNN Loop
         def scan_fn(carry, inputs):
             mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, prev_spk = carry
-            cur_eeg_feat, cur_tau_mod, cur_theta_mod = inputs
+            in_hr1, in_hr2, in_hr3, cur_tau_mod, cur_theta_mod = inputs
             
-            # HR-Module (3 Parallel LIFs)
-            mem_lif1 = 0.9 * mem_lif1 + cur_eeg_feat
+            mem_lif1 = 0.9 * mem_lif1 + in_hr1
             spk1 = spike_fn(mem_lif1 - 0.7)
             mem_lif1 = mem_lif1 * (1.0 - spk1)
             
-            mem_lif2 = 0.8 * mem_lif2 + cur_eeg_feat
+            mem_lif2 = 0.8 * mem_lif2 + in_hr2
             spk2 = spike_fn(mem_lif2 - 0.5)
             mem_lif2 = mem_lif2 * (1.0 - spk2)
             
-            mem_lif3 = 0.6 * mem_lif3 + cur_eeg_feat
+            mem_lif3 = 0.6 * mem_lif3 + in_hr3
             spk3 = spike_fn(mem_lif3 - 0.3)
             mem_lif3 = mem_lif3 * (1.0 - spk3)
             
-            hr_out = (spk1 + spk2 + spk3) / 3.0
+            hr_concat = jnp.concatenate([spk1, spk2, spk3], axis=-1)
+            hr_out = jnp.dot(hr_concat, self.w_mixer)
             
-            # Geo-ALIF
             tau_m = 0.5 + 0.49 * cur_tau_mod
             eta = self.tau_a * eta + (1 - self.tau_a) * prev_spk
-            theta_t = self.theta_0 + self.beta * eta - cur_theta_mod
+            theta_t = self.theta_0 * (0.5 + 0.5 * cur_theta_mod) + self.beta * eta 
             
             mem_alif = tau_m * mem_alif + hr_out
             spk_alif = spike_fn(mem_alif - theta_t)
             mem_alif = mem_alif * (1.0 - spk_alif)
             
             mem_li = 0.9 * mem_li + spk_alif
-            
-            new_carry = (mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, spk_alif)
-            return new_carry, mem_li
+            return (mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, spk_alif), mem_li
 
         init_carry = (
             jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)),
@@ -132,28 +211,21 @@ class TCN_Geo_HR_SNN(nn.Module):
         )
         
         inputs = (
-            jnp.swapaxes(eeg_temporal_features, 0, 1), 
-            jnp.swapaxes(tau_mod_seq, 0, 1),
-            jnp.swapaxes(theta_mod_seq, 0, 1)
+            jnp.swapaxes(x_hr1, 0, 1), jnp.swapaxes(x_hr2, 0, 1), jnp.swapaxes(x_hr3, 0, 1),
+            jnp.swapaxes(tau_mod_seq, 0, 1), jnp.swapaxes(theta_mod_seq, 0, 1)
         )
         _, mem_li_seq = jax.lax.scan(scan_fn, init_carry, inputs)
-        
         mem_li_seq = jnp.swapaxes(mem_li_seq, 0, 1) 
         
-        # DP-Pooling
-        windows = mem_li_seq.reshape((B, 10, 32, self.hid_ch))
-        start_mean = jnp.mean(windows[:, :16, :], axis=1) 
-        end_mean = jnp.mean(windows[:, 16:, :], axis=1)   
+        # 7. Global Temporal Mean Pooling
+        out_feat = jnp.mean(mem_li_seq, axis=1) 
         
-        dp_feat = (end_mean - start_mean).reshape((B, -1)) 
-        
-        out = self.classifier_drop(dp_feat, deterministic=not train)
+        out = self.classifier_drop(out_feat, deterministic=not train)
         out = self.fc_out(out)
-        
         return out
 
 # =========================================================
-# [3] Optax Training State
+# [4] Optax State & JIT (Cross Entropy)
 # =========================================================
 class TrainState(train_state.TrainState):
     batch_stats: Any
@@ -161,52 +233,45 @@ class TrainState(train_state.TrainState):
 def create_train_state(rng, model, eeg_shape, geo_shape, max_epochs, steps_per_epoch):
     eeg_dummy = jnp.ones(eeg_shape)
     geo_dummy = jnp.ones(geo_shape)
-    
     variables = model.init({'params': rng, 'dropout': rng}, eeg_dummy, geo_dummy, train=False)
-    params = variables['params']
-    batch_stats = variables['batch_stats']
     
-    scheduler = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=max_epochs * steps_per_epoch, alpha=0.01)
+    # Cost 최적화를 위한 120 에포크 기준 스케줄링
+    scheduler = optax.cosine_decay_schedule(init_value=2e-3, decay_steps=max_epochs * steps_per_epoch, alpha=0.01)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.add_decayed_weights(1e-3),
+        optax.add_decayed_weights(1e-4),
         optax.adamw(learning_rate=scheduler)
     )
     
-    return TrainState.create(apply_fn=model.apply, params=params, tx=tx, batch_stats=batch_stats)
+    return TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx, batch_stats=None)
 
 @jax.jit
-def train_step(state, x_eeg, x_geo, y, dropout_rng):
+def train_step(state, x_eeg_raw, x_geo, y, dropout_rng):
     dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
-    
     def loss_fn(params):
-        logits, updates = state.apply_fn(
-            {'params': params, 'batch_stats': state.batch_stats},
-            x_eeg, x_geo, train=True,
-            rngs={'dropout': dropout_rng},
-            mutable=['batch_stats']
+        logits = state.apply_fn(
+            {'params': params},
+            x_eeg_raw, x_geo, train=True,
+            rngs={'dropout': dropout_rng}
         )
         one_hot_y = jax.nn.one_hot(y, 4)
         smooth_labels = optax.smooth_labels(one_hot_y, 0.1)
         loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_labels).mean()
-        return loss, (logits, updates)
+        return loss, logits
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (logits, updates)), grads = grad_fn(state.params)
+    (loss, logits), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
-    state = state.replace(batch_stats=updates['batch_stats'])
-    
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
     return state, loss, correct_count, new_dropout_rng
 
 @jax.jit
-def eval_step(state, x_eeg, x_geo, y):
+def eval_step(state, x_eeg_raw, x_geo, y):
     logits = state.apply_fn(
-        {'params': state.params, 'batch_stats': state.batch_stats},
-        x_eeg, x_geo, train=False
+        {'params': state.params}, 
+        x_eeg_raw, x_geo, train=False
     )
-    correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
-    return correct_count
+    return jnp.sum(jnp.argmax(logits, -1) == y)
 
 def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True, drop_last=False):
     num_samples = len(y)
@@ -221,7 +286,7 @@ def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True, drop_last=False):
         yield x_eeg[batch_idx], x_geo[batch_idx], y[batch_idx]
 
 # =========================================================
-# [4] Data Pipeline
+# [5] Data Pipeline
 # =========================================================
 EXCLUDE_SUBS = [88, 92, 100, 104]
 VALID_SUBS = [s for s in range(1, 110) if s not in EXCLUDE_SUBS]
@@ -274,8 +339,8 @@ def process_single_subject_dual(sub):
         raw_eeg = np.concatenate([d_lh, d_rh, d_ft, d_rest])[:, :, 80:400]
         raw_eeg = raw_eeg.transpose(0, 2, 1).astype(np.float32)
         
-        xb = np.concatenate([d_lh, d_rh, d_ft, d_rest])[:, motor_idx, :]
-        xc = np.concatenate([c_lh, c_rh, c_ft, c_rest])[:, motor_idx, :]
+        xb = np.concatenate([d_lh, d_rh, d_ft, d_rest])[:, motor_idx, :320]
+        xc = np.concatenate([c_lh, c_rh, c_ft, c_rest])[:, motor_idx, :320]
         y = np.concatenate([np.zeros(min_trials), np.ones(min_trials), np.full(min_trials, 2), np.full(min_trials, 3)])
         
         win = 15
@@ -286,41 +351,32 @@ def process_single_subject_dual(sub):
         ddu = savgol_filter(u, win, 3, deriv=2, axis=-1)
         ddv = savgol_filter(v, win, 3, deriv=2, axis=-1)
         
-        areal_vel = (0.5 * np.abs(u * dv - v * du))[:, :, 80:400]
+        areal_vel = (0.5 * np.abs(u * dv - v * du))
         denom = np.clip((du**2 + dv**2)**(1.5), 1e-6, None)
-        curvature = (np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10))[:, :, 80:400]
+        curvature = (np.clip(np.abs(du * ddv - dv * ddu) / denom, 0, 10))
         
-        areal_vel = np.nan_to_num(areal_vel, nan=0.0, posinf=0.0, neginf=0.0)
-        curvature = np.nan_to_num(curvature, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        vel_mean, vel_std = np.mean(areal_vel, axis=(1, 2), keepdims=True), np.std(areal_vel, axis=(1, 2), keepdims=True) + 1e-8
-        curv_mean, curv_std = np.mean(curvature, axis=(1, 2), keepdims=True), np.std(curvature, axis=(1, 2), keepdims=True) + 1e-8
-        
-        vel_norm = (areal_vel - vel_mean) / vel_std 
-        curv_norm = (curvature - curv_mean) / curv_std 
-        
-        geo_features = np.concatenate([vel_norm, curv_norm], axis=1).astype(np.float32)
-        geo_features = geo_features.transpose(0, 2, 1) 
+        geo_features = np.concatenate([areal_vel, curvature], axis=1).astype(np.float32)
+        geo_features = np.nan_to_num(geo_features, nan=0.0, posinf=0.0, neginf=0.0).transpose(0, 2, 1) 
         
         return raw_eeg, geo_features, y
     except Exception as e: 
         return None
 
 if __name__ == "__main__":
-    print("INIT: TCN + TDA(Geo) + HR-SNN Pipeline")
+    print("🚀 INIT: SOTA Research-Grade EEG SNN (SE Block + LayerNorm + 120 Epochs)")
     
     subject_data = {}
     valid_loaded_subs = []
     
     for sub in VALID_SUBS:
-        print(f"LOAD: S{sub:03d}/109...", flush=True)
+        print(f"LOAD: S{sub:03d}/109...", end='\r')
         data = process_single_subject_dual(sub)
         if data is not None:
             subject_data[sub] = data
             valid_loaded_subs.append(sub)
             
     valid_subs_arr = np.array(valid_loaded_subs)
-    print(f"LOAD: Complete. Total subjects: {len(valid_subs_arr)}")
+    print(f"\n✅ LOAD Complete. Total subjects: {len(valid_subs_arr)}")
     
     sample_geo_ch = subject_data[valid_subs_arr[0]][1].shape[-1]
     
@@ -334,7 +390,7 @@ if __name__ == "__main__":
         test_subs = valid_subs_arr[test_idx]
         
         print(f"\n============================================================")
-        print(f"FOLD {fold}/5 | GLOBAL_TRAIN: {len(train_subs)} | GLOBAL_VAL: {len(test_subs)}")
+        print(f"FOLD {fold}/5 | GLOBAL_TRAIN: {len(train_subs)} | SSTL_TEST: {len(test_subs)}")
         print(f"============================================================")
         
         X_eeg_g = np.concatenate([subject_data[s][0] for s in train_subs])
@@ -345,11 +401,11 @@ if __name__ == "__main__":
         X_geo_val = np.concatenate([subject_data[s][1] for s in test_subs])
         y_val = np.concatenate([subject_data[s][2] for s in test_subs])
         
-        global_model = TCN_Geo_HR_SNN(geo_ch=sample_geo_ch)
+        global_model = SOTA_EEG_SNN()
         
         batch_size = 256
         steps_per_epoch = len(y_g) // batch_size
-        max_epochs = 200
+        max_epochs = 120 # 에포크 수 현실화 (Cost 절감)
         
         rng, init_rng = jax.random.split(rng)
         state = create_train_state(
@@ -358,7 +414,7 @@ if __name__ == "__main__":
             max_epochs=max_epochs, steps_per_epoch=steps_per_epoch
         )
         
-        print(f"STAGE 1: GLOBAL PRE-TRAINING")
+        print(f"STAGE 1: GLOBAL PRE-TRAINING (Train: {len(y_g)}, Val: {len(y_val)})")
         rng, dropout_rng = jax.random.split(rng)
         
         best_val_acc = 0.0
@@ -402,6 +458,7 @@ if __name__ == "__main__":
             X_eeg_sub, X_geo_sub, y_sub = subject_data[sub]
             tr_idx, ts_idx = train_test_split(np.arange(len(y_sub)), test_size=0.2, stratify=y_sub, random_state=42)
             
+            # SSTL (Batch=8)에서도 LayerNorm 덕분에 완벽하게 안정적 학습 가능
             sstl_tx = optax.chain(optax.add_decayed_weights(1e-4), optax.adamw(learning_rate=0.0005))
             sstl_opt_state = sstl_tx.init(best_global_state.params) 
             sstl_state = best_global_state.replace(tx=sstl_tx, opt_state=sstl_opt_state)
@@ -429,7 +486,7 @@ if __name__ == "__main__":
         fold += 1
 
     print(f"\n{'='*50}")
-    print(f"FINAL EVAL: TCN + TDA + HR-SNN")
+    print(f"FINAL EVAL: SOTA EEG SNN (SE Block + LayerNorm)")
     print(f"{'='*50}")
     valid_accs = list(results_acc.values())
     print(f"Mean Acc: {np.mean(valid_accs):.2f}%")

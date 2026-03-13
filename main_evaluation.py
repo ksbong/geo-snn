@@ -16,8 +16,6 @@ from sklearn.model_selection import train_test_split, KFold
 warnings.filterwarnings('ignore')
 mne.set_log_level('ERROR')
 
-# ⚠️ torch 관련 코드 싹 다 폐기 완료 (JAX가 GPU 메모리를 자동 관리함)
-
 DATA_DIR_PHYSIONET = './raw_data/files/'
 if not os.path.exists(DATA_DIR_PHYSIONET):
     DATA_DIR_PHYSIONET = './raw_data/files'
@@ -40,7 +38,7 @@ def spike_fn_bwd(res, g):
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 # =========================================================
-# [2] Geo-ALIF SNN 아키텍처 (Flax Linen)
+# [2] Geo-ALIF SNN 아키텍처 (Flax Linen 에러 완벽 수정)
 # =========================================================
 class Geo_ALIF_SNN(nn.Module):
     eeg_ch: int = 64
@@ -50,12 +48,13 @@ class Geo_ALIF_SNN(nn.Module):
     out_ch: int = 4
 
     def setup(self):
+        # 🔥 에러 원인 제거: setup에서는 구조만 선언하고, train 상태는 받지 않음
         self.conv1 = nn.Conv(features=self.temp_hid, kernel_size=(5,), padding=2)
-        self.bn1 = nn.BatchNorm(use_running_average=not self.train)
-        self.drop1 = nn.Dropout(rate=0.3, deterministic=not self.train)
+        self.bn1 = nn.BatchNorm()
+        self.drop1 = nn.Dropout(rate=0.3)
         
         self.conv2 = nn.Conv(features=self.hid_ch, kernel_size=(3,), padding=1)
-        self.bn2 = nn.BatchNorm(use_running_average=not self.train)
+        self.bn2 = nn.BatchNorm()
         
         self.geo_mod = nn.Dense(features=self.hid_ch)
         
@@ -65,7 +64,7 @@ class Geo_ALIF_SNN(nn.Module):
         self.tau_m = 0.8
         self.gamma = self.param('gamma', nn.initializers.constant(0.5), (self.hid_ch,))
         
-        self.drop_out = nn.Dropout(rate=0.5, deterministic=not self.train)
+        self.drop_out = nn.Dropout(rate=0.5)
         self.fc1 = nn.Dense(features=64)
         self.fc2 = nn.Dense(features=self.out_ch)
 
@@ -74,6 +73,7 @@ class Geo_ALIF_SNN(nn.Module):
         B, T, _ = x_eeg.shape
         
         x = self.conv1(x_eeg)
+        # 🔥 올바른 Flax 사용법: 실행 시점(__call__)에 train 상태 전달
         x = self.bn1(x, use_running_average=not train)
         x = nn.relu(x)
         x = self.drop1(x, deterministic=not train)
@@ -84,7 +84,6 @@ class Geo_ALIF_SNN(nn.Module):
         
         geo_mod = nn.sigmoid(self.geo_mod(x_geo)) 
         
-        # 🚀 XLA 가속 루프 (시간축 320번을 C++ 수준에서 한방에 컴파일)
         def scan_fn(carry, inputs):
             mem_alif, eta, mem_li, prev_spike = carry
             cur_eeg, cur_geo_mod = inputs
@@ -183,7 +182,6 @@ def eval_step(state, x_eeg, x_geo, y):
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
     return correct_count
 
-# 🔥 PyTorch DataLoader를 완벽하게 대체하는 NumPy 기반 배치 제너레이터
 def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True):
     num_samples = len(y)
     indices = np.arange(num_samples)
@@ -332,9 +330,7 @@ if __name__ == "__main__":
             
             tr_loss, tr_c, tr_t = 0.0, 0, 0
             
-            # 🔥 DataLoader 대신 get_batches 사용
             for batch_idx, (xb_eeg, xb_geo, yb) in enumerate(get_batches(X_eeg_g, X_geo_g, y_g, batch_size=256, shuffle=True), 1):
-                # JAX Array로 변환 후 GPU 연산 태움
                 xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)
                 
                 state, loss, correct_count, dropout_rng = train_step(state, xb_eeg, xb_geo, yb, dropout_rng)
@@ -358,12 +354,10 @@ if __name__ == "__main__":
             
             best_test_acc = 0.0
             for epoch in range(1, 11): 
-                # 파인튜닝 학습
                 for xb_eeg, xb_geo, yb in get_batches(X_eeg_sub[tr_idx], X_geo_sub[tr_idx], y_sub[tr_idx], batch_size=8, shuffle=True):
                     xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)
                     sstl_state, _, _, dropout_rng = train_step(sstl_state, xb_eeg, xb_geo, yb, dropout_rng)
                 
-                # Test 평가
                 ts_c, ts_t = 0, 0
                 for xb_eeg, xb_geo, yb in get_batches(X_eeg_sub[ts_idx], X_geo_sub[ts_idx], y_sub[ts_idx], batch_size=32, shuffle=False):
                     xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)

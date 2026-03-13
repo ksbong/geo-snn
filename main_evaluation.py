@@ -38,72 +38,94 @@ def spike_fn_bwd(res, g):
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 # =========================================================
-# [2] Geo-ALIF SNN 아키텍처 (Flax Linen 에러 완벽 수정)
+# [2] Novel Architecture: Geo-HR-SNN
 # =========================================================
-class Geo_ALIF_SNN(nn.Module):
+class Geo_HR_SNN(nn.Module):
     eeg_ch: int = 64
     geo_ch: int = 18
-    temp_hid: int = 32
-    hid_ch: int = 16
+    hid_ch: int = 32
     out_ch: int = 4
 
     def setup(self):
-        # 🔥 에러 원인 제거: setup에서는 구조만 선언하고, train 상태는 받지 않음
-        self.conv1 = nn.Conv(features=self.temp_hid, kernel_size=(5,), padding=2)
-        self.bn1 = nn.BatchNorm()
-        self.drop1 = nn.Dropout(rate=0.3)
+        # 1. EEG Backbone (Depthwise Separable)
+        self.eeg_temp_conv = nn.Conv(features=self.eeg_ch, kernel_size=(15,), feature_group_count=self.eeg_ch, padding='SAME')
+        self.eeg_bn1 = nn.BatchNorm()
+        self.eeg_spat_conv = nn.Conv(features=self.hid_ch, kernel_size=(1,), padding='SAME')
+        self.eeg_bn2 = nn.BatchNorm()
+        self.eeg_drop = nn.Dropout(rate=0.4)
         
-        self.conv2 = nn.Conv(features=self.hid_ch, kernel_size=(3,), padding=1)
-        self.bn2 = nn.BatchNorm()
+        # 2. Geo Backbone (Depthwise Separable)
+        self.geo_temp_conv = nn.Conv(features=self.geo_ch, kernel_size=(15,), feature_group_count=self.geo_ch, padding='SAME')
+        self.geo_bn1 = nn.BatchNorm()
+        self.geo_spat_conv = nn.Conv(features=self.hid_ch, kernel_size=(1,), padding='SAME')
+        self.geo_bn2 = nn.BatchNorm()
         
-        self.geo_mod = nn.Dense(features=self.hid_ch)
-        
+        # 3. Geo-ALIF Modulator
         self.theta_0 = 0.5
         self.beta = 1.8
         self.tau_a = 0.36
-        self.tau_m = 0.8
         self.gamma = self.param('gamma', nn.initializers.constant(0.5), (self.hid_ch,))
         
-        self.drop_out = nn.Dropout(rate=0.5)
-        self.fc1 = nn.Dense(features=64)
+        # 4. Classifier
+        self.classifier_drop = nn.Dropout(rate=0.5)
+        self.fc1 = nn.Dense(features=128)
         self.fc2 = nn.Dense(features=self.out_ch)
 
     @nn.compact
     def __call__(self, x_eeg, x_geo, train: bool = True):
         B, T, _ = x_eeg.shape
         
-        x = self.conv1(x_eeg)
-        # 🔥 올바른 Flax 사용법: 실행 시점(__call__)에 train 상태 전달
-        x = self.bn1(x, use_running_average=not train)
-        x = nn.relu(x)
-        x = self.drop1(x, deterministic=not train)
+        # EEG Feature Extraction
+        xe = self.eeg_temp_conv(x_eeg)
+        xe = self.eeg_bn1(xe, use_running_average=not train)
+        xe = self.eeg_spat_conv(xe)
+        xe = self.eeg_bn2(xe, use_running_average=not train)
+        eeg_encoded = self.eeg_drop(nn.relu(xe), deterministic=not train)
         
-        x = self.conv2(x)
-        x = self.bn2(x, use_running_average=not train)
-        eeg_encoded = nn.relu(x) 
+        # Geo Feature Extraction
+        xg = self.geo_temp_conv(x_geo)
+        xg = self.geo_bn1(xg, use_running_average=not train)
+        xg = self.geo_spat_conv(xg)
+        xg = self.geo_bn2(xg, use_running_average=not train)
+        geo_mod = nn.sigmoid(xg) 
         
-        geo_mod = nn.sigmoid(self.geo_mod(x_geo)) 
-        
+        # XLA Accelerated Spiking Loop
         def scan_fn(carry, inputs):
-            mem_alif, eta, mem_li, prev_spike = carry
+            mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, prev_spk = carry
             cur_eeg, cur_geo_mod = inputs
             
-            eta = self.tau_a * eta + (1 - self.tau_a) * prev_spike
+            # HR-Module: 3 Parallel LIFs with different dynamics
+            mem_lif1 = 0.9 * mem_lif1 + cur_eeg
+            spk1 = spike_fn(mem_lif1 - 0.7)
+            mem_lif1 = mem_lif1 * (1.0 - spk1)
+            
+            mem_lif2 = 0.8 * mem_lif2 + cur_eeg
+            spk2 = spike_fn(mem_lif2 - 0.5)
+            mem_lif2 = mem_lif2 * (1.0 - spk2)
+            
+            mem_lif3 = 0.6 * mem_lif3 + cur_eeg
+            spk3 = spike_fn(mem_lif3 - 0.3)
+            mem_lif3 = mem_lif3 * (1.0 - spk3)
+            
+            hr_out = (spk1 + spk2 + spk3) / 3.0
+            
+            # Geo-ALIF
+            eta = self.tau_a * eta + (1 - self.tau_a) * prev_spk
             theta_t = self.theta_0 + self.beta * eta - (self.gamma * cur_geo_mod)
             
-            mem_alif = self.tau_m * mem_alif + cur_eeg
-            spk = spike_fn(mem_alif - theta_t)
-            mem_alif = mem_alif * (1.0 - spk)
+            mem_alif = 0.8 * mem_alif + hr_out
+            spk_alif = spike_fn(mem_alif - theta_t)
+            mem_alif = mem_alif * (1.0 - spk_alif)
             
-            mem_li = 0.9 * mem_li + spk
+            # Leaky Integrator
+            mem_li = 0.9 * mem_li + spk_alif
             
-            return (mem_alif, eta, mem_li, spk), mem_li
+            new_carry = (mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, spk_alif)
+            return new_carry, mem_li
 
         init_carry = (
-            jnp.zeros((B, self.hid_ch)), 
-            jnp.zeros((B, self.hid_ch)), 
-            jnp.zeros((B, self.hid_ch)), 
-            jnp.zeros((B, self.hid_ch))  
+            jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)),
+            jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch))
         )
         
         inputs = (jnp.swapaxes(eeg_encoded, 0, 1), jnp.swapaxes(geo_mod, 0, 1))
@@ -112,25 +134,26 @@ class Geo_ALIF_SNN(nn.Module):
         mem_li_seq = jnp.swapaxes(mem_li_seq, 0, 1) 
         mem_li_seq = jnp.swapaxes(mem_li_seq, 1, 2) 
         
+        # DP-Pooling (Time length 320 -> 10 windows of 32)
         windows = mem_li_seq.reshape((B, self.hid_ch, 10, 32))
         start_mean = jnp.mean(windows[:, :, :, :16], axis=-1) 
         end_mean = jnp.mean(windows[:, :, :, 16:], axis=-1)   
         
         dp_feat = (end_mean - start_mean).reshape((B, -1)) 
         
-        out = self.drop_out(dp_feat, deterministic=not train)
+        out = self.classifier_drop(dp_feat, deterministic=not train)
         out = nn.relu(self.fc1(out))
         out = self.fc2(out)
         
         return out
 
 # =========================================================
-# [3] Optax TrainState & JIT Training Steps
+# [3] Optax Training State
 # =========================================================
 class TrainState(train_state.TrainState):
     batch_stats: Any
 
-def create_train_state(rng, model, eeg_shape, geo_shape, learning_rate, weight_decay):
+def create_train_state(rng, model, eeg_shape, geo_shape, max_epochs, steps_per_epoch):
     eeg_dummy = jnp.ones(eeg_shape)
     geo_dummy = jnp.ones(geo_shape)
     
@@ -138,17 +161,14 @@ def create_train_state(rng, model, eeg_shape, geo_shape, learning_rate, weight_d
     params = variables['params']
     batch_stats = variables['batch_stats']
     
+    # Cosine Annealing Learning Rate for proper convergence
+    scheduler = optax.cosine_decay_schedule(init_value=2e-3, decay_steps=max_epochs * steps_per_epoch, alpha=0.05)
     tx = optax.chain(
-        optax.add_decayed_weights(weight_decay),
-        optax.adamw(learning_rate=learning_rate)
+        optax.add_decayed_weights(1e-4),
+        optax.adamw(learning_rate=scheduler)
     )
     
-    return TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=tx,
-        batch_stats=batch_stats
-    )
+    return TrainState.create(apply_fn=model.apply, params=params, tx=tx, batch_stats=batch_stats)
 
 @jax.jit
 def train_step(state, x_eeg, x_geo, y, dropout_rng):
@@ -162,7 +182,8 @@ def train_step(state, x_eeg, x_geo, y, dropout_rng):
             mutable=['batch_stats']
         )
         one_hot_y = jax.nn.one_hot(y, 4)
-        loss = optax.softmax_cross_entropy(logits=logits, labels=one_hot_y).mean()
+        smooth_labels = optax.smooth_labels(one_hot_y, 0.1) # Label smoothing avoids overfitting
+        loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_labels).mean()
         return loss, (logits, updates)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -182,17 +203,20 @@ def eval_step(state, x_eeg, x_geo, y):
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
     return correct_count
 
-def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True):
+def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True, drop_last=False):
     num_samples = len(y)
     indices = np.arange(num_samples)
     if shuffle:
         np.random.shuffle(indices)
     for start_idx in range(0, num_samples, batch_size):
-        batch_idx = indices[start_idx:start_idx + batch_size]
+        end_idx = start_idx + batch_size
+        if drop_last and end_idx > num_samples:
+            break
+        batch_idx = indices[start_idx:end_idx]
         yield x_eeg[batch_idx], x_geo[batch_idx], y[batch_idx]
 
 # =========================================================
-# [4] 데이터 전처리 (운동 피질 집중 + 105명 스케일)
+# [4] Data Pipeline
 # =========================================================
 EXCLUDE_SUBS = [88, 92, 100, 104]
 VALID_SUBS = [s for s in range(1, 110) if s not in EXCLUDE_SUBS]
@@ -278,26 +302,25 @@ def process_single_subject_dual(sub):
         return None
 
 if __name__ == "__main__":
-    print(f"🔥 Geo-ALIF SNN [100% 퓨어 JAX/Flax XLA 최적화 버전] 시작...\n")
+    print("Initializing Geo-HR-SNN Validation Pipeline...")
     
     subject_data = {}
     valid_loaded_subs = []
     
     for sub in VALID_SUBS:
-        print(f"데이터 로드 및 특징 추출 중: S{sub:03d} / 109", end='\r')
+        print(f"Loading data for S{sub:03d}/109...", end='\r')
         data = process_single_subject_dual(sub)
         if data is not None:
             subject_data[sub] = data
             valid_loaded_subs.append(sub)
             
     valid_subs_arr = np.array(valid_loaded_subs)
-    print(f"\n✅ 데이터 로드 완료! (유효 피험자: {len(valid_subs_arr)}명)")
+    print(f"\nData loaded successfully. Total valid subjects: {len(valid_subs_arr)}")
     
     sample_geo_ch = subject_data[valid_subs_arr[0]][1].shape[-1]
     
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     results_acc = {}
-    
     rng = jax.random.PRNGKey(42)
     
     fold = 1
@@ -306,44 +329,49 @@ if __name__ == "__main__":
         test_subs = valid_subs_arr[test_idx]
         
         print(f"\n{'='*60}")
-        print(f"🔄 [Fold {fold}/5] Global Train: {len(train_subs)}명 | SSTL Test: {len(test_subs)}명")
+        print(f"Fold [{fold}/5] | Global Train: {len(train_subs)} subjects | SSTL Test: {len(test_subs)} subjects")
         print(f"{'='*60}")
         
         X_eeg_g = np.concatenate([subject_data[s][0] for s in train_subs])
         X_geo_g = np.concatenate([subject_data[s][1] for s in train_subs])
         y_g = np.concatenate([subject_data[s][2] for s in train_subs])
         
-        global_model = Geo_ALIF_SNN(geo_ch=sample_geo_ch)
+        global_model = Geo_HR_SNN(geo_ch=sample_geo_ch)
+        
+        batch_size = 256
+        steps_per_epoch = len(y_g) // batch_size
+        max_epochs = 200
         
         rng, init_rng = jax.random.split(rng)
         state = create_train_state(
             init_rng, global_model, 
             eeg_shape=(1, 320, 64), geo_shape=(1, 320, sample_geo_ch),
-            learning_rate=0.002, weight_decay=1e-4
+            max_epochs=max_epochs, steps_per_epoch=steps_per_epoch
         )
         
-        print(f"🚀 글로벌 모델 학습 시작 (학습 데이터: {len(y_g)}개, Epochs: 40)")
+        print(f"Starting Global Training | Total Data: {len(y_g)} | Target Epochs: {max_epochs}")
         rng, dropout_rng = jax.random.split(rng)
         
-        for epoch in range(1, 41):
+        for epoch in range(1, max_epochs + 1):
             epoch_start = time.time()
-            
             tr_loss, tr_c, tr_t = 0.0, 0, 0
             
-            for batch_idx, (xb_eeg, xb_geo, yb) in enumerate(get_batches(X_eeg_g, X_geo_g, y_g, batch_size=256, shuffle=True), 1):
+            # drop_last=True for optimized static shape JIT compilation
+            for xb_eeg, xb_geo, yb in get_batches(X_eeg_g, X_geo_g, y_g, batch_size=batch_size, shuffle=True, drop_last=True):
                 xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)
                 
                 state, loss, correct_count, dropout_rng = train_step(state, xb_eeg, xb_geo, yb, dropout_rng)
                 
-                batch_size = len(yb)
-                tr_loss += loss.item() * batch_size
+                bs = len(yb)
+                tr_loss += loss.item() * bs
                 tr_c += correct_count.item() 
-                tr_t += batch_size
+                tr_t += bs
             
+            # Print cleanly formatted single line
             epoch_time = time.time() - epoch_start
-            print(f"  👉 [Global Epoch {epoch:02d}/40] Loss: {tr_loss/tr_t:.4f} | Train Acc: {100*tr_c/tr_t:.1f}% | 소요시간: {epoch_time:.2f}초")
+            print(f"[Global Epoch {epoch:03d}/{max_epochs}] Loss: {tr_loss/tr_t:.4f} | Train Acc: {100*tr_c/tr_t:>5.1f}% | Time: {epoch_time:.2f}s")
                 
-        print(f"\n🎯 [Stage 2] 파인튜닝(SSTL) 및 평가 진행 중... (총 {len(test_subs)}명)")
+        print(f"\nStarting Subject-Specific Transfer Learning (SSTL) for {len(test_subs)} subjects...")
         for idx, sub in enumerate(test_subs, 1):
             X_eeg_sub, X_geo_sub, y_sub = subject_data[sub]
             tr_idx, ts_idx = train_test_split(np.arange(len(y_sub)), test_size=0.2, stratify=y_sub, random_state=42)
@@ -370,15 +398,14 @@ if __name__ == "__main__":
                     best_test_acc = test_acc
                     
             results_acc[sub] = best_test_acc
-            print(f"  ✅ S{sub:03d} SSTL 완료 ({idx}/{len(test_subs)}) -> 최고 Test Acc: {best_test_acc:.1f}%")
+            print(f"  Target S{sub:03d} SSTL Completed ({idx}/{len(test_subs)}) | Best Test Acc: {best_test_acc:.1f}%")
             
-        print(f"\n✅ Fold {fold} 평가 싹 다 완료.")
         fold += 1
 
     print(f"\n{'='*50}")
-    print(f"📊 최종 Geo-ALIF SNN (JAX Accelerated) 테스트 결과")
+    print(f"Final Geo-HR-SNN Evaluation Results")
     print(f"{'='*50}")
     valid_accs = list(results_acc.values())
-    print(f"평균 정확도(Mean): {np.mean(valid_accs):.1f}%")
-    print(f"최고 정확도(Max):  {np.max(valid_accs):.1f}%")
-    print(f"최저 정확도(Min):  {np.min(valid_accs):.1f}%")
+    print(f"Mean Accuracy: {np.mean(valid_accs):.2f}%")
+    print(f"Max Accuracy:  {np.max(valid_accs):.2f}%")
+    print(f"Min Accuracy:  {np.min(valid_accs):.2f}%")

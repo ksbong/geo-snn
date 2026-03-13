@@ -6,7 +6,6 @@ from scipy.signal import hilbert, savgol_filter
 import warnings
 from typing import Any
 
-# JAX 환경 변수 (OOM 방지)
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 os.environ['XLA_FLAGS'] = '--xla_gpu_strict_conv_algorithm_picker=false'
 
@@ -42,23 +41,32 @@ def spike_fn_bwd(res, g):
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 # =========================================================
-# [2] Pure Geo-ALIF Architecture (Tracer Leak 수정 완료)
+# [2] Novelty: TCN + TDA(Geo) + HR-SNN
 # =========================================================
-class Pure_Geo_ALIF_SNN(nn.Module):
+class TCN_Geo_HR_SNN(nn.Module):
     eeg_ch: int = 64
     geo_ch: int = 18
     hid_ch: int = 32
     out_ch: int = 4
 
     def setup(self):
-        self.w_eeg = nn.Dense(features=self.hid_ch, use_bias=False)
-        self.w_tau = nn.Dense(features=self.hid_ch)
-        self.w_theta = nn.Dense(features=self.hid_ch)
+        # TCN Block for EEG Spikes (Dilation 적용하여 수용영역 확장)
+        self.tcn_conv1 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(1,), padding='SAME')
+        self.tcn_bn1 = nn.BatchNorm()
+        self.tcn_conv2 = nn.Conv(features=self.hid_ch, kernel_size=(5,), kernel_dilation=(2,), padding='SAME')
+        self.tcn_bn2 = nn.BatchNorm()
+        self.tcn_drop = nn.Dropout(rate=0.4)
         
+        # TDA(Geo) Features Projection
+        self.geo_tau_proj = nn.Dense(features=self.hid_ch)
+        self.geo_theta_proj = nn.Dense(features=self.hid_ch)
+        
+        # SNN Dynamics
         self.theta_0 = 0.5
         self.tau_a = 0.36
         self.beta = 1.8
         
+        # Classifier
         self.classifier_drop = nn.Dropout(rate=0.5)
         self.fc_out = nn.Dense(features=self.out_ch)
 
@@ -66,54 +74,76 @@ class Pure_Geo_ALIF_SNN(nn.Module):
     def __call__(self, x_eeg, x_geo, train: bool = True):
         B, T, _ = x_eeg.shape
         
-        # BSA 스타일 인코딩
+        # 1. BSA Style Deterministic Encoding
         eeg_diff = x_eeg[:, 1:, :] - x_eeg[:, :-1, :]
         encoded_spikes = spike_fn(jnp.abs(eeg_diff) - 0.1) 
         zero_pad = jnp.zeros((B, 1, self.eeg_ch))
         x_eeg_spikes = jnp.concatenate([zero_pad, encoded_spikes], axis=1)
         
-        # 스파이크 및 기하학적 피처 사전 연산 (Pre-compute) -> Tracer Leak 해결의 핵심
-        eeg_mapped = self.w_eeg(x_eeg_spikes) # [B, T, hid_ch]
+        # 2. TCN Feature Extraction (LSTM 대체, 병렬 연산)
+        x_tcn = self.tcn_conv1(x_eeg_spikes)
+        x_tcn = self.tcn_bn1(x_tcn, use_running_average=not train)
+        x_tcn = nn.elu(x_tcn)
+        x_tcn = self.tcn_conv2(x_tcn)
+        x_tcn = self.tcn_bn2(x_tcn, use_running_average=not train)
+        eeg_temporal_features = self.tcn_drop(nn.elu(x_tcn), deterministic=not train) # [B, T, hid_ch]
         
-        geo_tau_seq = nn.sigmoid(self.w_tau(x_geo)) # [B, T, hid_ch]
-        geo_theta_seq = nn.softplus(self.w_theta(x_geo)) # [B, T, hid_ch]
+        # 3. TDA(Geo) Modulation Pre-computation (Tracer Leak 방지)
+        tau_mod_seq = nn.sigmoid(self.geo_tau_proj(x_geo)) 
+        theta_mod_seq = nn.softplus(self.geo_theta_proj(x_geo)) 
         
+        # 4. HR-SNN + Geo-ALIF Loop
         def scan_fn(carry, inputs):
-            mem_alif, eta, mem_li, prev_spk = carry
-            cur_eeg_spk, cur_tau_mod, cur_theta_mod = inputs
+            mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, prev_spk = carry
+            cur_eeg_feat, cur_tau_mod, cur_theta_mod = inputs
             
+            # HR-Module (3 Parallel LIFs)
+            mem_lif1 = 0.9 * mem_lif1 + cur_eeg_feat
+            spk1 = spike_fn(mem_lif1 - 0.7)
+            mem_lif1 = mem_lif1 * (1.0 - spk1)
+            
+            mem_lif2 = 0.8 * mem_lif2 + cur_eeg_feat
+            spk2 = spike_fn(mem_lif2 - 0.5)
+            mem_lif2 = mem_lif2 * (1.0 - spk2)
+            
+            mem_lif3 = 0.6 * mem_lif3 + cur_eeg_feat
+            spk3 = spike_fn(mem_lif3 - 0.3)
+            mem_lif3 = mem_lif3 * (1.0 - spk3)
+            
+            hr_out = (spk1 + spk2 + spk3) / 3.0
+            
+            # Geo-ALIF
             tau_m = 0.5 + 0.49 * cur_tau_mod
-            geo_theta_shift = cur_theta_mod
-            
             eta = self.tau_a * eta + (1 - self.tau_a) * prev_spk
-            theta_t = self.theta_0 + self.beta * eta - geo_theta_shift
+            theta_t = self.theta_0 + self.beta * eta - cur_theta_mod
             
-            mem_alif = tau_m * mem_alif + cur_eeg_spk
+            mem_alif = tau_m * mem_alif + hr_out
             spk_alif = spike_fn(mem_alif - theta_t)
             mem_alif = mem_alif * (1.0 - spk_alif)
             
             mem_li = 0.9 * mem_li + spk_alif
             
-            return (mem_alif, eta, mem_li, spk_alif), mem_li
+            new_carry = (mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, spk_alif)
+            return new_carry, mem_li
 
         init_carry = (
-            jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), 
-            jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch))
+            jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)),
+            jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch))
         )
         
-        # 사전에 계산된 시계열 텐서들을 시간축(axis=1) 기준으로 스캔
         inputs = (
-            jnp.swapaxes(eeg_mapped, 0, 1), 
-            jnp.swapaxes(geo_tau_seq, 0, 1),
-            jnp.swapaxes(geo_theta_seq, 0, 1)
+            jnp.swapaxes(eeg_temporal_features, 0, 1), 
+            jnp.swapaxes(tau_mod_seq, 0, 1),
+            jnp.swapaxes(theta_mod_seq, 0, 1)
         )
         _, mem_li_seq = jax.lax.scan(scan_fn, init_carry, inputs)
         
         mem_li_seq = jnp.swapaxes(mem_li_seq, 0, 1) 
         
+        # DP-Pooling
         windows = mem_li_seq.reshape((B, 10, 32, self.hid_ch))
-        start_mean = jnp.mean(windows[:, :, :16, :], axis=2) 
-        end_mean = jnp.mean(windows[:, :, 16:, :], axis=2)   
+        start_mean = jnp.mean(windows[:, :16, :], axis=1) 
+        end_mean = jnp.mean(windows[:, 16:, :], axis=1)   
         
         dp_feat = (end_mean - start_mean).reshape((B, -1)) 
         
@@ -134,34 +164,37 @@ def create_train_state(rng, model, eeg_shape, geo_shape, max_epochs, steps_per_e
     
     variables = model.init({'params': rng, 'dropout': rng}, eeg_dummy, geo_dummy, train=False)
     params = variables['params']
+    batch_stats = variables['batch_stats']
     
     scheduler = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=max_epochs * steps_per_epoch, alpha=0.01)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.add_decayed_weights(1e-2), 
+        optax.add_decayed_weights(1e-3),
         optax.adamw(learning_rate=scheduler)
     )
     
-    return TrainState.create(apply_fn=model.apply, params=params, tx=tx, batch_stats=None)
+    return TrainState.create(apply_fn=model.apply, params=params, tx=tx, batch_stats=batch_stats)
 
 @jax.jit
 def train_step(state, x_eeg, x_geo, y, dropout_rng):
     dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
     
     def loss_fn(params):
-        logits = state.apply_fn(
-            {'params': params},
+        logits, updates = state.apply_fn(
+            {'params': params, 'batch_stats': state.batch_stats},
             x_eeg, x_geo, train=True,
-            rngs={'dropout': dropout_rng}
+            rngs={'dropout': dropout_rng},
+            mutable=['batch_stats']
         )
         one_hot_y = jax.nn.one_hot(y, 4)
         smooth_labels = optax.smooth_labels(one_hot_y, 0.1)
         loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_labels).mean()
-        return loss, logits
+        return loss, (logits, updates)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
+    (loss, (logits, updates)), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
+    state = state.replace(batch_stats=updates['batch_stats'])
     
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
     return state, loss, correct_count, new_dropout_rng
@@ -169,7 +202,7 @@ def train_step(state, x_eeg, x_geo, y, dropout_rng):
 @jax.jit
 def eval_step(state, x_eeg, x_geo, y):
     logits = state.apply_fn(
-        {'params': state.params},
+        {'params': state.params, 'batch_stats': state.batch_stats},
         x_eeg, x_geo, train=False
     )
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
@@ -274,7 +307,7 @@ def process_single_subject_dual(sub):
         return None
 
 if __name__ == "__main__":
-    print("INIT: Pure Geo-ALIF SNN Validation Pipeline")
+    print("INIT: TCN + TDA(Geo) + HR-SNN Pipeline")
     
     subject_data = {}
     valid_loaded_subs = []
@@ -301,7 +334,7 @@ if __name__ == "__main__":
         test_subs = valid_subs_arr[test_idx]
         
         print(f"\n============================================================")
-        print(f"FOLD {fold}/5 | GLOBAL_TRAIN: {len(train_subs)} | GLOBAL_VAL/SSTL_TEST: {len(test_subs)}")
+        print(f"FOLD {fold}/5 | GLOBAL_TRAIN: {len(train_subs)} | GLOBAL_VAL: {len(test_subs)}")
         print(f"============================================================")
         
         X_eeg_g = np.concatenate([subject_data[s][0] for s in train_subs])
@@ -312,7 +345,7 @@ if __name__ == "__main__":
         X_geo_val = np.concatenate([subject_data[s][1] for s in test_subs])
         y_val = np.concatenate([subject_data[s][2] for s in test_subs])
         
-        global_model = Pure_Geo_ALIF_SNN(geo_ch=sample_geo_ch)
+        global_model = TCN_Geo_HR_SNN(geo_ch=sample_geo_ch)
         
         batch_size = 256
         steps_per_epoch = len(y_g) // batch_size
@@ -325,7 +358,7 @@ if __name__ == "__main__":
             max_epochs=max_epochs, steps_per_epoch=steps_per_epoch
         )
         
-        print(f"STAGE 1: GLOBAL PRE-TRAINING (Train: {len(y_g)}, Val: {len(y_val)})")
+        print(f"STAGE 1: GLOBAL PRE-TRAINING")
         rng, dropout_rng = jax.random.split(rng)
         
         best_val_acc = 0.0
@@ -391,12 +424,12 @@ if __name__ == "__main__":
                     sub_best_test_acc = test_acc
                     
             results_acc[sub] = sub_best_test_acc
-            print(f"  [SSTL] S{sub:03d} ({idx}/{len(test_subs)}) -> Best Test Acc: {sub_best_test_acc:.1f}%")
+            print(f"  [SSTL] S{sub:03d} -> Best Test Acc: {sub_best_test_acc:.1f}%")
             
         fold += 1
 
     print(f"\n{'='*50}")
-    print(f"FINAL EVAL: Pure Geo-ALIF SNN")
+    print(f"FINAL EVAL: TCN + TDA + HR-SNN")
     print(f"{'='*50}")
     valid_accs = list(results_acc.values())
     print(f"Mean Acc: {np.mean(valid_accs):.2f}%")

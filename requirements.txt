@@ -8,3 +8,4 @@ giotto-tda>=0.6.0
 jax[cuda12]
 flax
 optax
+snntorch

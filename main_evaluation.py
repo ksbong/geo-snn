@@ -38,42 +38,30 @@ def spike_fn_bwd(res, g):
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 # =========================================================
-# [2] Focal Loss (Advanced Loss for Noisy EEG)
-# =========================================================
-def focal_loss_fn(logits, labels, gamma=2.0, alpha=0.25):
-    probs = jax.nn.softmax(logits)
-    p_t = jnp.sum(probs * labels, axis=-1)
-    ce_loss = optax.softmax_cross_entropy(logits=logits, labels=labels)
-    focal_weight = alpha * jnp.power(1.0 - p_t, gamma)
-    return jnp.mean(focal_weight * ce_loss)
-
-# =========================================================
-# [3] 2D Spatial-Temporal Geo-ALIF SNN (Novel Architecture)
+# [2] Novel Architecture: Geo-HR-SNN (XLA Optimized)
 # =========================================================
 class Geo_HR_SNN(nn.Module):
     eeg_ch: int = 64
     geo_ch: int = 18
     F1: int = 8
-    D: int = 2
+    hid_ch: int = 32
     out_ch: int = 4
 
     def setup(self):
-        # 1. 2D EEG Backbone (Time -> Spatial)
-        self.eeg_conv_time = nn.Conv(features=self.F1, kernel_size=(64, 1), padding='SAME', use_bias=False)
+        # 1. EEG Backbone: Temporal Depthwise Conv -> Spatial Dense Mixing
+        self.eeg_temp_conv = nn.Conv(features=self.eeg_ch * self.F1, kernel_size=(32,), feature_group_count=self.eeg_ch, padding='SAME')
         self.eeg_bn1 = nn.BatchNorm()
-        # Depthwise spatial convolution
-        self.eeg_conv_spat = nn.Conv(features=self.F1 * self.D, kernel_size=(1, self.eeg_ch), feature_group_count=self.F1, padding='VALID', use_bias=False)
+        self.eeg_spat_dense = nn.Dense(features=self.hid_ch)
         self.eeg_bn2 = nn.BatchNorm()
-        self.eeg_drop = nn.Dropout(rate=0.5)
+        self.eeg_drop = nn.Dropout(rate=0.4)
         
-        # 2. 2D Geo Backbone
-        self.geo_conv_time = nn.Conv(features=self.F1, kernel_size=(32, 1), padding='SAME', use_bias=False)
+        # 2. Geo Backbone: Temporal Depthwise Conv -> Spatial Dense Mixing
+        self.geo_temp_conv = nn.Conv(features=self.geo_ch * self.F1, kernel_size=(32,), feature_group_count=self.geo_ch, padding='SAME')
         self.geo_bn1 = nn.BatchNorm()
-        self.geo_conv_spat = nn.Conv(features=self.F1 * self.D, kernel_size=(1, self.geo_ch), feature_group_count=self.F1, padding='VALID', use_bias=False)
+        self.geo_spat_dense = nn.Dense(features=self.hid_ch)
         self.geo_bn2 = nn.BatchNorm()
         
-        # 3. Geo-ALIF Parameters
-        self.hid_ch = self.F1 * self.D
+        # 3. Geo-ALIF Modulator Params
         self.theta_0 = 0.5
         self.beta = 1.8
         self.tau_a = 0.36
@@ -86,35 +74,27 @@ class Geo_HR_SNN(nn.Module):
 
     @nn.compact
     def __call__(self, x_eeg, x_geo, train: bool = True):
-        # inputs are [B, T, C] -> reshape to [B, T, C, 1] for 2D Conv
-        B, T, C_eeg = x_eeg.shape
-        _, _, C_geo = x_geo.shape
+        B, T, _ = x_eeg.shape
         
-        x_eeg_2d = jnp.expand_dims(x_eeg, axis=-1)
-        x_geo_2d = jnp.expand_dims(x_geo, axis=-1)
-        
-        # EEG 2D Processing
-        xe = self.eeg_conv_time(x_eeg_2d)
+        # EEG Feature Extraction
+        xe = self.eeg_temp_conv(x_eeg)
         xe = self.eeg_bn1(xe, use_running_average=not train)
-        xe = self.eeg_conv_spat(xe)
+        xe = self.eeg_spat_dense(xe)
         xe = self.eeg_bn2(xe, use_running_average=not train)
-        xe = nn.elu(xe)
-        xe = self.eeg_drop(xe, deterministic=not train)
-        eeg_encoded = jnp.squeeze(xe, axis=2) # [B, T, F1*D]
+        eeg_encoded = self.eeg_drop(nn.relu(xe), deterministic=not train)
         
-        # Geo 2D Processing
-        xg = self.geo_conv_time(x_geo_2d)
+        # Geo Feature Extraction
+        xg = self.geo_temp_conv(x_geo)
         xg = self.geo_bn1(xg, use_running_average=not train)
-        xg = self.geo_conv_spat(xg)
+        xg = self.geo_spat_dense(xg)
         xg = self.geo_bn2(xg, use_running_average=not train)
-        geo_encoded = jnp.squeeze(xg, axis=2) # [B, T, F1*D]
-        geo_mod = nn.sigmoid(geo_encoded)
+        geo_mod = nn.sigmoid(xg) 
         
-        # XLA Accelerated HR-SNN Loop
         def scan_fn(carry, inputs):
             mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, prev_spk = carry
             cur_eeg, cur_geo_mod = inputs
             
+            # HR-Module (3 Parallel LIFs)
             mem_lif1 = 0.9 * mem_lif1 + cur_eeg
             spk1 = spike_fn(mem_lif1 - 0.7)
             mem_lif1 = mem_lif1 * (1.0 - spk1)
@@ -129,6 +109,7 @@ class Geo_HR_SNN(nn.Module):
             
             hr_out = (spk1 + spk2 + spk3) / 3.0
             
+            # Geo-ALIF Mechanism
             eta = self.tau_a * eta + (1 - self.tau_a) * prev_spk
             theta_t = self.theta_0 + self.beta * eta - (self.gamma * cur_geo_mod)
             
@@ -136,6 +117,7 @@ class Geo_HR_SNN(nn.Module):
             spk_alif = spike_fn(mem_alif - theta_t)
             mem_alif = mem_alif * (1.0 - spk_alif)
             
+            # Leaky Integrator for Pooling
             mem_li = 0.9 * mem_li + spk_alif
             
             new_carry = (mem_lif1, mem_lif2, mem_lif3, mem_alif, eta, mem_li, spk_alif)
@@ -152,6 +134,7 @@ class Geo_HR_SNN(nn.Module):
         mem_li_seq = jnp.swapaxes(mem_li_seq, 0, 1) 
         mem_li_seq = jnp.swapaxes(mem_li_seq, 1, 2) 
         
+        # Temporal DP-Pooling
         windows = mem_li_seq.reshape((B, self.hid_ch, 10, 32))
         start_mean = jnp.mean(windows[:, :, :, :16], axis=-1) 
         end_mean = jnp.mean(windows[:, :, :, 16:], axis=-1)   
@@ -165,7 +148,7 @@ class Geo_HR_SNN(nn.Module):
         return out
 
 # =========================================================
-# [4] Training State & JIT Steps
+# [3] Optax Training State (Restored CE + Label Smoothing)
 # =========================================================
 class TrainState(train_state.TrainState):
     batch_stats: Any
@@ -178,10 +161,10 @@ def create_train_state(rng, model, eeg_shape, geo_shape, max_epochs, steps_per_e
     params = variables['params']
     batch_stats = variables['batch_stats']
     
-    scheduler = optax.cosine_decay_schedule(init_value=3e-3, decay_steps=max_epochs * steps_per_epoch, alpha=0.01)
+    scheduler = optax.cosine_decay_schedule(init_value=2e-3, decay_steps=max_epochs * steps_per_epoch, alpha=0.01)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.add_decayed_weights(1e-3),
+        optax.add_decayed_weights(1e-4),
         optax.adamw(learning_rate=scheduler)
     )
     
@@ -200,7 +183,8 @@ def train_step(state, x_eeg, x_geo, y, dropout_rng):
         )
         one_hot_y = jax.nn.one_hot(y, 4)
         smooth_labels = optax.smooth_labels(one_hot_y, 0.1)
-        loss = focal_loss_fn(logits, smooth_labels)
+        # Restore standard Cross Entropy for healthy gradient flow
+        loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_labels).mean()
         return loss, (logits, updates)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -218,8 +202,7 @@ def eval_step(state, x_eeg, x_geo, y):
         x_eeg, x_geo, train=False
     )
     correct_count = jnp.sum(jnp.argmax(logits, -1) == y)
-    loss = focal_loss_fn(logits, jax.nn.one_hot(y, 4))
-    return loss, correct_count
+    return correct_count
 
 def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True, drop_last=False):
     num_samples = len(y)
@@ -234,7 +217,7 @@ def get_batches(x_eeg, x_geo, y, batch_size, shuffle=True, drop_last=False):
         yield x_eeg[batch_idx], x_geo[batch_idx], y[batch_idx]
 
 # =========================================================
-# [5] Data Pipeline
+# [4] Data Pipeline
 # =========================================================
 EXCLUDE_SUBS = [88, 92, 100, 104]
 VALID_SUBS = [s for s in range(1, 110) if s not in EXCLUDE_SUBS]
@@ -320,19 +303,20 @@ def process_single_subject_dual(sub):
         return None
 
 if __name__ == "__main__":
-    print("INIT: Geo-HR-SNN Validation Pipeline (2D Conv + Focal Loss)")
+    print("INIT: Geo-HR-SNN (1D Depthwise + Dense + HR-Module)")
     
     subject_data = {}
     valid_loaded_subs = []
     
     for sub in VALID_SUBS:
+        print(f"LOAD: S{sub:03d}/109...", flush=True)
         data = process_single_subject_dual(sub)
         if data is not None:
             subject_data[sub] = data
             valid_loaded_subs.append(sub)
             
     valid_subs_arr = np.array(valid_loaded_subs)
-    print(f"LOAD: Total valid subjects: {len(valid_subs_arr)}")
+    print(f"LOAD: Complete. Total subjects: {len(valid_subs_arr)}")
     
     sample_geo_ch = subject_data[valid_subs_arr[0]][1].shape[-1]
     
@@ -345,15 +329,14 @@ if __name__ == "__main__":
         train_subs = valid_subs_arr[train_idx]
         test_subs = valid_subs_arr[test_idx]
         
-        print(f"\n{'='*60}")
-        print(f"FOLD {fold}/5 | GLOBAL_TRAIN: {len(train_subs)} | GLOBAL_VAL/SSTL_TEST: {len(test_subs)}")
-        print(f"{'='*60}")
+        print(f"\n============================================================")
+        print(f"FOLD {fold}/5 | GLOBAL_TRAIN: {len(train_subs)} | SSTL_TEST: {len(test_subs)}")
+        print(f"============================================================")
         
         X_eeg_g = np.concatenate([subject_data[s][0] for s in train_subs])
         X_geo_g = np.concatenate([subject_data[s][1] for s in train_subs])
         y_g = np.concatenate([subject_data[s][2] for s in train_subs])
         
-        # ⚠️ 과적합 방지를 위해 Global Validation Set 분리
         X_eeg_val = np.concatenate([subject_data[s][0] for s in test_subs])
         X_geo_val = np.concatenate([subject_data[s][1] for s in test_subs])
         y_val = np.concatenate([subject_data[s][2] for s in test_subs])
@@ -390,17 +373,15 @@ if __name__ == "__main__":
                 tr_c += correct_count.item() 
                 tr_t += bs
                 
-            # Evaluation on Validation Set
             val_c, val_t = 0, 0
             for xb_eeg, xb_geo, yb in get_batches(X_eeg_val, X_geo_val, y_val, batch_size=256, shuffle=False):
                 xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)
-                _, correct_count = eval_step(state, xb_eeg, xb_geo, yb)
+                correct_count = eval_step(state, xb_eeg, xb_geo, yb)
                 val_c += correct_count.item()
                 val_t += len(yb)
                 
             val_acc = 100 * val_c / val_t
             
-            # Save best global model
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_global_state = state
@@ -411,13 +392,12 @@ if __name__ == "__main__":
             epoch_time = time.time() - epoch_start
             print(f"[G-EP {epoch:03d}/{max_epochs}] TLoss: {tr_loss/tr_t:.4f} | TAcc: {100*tr_c/tr_t:>5.1f}% | VAcc: {val_acc:>5.1f}% {mark} | T: {epoch_time:.2f}s")
                 
-        print(f"\nSTAGE 2: SSTL (Targeting {len(test_subs)} subjects from Best Global Model: {best_val_acc:.1f}%)")
+        print(f"\nSTAGE 2: SSTL (Loading Best Global Model: {best_val_acc:.1f}%)")
         
-        for idx, sub in enumerate(test_subs, 1):
+        for sub in test_subs:
             X_eeg_sub, X_geo_sub, y_sub = subject_data[sub]
             tr_idx, ts_idx = train_test_split(np.arange(len(y_sub)), test_size=0.2, stratify=y_sub, random_state=42)
             
-            # Load BEST global weights
             sstl_tx = optax.chain(optax.add_decayed_weights(1e-4), optax.adamw(learning_rate=0.0005))
             sstl_opt_state = sstl_tx.init(best_global_state.params) 
             sstl_state = best_global_state.replace(tx=sstl_tx, opt_state=sstl_opt_state)
@@ -431,7 +411,7 @@ if __name__ == "__main__":
                 ts_c, ts_t = 0, 0
                 for xb_eeg, xb_geo, yb in get_batches(X_eeg_sub[ts_idx], X_geo_sub[ts_idx], y_sub[ts_idx], batch_size=32, shuffle=False):
                     xb_eeg, xb_geo, yb = jnp.array(xb_eeg), jnp.array(xb_geo), jnp.array(yb, dtype=jnp.int32)
-                    _, correct_count = eval_step(sstl_state, xb_eeg, xb_geo, yb)
+                    correct_count = eval_step(sstl_state, xb_eeg, xb_geo, yb)
                     ts_c += correct_count.item()
                     ts_t += len(yb)
                 
@@ -440,12 +420,12 @@ if __name__ == "__main__":
                     sub_best_test_acc = test_acc
                     
             results_acc[sub] = sub_best_test_acc
-            print(f"  [SSTL] S{sub:03d} ({idx}/{len(test_subs)}) -> Best Test Acc: {sub_best_test_acc:.1f}%")
+            print(f"  [SSTL] S{sub:03d} -> Best Test Acc: {sub_best_test_acc:.1f}%")
             
         fold += 1
 
     print(f"\n{'='*50}")
-    print(f"FINAL EVALUATION: Geo-HR-SNN")
+    print(f"FINAL EVAL: Geo-HR-SNN (1D Depthwise + Spatial Dense)")
     print(f"{'='*50}")
     valid_accs = list(results_acc.values())
     print(f"Mean Acc: {np.mean(valid_accs):.2f}%")

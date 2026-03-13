@@ -31,9 +31,9 @@ def compute_spd_cov(envelope):
 # =====================================================================
 # 2. 전처리 & 텐서 저장 (Sliding Window로 Temporal Dynamics 추출)
 # =====================================================================
-DATA_DIR = '/kaggle/input/datasets/sangbongkim/full-physionet/07_Data'
+DATA_DIR = './raw_data/files/'
 if not os.path.exists(DATA_DIR):
-    DATA_DIR = '/kaggle/input/full-physionet/07_Data'
+    DATA_DIR = './raw_data/files'
 
 SAVE_DIR = './processed_tensors_seq'
 os.makedirs(SAVE_DIR, exist_ok=True)

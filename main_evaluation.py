@@ -16,7 +16,7 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =====================================================================
-# 1. 기하학적 특징 및 라플라시안 그래프 전처리 (수정됨)
+# 1. 기하학적 특징 및 라플라시안 그래프 전처리 (최종 완성형)
 # =====================================================================
 def project_to_hardy_space(data, sfreq, l_freq=8.0, h_freq=30.0):
     n_times = data.shape[-1]
@@ -42,7 +42,7 @@ exclude_subjects = ['S088', 'S092', 'S100', 'S104']
 all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
 
 def process_and_save_subject_graph(subj):
-    save_path_L = f"{SAVE_DIR}/{subj}_L.pt" # 💡 A 대신 L(Laplacian) 저장
+    save_path_L = f"{SAVE_DIR}/{subj}_L.pt" 
     save_path_X = f"{SAVE_DIR}/{subj}_X.pt" 
     save_path_y = f"{SAVE_DIR}/{subj}_y.pt"
     if os.path.exists(save_path_L): return
@@ -52,7 +52,6 @@ def process_and_save_subject_graph(subj):
     epochs_list = []
     
     try:
-        # 데이터 로드 (이전과 동일)
         for run in runs_hands:
             path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
             if not os.path.exists(path): continue
@@ -80,74 +79,72 @@ def process_and_save_subject_graph(subj):
         labels = np.array(epochs_all.events[:, 2]) - 1 
         sfreq = epochs_all.info['sfreq']
 
+        # Hardy Space 투영 후 Envelope 추출
         hardy_signals = project_to_hardy_space(data, sfreq)
-        envelopes = np.abs(hardy_signals)
+        envelopes = np.abs(hardy_signals) # Shape: (Epochs, 64, 480)
         
-        win_len = 160; stride = 80; num_windows = 5
-        
-        X_covs_seq = []
-        for w in range(num_windows):
-            start = w * stride; end = start + win_len
-            env_win = envelopes[:, :, start:end]
-            X_covs_seq.append(np.array([compute_spd_cov(env) for env in env_win]))
-        X_covs_seq = np.stack(X_covs_seq, axis=1)
-
-        rest_covs = X_covs_seq[labels == 0]
-        p_rest = np.mean(rest_covs, axis=(0, 1)) 
+        # 💡 Rest 상태 공분산 계산 (Reference Point)
+        rest_idx = (labels == 0)
+        rest_envelopes = envelopes[rest_idx]
+        rest_covs = np.array([compute_spd_cov(env) for env in rest_envelopes])
+        p_rest = np.mean(rest_covs, axis=0) 
         p_rest_sqrt = sqrtm(p_rest).real
         p_rest_inv_sqrt = inv(p_rest_sqrt)
 
-        L_norm_seq = []
-        X_feat_seq = []
+        L_norm_list = []
+        X_feat_list = []
         
-        for ep_idx in range(X_covs_seq.shape[0]):
-            ep_L = []; ep_X = []
-            for w in range(num_windows):
-                cov = X_covs_seq[ep_idx, w]
-                inner = p_rest_inv_sqrt @ cov @ p_rest_inv_sqrt
-                tangent = p_rest_sqrt @ logm(inner).real @ p_rest_sqrt
-                
-                node_features = tangent 
-                
-                # 💡 핵심 1: k-NN 그래프 희소화 (Oversmoothing 방지)
-                A = np.abs(tangent)
-                np.fill_diagonal(A, 0) # 자기 자신 제외하고 가장 강한 연결 찾기
-                
-                k = 8 # 상위 8개 이웃만 남김
-                A_sparse = np.zeros_like(A)
-                for i in range(A.shape[0]):
-                    idx = np.argsort(A[i])[-k:]
-                    A_sparse[i, idx] = A[i, idx]
-                
-                # 방향성 없애고 대칭 행렬로 복구
-                A_sparse = np.maximum(A_sparse, A_sparse.T) 
-                
-                # 💡 핵심 2: 정규화된 라플라시안 행렬 유도 (L = I - D^{-1/2} A D^{-1/2})
-                D = np.diag(np.sum(A_sparse, axis=1))
-                D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
-                
-                L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A_sparse @ D_inv_sqrt)
-                
-                ep_L.append(L_norm)
-                ep_X.append(node_features)
-                
-            L_norm_seq.append(ep_L)
-            X_feat_seq.append(ep_X)
+        num_steps = 15
+        chunk_size = envelopes.shape[-1] // num_steps # 480 // 15 = 32
         
-        L_norm_seq = np.array(L_norm_seq, dtype=np.float32) 
-        X_feat_seq = np.array(X_feat_seq, dtype=np.float32) 
+        for ep_idx in range(envelopes.shape[0]):
+            env = envelopes[ep_idx] # (64, 480)
+            
+            # 💡 1. 지도 제작: 3초 전체 데이터에서 O(N^3) 연산은 딱 한 번만 수행
+            cov_full = compute_spd_cov(env)
+            inner = p_rest_inv_sqrt @ cov_full @ p_rest_inv_sqrt
+            tangent = p_rest_sqrt @ logm(inner).real @ p_rest_sqrt
+            
+            # k-NN 라플라시안 그래프 생성 (k=8)
+            A = np.abs(tangent)
+            np.fill_diagonal(A, 0) 
+            
+            k = 8 
+            A_sparse = np.zeros_like(A)
+            for i in range(A.shape[0]):
+                idx = np.argsort(A[i])[-k:]
+                A_sparse[i, idx] = A[i, idx]
+            
+            A_sparse = np.maximum(A_sparse, A_sparse.T) 
+            
+            D = np.diag(np.sum(A_sparse, axis=1))
+            D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
+            L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A_sparse @ D_inv_sqrt)
+            
+            # 💡 2. 자동차 제작: 3초 궤적을 15조각으로 쪼개서 순차적 시계열 피처 생성
+            X_seq = []
+            for t in range(num_steps):
+                chunk = env[:, t*chunk_size : (t+1)*chunk_size]
+                # 각 조각의 평균 에너지를 노드 피처로 사용
+                X_seq.append(np.mean(chunk, axis=1, keepdims=True)) 
+            
+            L_norm_list.append(L_norm)
+            X_feat_list.append(np.stack(X_seq, axis=0)) # (15, 64, 1)
+        
+        L_norm_list = np.array(L_norm_list, dtype=np.float32) # (Epochs, 64, 64)
+        X_feat_list = np.array(X_feat_list, dtype=np.float32) # (Epochs, 15, 64, 1)
 
-        scale_X = np.max(np.abs(X_feat_seq))
-        if scale_X > 0: X_feat_seq = X_feat_seq / scale_X
+        scale_X = np.max(np.abs(X_feat_list))
+        if scale_X > 0: X_feat_list = X_feat_list / scale_X
 
-        torch.save(torch.tensor(L_norm_seq), save_path_L)
-        torch.save(torch.tensor(X_feat_seq), save_path_X)
+        torch.save(torch.tensor(L_norm_list), save_path_L)
+        torch.save(torch.tensor(X_feat_list), save_path_X)
         torch.save(torch.tensor(labels, dtype=torch.long), save_path_y)
         
     except Exception as e:
         print(f"🚨 {subj} 전처리 에러: {e}")
 
-print("🚀 1단계: 라플라시안 그래프 텐서 변환 시작")
+print("🚀 1단계: O(N^3) 최적화 전처리 시작")
 for subj in tqdm(all_subjects):
     process_and_save_subject_graph(subj)
 
@@ -173,13 +170,13 @@ class DenseLaplacianConv(nn.Module):
         nn.init.zeros_(self.bias)
 
     def forward(self, L_norm, X):
+        # L_norm: [B, 64, 64], X: [B, 64, in_features]
         support = torch.matmul(X, self.weight) 
-        # 💡 라플라시안을 곱하여 노드 간의 '공간적 차이(Gradient)'를 추출 (High-pass)
         out = torch.bmm(L_norm, support)       
         return out + self.bias
 
 # =====================================================================
-# 3. 모델 수정: 파라미터 다이어트 및 라플라시안 적용
+# 3. 모델 정의: 고정 지도 위에서 15개의 피처가 주행
 # =====================================================================
 class RiemannianGraphSNN(nn.Module):
     def __init__(self, num_steps=15):
@@ -187,41 +184,37 @@ class RiemannianGraphSNN(nn.Module):
         self.num_steps = num_steps
         spike_grad = surrogate.fast_sigmoid(slope=25)
         
-        # 💡 차원 압축으로 오버피팅 완벽 차단
-        self.gcn1 = DenseLaplacianConv(64, 32) 
+        # 입력 에너지가 1차원(스칼라)이므로 1 -> 16 -> 32로 특징 추출
+        self.gcn1 = DenseLaplacianConv(1, 16) 
         self.lif1 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
         
-        self.gcn2 = DenseLaplacianConv(32, 16)
+        self.gcn2 = DenseLaplacianConv(16, 32)
         self.lif2 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
         
         self.dropout = nn.Dropout(0.5)
         
-        # 압축된 차원: 64노드 * 16특징 * 15스텝 = 15360
         self.classifier = nn.Sequential(
-            nn.Linear(64 * 16 * 15, 128),
+            nn.Linear(64 * 32 * 15, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 4)
         )
 
-    def forward(self, L_norm_seq, X_feat_seq):
+    def forward(self, L_norm, X_seq):
+        # L_norm: [B, 64, 64], X_seq: [B, 15, 64, 1]
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
         
         spk2_rec = []
-        steps_per_window = self.num_steps // 5
         
+        # 💡 3. 주행: 고정된 라플라시안 지도(L_norm) 위에서 시간에 따른 에너지 변동(X_current) 주입
         for step in range(self.num_steps):
-            w_idx = step // steps_per_window
-            if w_idx >= 5: w_idx = 4
+            X_current = X_seq[:, step] * 10.0 # 강제 스파이크 발화 펌핑
             
-            L_current = L_norm_seq[:, w_idx]
-            X_current = X_feat_seq[:, w_idx] * 10.0 
-            
-            cur1 = self.gcn1(L_current, X_current)
+            cur1 = self.gcn1(L_norm, X_current)
             spk1, mem1 = self.lif1(cur1, mem1)
             
-            cur2 = self.gcn2(L_current, spk1)
+            cur2 = self.gcn2(L_norm, spk1)
             spk2, mem2 = self.lif2(cur2, mem2)
             
             spk2_rec.append(torch.flatten(spk2, start_dim=1))
@@ -233,7 +226,7 @@ class RiemannianGraphSNN(nn.Module):
         return out 
 
 # =====================================================================
-# 4. 학습 파이프라인 (변동 없음, 로더 변수만 L_batch로 변경됨)
+# 4. 학습 파이프라인
 # =====================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -241,7 +234,7 @@ global_acc_list = []
 sstl_acc_list = []
 
 print("\n" + "="*50)
-print("🧠 진짜 Laplacian RG-SNN 5-Fold 학습 시작")
+print("🧠 극비 효율화 RG-SNN (1 Graph + 15 Time Chunks) 5-Fold 학습 시작")
 print("="*50)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -250,6 +243,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     global_test_subjs = [all_subjects[i] for i in test_idx]
     
     L_train, X_train, y_train = load_graph_data(global_train_subjs)
+    if L_train is None: continue
     train_loader = DataLoader(TensorDataset(L_train, X_train, y_train), batch_size=128, shuffle=True)
     
     net = RiemannianGraphSNN(num_steps=15).to(device)

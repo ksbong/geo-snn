@@ -232,6 +232,37 @@ for epoch in range(num_epochs_global):
         
     if (epoch + 1) % 5 == 0 or epoch == 0:
         print(f"Global Epoch {epoch+1}/{num_epochs_global} | Loss: {total_loss/len(global_loader):.4f} | Acc: {100*correct/total:.2f}%")
+        
+
+# =====================================================================
+# 5.5 진짜 Global Test Accuracy 측정 (SSTL 하기 직전 단계)
+# =====================================================================
+print("-" * 50)
+print("🧐 진짜 Global Test Accuracy (본 적 없는 21명 대상) 측정 시작")
+print("-" * 50)
+
+# 테스트용 21명 데이터 로드
+X_unseen, y_unseen = load_subjects_data(global_test_subjs)
+unseen_dataset = TensorDataset(X_unseen, y_unseen)
+unseen_loader = DataLoader(unseen_dataset, batch_size=128, shuffle=False)
+
+net.eval()
+unseen_correct = 0
+unseen_total = 0
+
+with torch.no_grad():
+    for data, targets in unseen_loader:
+        data, targets = data.to(device), targets.to(device)
+        mem_rec = net(data)
+        m_mean = mem_rec.mean(dim=0)
+        _, predicted = m_mean.max(1)
+        unseen_total += targets.size(0)
+        unseen_correct += (predicted == targets).sum().item()
+
+true_global_test_acc = 100 * unseen_correct / unseen_total
+print(f"🔥 진짜 Global Test Accuracy (p0): {true_global_test_acc:.2f}%")
+print(f"📄 논문 목표치 (p0): 67.24%")
+print("-" * 50)
 # =====================================================================
 # 6. SSTL (Subject-Specific Transfer Learning) - 수정된 버전
 # =====================================================================

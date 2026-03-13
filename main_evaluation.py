@@ -31,9 +31,9 @@ def compute_spd_cov(envelope):
     epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
     return cov + np.eye(cov.shape[0]) * epsilon
 
-DATA_DIR = '/kaggle/input/datasets/sangbongkim/full-physionet/07_Data'
+DATA_DIR = './raw_data/files/'
 if not os.path.exists(DATA_DIR):
-    DATA_DIR = '/kaggle/input/full-physionet/07_Data'
+    DATA_DIR = './raw_data/files'
 
 SAVE_DIR = './processed_graph_tensors'
 os.makedirs(SAVE_DIR, exist_ok=True)

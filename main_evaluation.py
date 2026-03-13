@@ -246,11 +246,12 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
     
     net.train()
-    for epoch in range(20): # 빠른 검증을 위해 20 에폭 (필요시 30으로 증가)
+    for epoch in range(20): 
         for data, targets in train_loader:
             data, targets = data.to(device), targets.to(device)
-            m_mean = net(data).mean(dim=0)
-            loss = criterion(m_mean, targets)
+            # 수정됨: .mean(dim=0) 제거
+            outputs = net(data)
+            loss = criterion(outputs, targets)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -264,8 +265,9 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     with torch.no_grad():
         for data, targets in unseen_loader:
             data, targets = data.to(device), targets.to(device)
-            m_mean = net(data).mean(dim=0)
-            _, predicted = m_mean.max(1)
+            # 수정됨: .mean(dim=0) 제거
+            outputs = net(data)
+            _, predicted = outputs.max(1)
             unseen_total += targets.size(0)
             unseen_correct += (predicted == targets).sum().item()
             
@@ -298,10 +300,11 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             sub_test_loader = DataLoader(TensorDataset(X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=32, shuffle=False)
             
             sstl_net.train()
-            for _ in range(10): # 💡 개인이 적응할 수 있도록 에폭을 5->10으로 살짝 늘림
+            for _ in range(10): 
                 for data, targets in sub_train_loader:
                     data, targets = data.to(device), targets.to(device)
-                    loss = criterion(sstl_net(data).mean(dim=0), targets)
+                    # 수정됨: .mean(dim=0) 제거
+                    loss = criterion(sstl_net(data), targets)
                     sstl_optimizer.zero_grad()
                     loss.backward()
                     sstl_optimizer.step()
@@ -311,7 +314,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             with torch.no_grad():
                 for data, targets in sub_test_loader:
                     data, targets = data.to(device), targets.to(device)
-                    _, predicted = sstl_net(data).mean(dim=0).max(1)
+                    # 수정됨: .mean(dim=0) 제거
+                    _, predicted = sstl_net(data).max(1)
                     tot += targets.size(0)
                     corr += (predicted == targets).sum().item()
             subj_fold_accs.append(100 * corr / tot)

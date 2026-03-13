@@ -150,55 +150,75 @@ class RiemannianSNN(nn.Module):
         super().__init__()
         self.num_steps = num_steps
         spike_grad = surrogate.fast_sigmoid(slope=25) 
-        beta = 0.9  
         
+        # 💡 개선 1: 네트워크 용량 증대 및 Dropout 추가
         self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=5, padding=2),
-            nn.BatchNorm2d(16),
+            nn.Conv2d(1, 32, kernel_size=5, padding=2),
+            nn.BatchNorm2d(32),
             nn.MaxPool2d(2),
         )
-        self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+        # 뉴런의 망각률(beta)을 다양하게 분리 (Hybrid Response 흉내)
+        self.lif1 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
         
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, padding=2)
-        self.bn2 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.drop2 = nn.Dropout2d(0.3) # 피험자 간 과적합 방지
         self.pool2 = nn.MaxPool2d(2)
-        self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+        
+        # 💡 개선 2: Hybrid Response 메커니즘 
+        # 빠른 반응 뉴런(beta=0.5)과 느린 기억 뉴런(beta=0.95)을 섞음
+        self.lif2_fast = snn.Leaky(beta=0.5, spike_grad=spike_grad)
+        self.lif2_slow = snn.Leaky(beta=0.95, spike_grad=spike_grad)
         
         self.flatten = nn.Flatten()
-        self.classifier = nn.Linear(32 * 16 * 16, 4) 
-        self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad, output=True)
+        
+        # 💡 개선 3: 시간 정보를 평균 내지 않고, 통째로 분류기에 넣기 위한 차원 확장
+        # 64채널 * 16 * 16 (공간) * 15 (시간) = 분류기가 시간 흐름 전체를 봄
+        self.classifier = nn.Sequential(
+            nn.Linear(64 * 16 * 16 * 15, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 4)
+        )
 
     def forward(self, x):
         # x shape: [Batch, 5, 1, 64, 64]
         x = x * 10.0 
         
         mem1 = self.lif1.init_leaky()
-        mem2 = self.lif2.init_leaky()
-        mem_out = self.lif_out.init_leaky()
+        mem2_f = self.lif2_fast.init_leaky()
+        mem2_s = self.lif2_slow.init_leaky()
         
-        mem_out_rec = []
-        steps_per_window = self.num_steps // 5 # 15스텝 중 3스텝마다 행렬 변경
+        spk2_rec = []
+        steps_per_window = self.num_steps // 5
         
         for step in range(self.num_steps):
             w_idx = step // steps_per_window
             if w_idx >= 5: w_idx = 4
             
-            # 💡 시간에 맞춰 변화하는 기하학적 피처 주입
             current_x = x[:, w_idx] 
             
+            # Layer 1
             cur1 = self.feature_extractor(current_x)
             spk1, mem1 = self.lif1(cur1, mem1)
             
-            cur2 = self.pool2(self.bn2(self.conv2(spk1)))
-            spk2, mem2 = self.lif2(cur2, mem2)
+            # Layer 2 (Hybrid Response)
+            cur2 = self.drop2(self.pool2(self.bn2(self.conv2(spk1))))
             
-            cur_out = self.classifier(self.flatten(spk2))
-            spk_out, mem_out = self.lif_out(cur_out, mem_out)
+            spk2_f, mem2_f = self.lif2_fast(cur2, mem2_f)
+            spk2_s, mem2_s = self.lif2_slow(cur2, mem2_s)
             
-            mem_out_rec.append(mem_out)
+            # Fast와 Slow 뉴런의 스파이크를 더해서 풍부한 시간 특징 생성
+            spk2_combined = spk2_f + spk2_s 
+            spk2_rec.append(self.flatten(spk2_combined))
             
-        return torch.stack(mem_out_rec)
-
+        # [Time, Batch, Features] -> [Batch, Time * Features]
+        # 시간축 데이터를 믹서기(mean)에 갈지 않고, 길게 쭉 펴서 공간+시간 특징을 보존함
+        all_time_features = torch.stack(spk2_rec).transpose(0, 1).contiguous()
+        flat_spatio_temporal = all_time_features.view(all_time_features.size(0), -1)
+        
+        out = self.classifier(flat_spatio_temporal)
+        return out # 주의: 이제 m_mean.max(1)이 아니라 그냥 out.max(1)로 바로 CrossEntropy에 넣으면 됨
 # =====================================================================
 # 4. 5-Fold 교차 검증 (Global Training -> True Global Acc -> SSTL)
 # =====================================================================

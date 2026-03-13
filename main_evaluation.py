@@ -232,43 +232,44 @@ for epoch in range(num_epochs_global):
         
     if (epoch + 1) % 5 == 0 or epoch == 0:
         print(f"Global Epoch {epoch+1}/{num_epochs_global} | Loss: {total_loss/len(global_loader):.4f} | Acc: {100*correct/total:.2f}%")
-
 # =====================================================================
-# 6. SSTL (Subject-Specific Transfer Learning) - 테스트 21명
+# 6. SSTL (Subject-Specific Transfer Learning) - 수정된 버전
 # =====================================================================
 print("-" * 50)
 print("🚀 SSTL (개인 맞춤형 전이 학습) 시작")
 print("-" * 50)
 
+# Global Model의 가중치를 CPU로 미리 빼둠 (안전한 복사를 위해)
+global_model_state = net.state_dict()
+
 sstl_accuracies = []
 
 for subj in global_test_subjs:
-    X_sub, y_sub = load_subjects_data([subj])
+    # weights_only=True 추가해서 보안 경고 해결
+    X_sub, y_sub = load_subjects_data([subj]) 
     if X_sub is None: continue
     
-    # 4-fold Cross Validation 진행
     kf = KFold(n_splits=4, shuffle=True, random_state=42)
     subj_fold_accs = []
     
     for train_idx, test_idx in kf.split(X_sub):
-        # 💡 매 폴드마다 Global Model의 가중치로 리셋 (복사본 생성)
-        import copy
-        sstl_net = copy.deepcopy(net).to(device)
+        # 💡 수정된 부분: deepcopy 대신 새로운 인스턴스 생성 후 가중치 로드
+        sstl_net = RiemannianSNN(num_steps=15).to(device)
+        sstl_net.load_state_dict(global_model_state)
         
-        # 💡 논문 룰 적용: classifier 파라미터만 업데이트 허용, 나머지는 동결
+        # Classifier(FC 레이어) 파라미터만 업데이트 허용, 나머지는 동결
         for name, param in sstl_net.named_parameters():
             if 'classifier' not in name:
                 param.requires_grad = False
                 
-        # SSTL 전용 Optimizer (lr을 살짝 낮춰서 미세조정)
         sstl_optimizer = torch.optim.Adam(sstl_net.classifier.parameters(), lr=5e-4)
         
+        # (이하 학습 및 평가 루틴은 동일)
         sub_train_loader = DataLoader(TensorDataset(X_sub[train_idx], y_sub[train_idx]), batch_size=32, shuffle=True)
         sub_test_loader = DataLoader(TensorDataset(X_sub[test_idx], y_sub[test_idx]), batch_size=32, shuffle=False)
         
-        # 딱 5 에폭만 학습
         sstl_net.train()
-        for _ in range(5):
+        for _ in range(5): # 딱 5 에폭만 학습 [cite: 327]
             for data, targets in sub_train_loader:
                 data, targets = data.to(device), targets.to(device)
                 m_mean = sstl_net(data).mean(dim=0)
@@ -277,7 +278,6 @@ for subj in global_test_subjs:
                 loss.backward()
                 sstl_optimizer.step()
                 
-        # 평가
         sstl_net.eval()
         correct, total = 0, 0
         with torch.no_grad():
@@ -290,7 +290,6 @@ for subj in global_test_subjs:
         
         subj_fold_accs.append(100 * correct / total)
     
-    # 해당 피험자의 4-fold 평균 정확도
     subj_acc = np.mean(subj_fold_accs)
     sstl_accuracies.append(subj_acc)
     print(f"피험자 {subj} SSTL Accuracy: {subj_acc:.2f}%")

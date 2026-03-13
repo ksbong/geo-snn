@@ -11,9 +11,12 @@ from sklearn.model_selection import KFold
 import snntorch as snn
 from snntorch import surrogate
 from tqdm import tqdm
+import warnings
+
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =====================================================================
-# 1. 기하학적 특징 추출
+# 1. 기하학적 특징 및 라플라시안 그래프 전처리
 # =====================================================================
 def project_to_hardy_space(data, sfreq, l_freq=8.0, h_freq=30.0):
     n_times = data.shape[-1]
@@ -28,30 +31,25 @@ def compute_spd_cov(envelope):
     epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
     return cov + np.eye(cov.shape[0]) * epsilon
 
-# =====================================================================
-# 2. 전처리 & 텐서 저장 (Sliding Window로 Temporal Dynamics 추출)
-# =====================================================================
-DATA_DIR = './raw_data/files/'
+DATA_DIR = '/kaggle/input/datasets/sangbongkim/full-physionet/07_Data'
 if not os.path.exists(DATA_DIR):
-    DATA_DIR = './raw_data/files'
+    DATA_DIR = '/kaggle/input/full-physionet/07_Data'
 
-SAVE_DIR = './processed_tensors_seq'
+SAVE_DIR = './processed_graph_tensors'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 exclude_subjects = ['S088', 'S092', 'S100', 'S104']
 all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
 
-def process_and_save_subject(subj):
-    save_path_X = f"{SAVE_DIR}/{subj}_X.pt"
+def process_and_save_subject_graph(subj):
+    save_path_A = f"{SAVE_DIR}/{subj}_A.pt" # Graph Adjacency
+    save_path_X = f"{SAVE_DIR}/{subj}_X.pt" # Node Features
     save_path_y = f"{SAVE_DIR}/{subj}_y.pt"
-    if os.path.exists(save_path_X): return
+    if os.path.exists(save_path_A): return
         
     runs_hands = ['R04', 'R08', 'R12']
     runs_feet = ['R06', 'R10', 'R14']
     epochs_list = []
-    
-    import warnings
-    warnings.filterwarnings('ignore', category=RuntimeWarning)
     
     try:
         for run in runs_hands:
@@ -81,11 +79,9 @@ def process_and_save_subject(subj):
         labels = np.array(epochs_all.events[:, 2]) - 1 
         sfreq = epochs_all.info['sfreq']
 
-        # 전체 3초 신호에 대해 한 번에 Hardy Space 변환 (FFT 아티팩트 방지)
         hardy_signals = project_to_hardy_space(data, sfreq)
         envelopes = np.abs(hardy_signals)
         
-        # 💡 Sliding Window 설정 (1초 길이, 0.5초 겹침 -> 총 5 시퀀스)
         win_len = 160
         stride = 80
         num_windows = 5
@@ -98,96 +94,118 @@ def process_and_save_subject(subj):
             covs = np.array([compute_spd_cov(env) for env in env_win])
             X_covs_seq.append(covs)
             
-        X_covs_seq = np.stack(X_covs_seq, axis=1) # Shape: (Epochs, 5, 64, 64)
+        X_covs_seq = np.stack(X_covs_seq, axis=1) # (Epochs, 5, 64, 64)
 
-        # 피험자별 Rest 상태 매핑 기준점 계산 (전체 윈도우 평균)
         rest_covs = X_covs_seq[labels == 0]
         p_rest = np.mean(rest_covs, axis=(0, 1)) 
         p_rest_sqrt = sqrtm(p_rest).real
         p_rest_inv_sqrt = inv(p_rest_sqrt)
 
-        # Tangent Space 매핑
-        features = []
+        # 💡 위상수학적 그래프 구조 생성 (Normalized Laplacian Base)
+        A_norm_seq = []
+        X_feat_seq = []
+        
         for ep_idx in range(X_covs_seq.shape[0]):
-            ep_feats = []
+            ep_A = []
+            ep_X = []
             for w in range(num_windows):
-                inner = p_rest_inv_sqrt @ X_covs_seq[ep_idx, w] @ p_rest_inv_sqrt
+                cov = X_covs_seq[ep_idx, w]
+                inner = p_rest_inv_sqrt @ cov @ p_rest_inv_sqrt
                 tangent = p_rest_sqrt @ logm(inner).real @ p_rest_sqrt
-                ep_feats.append(tangent)
-            features.append(ep_feats)
+                
+                # 1. 노드 특성: 각 채널의 분산(대각 원소)을 뇌파 고유 특징으로 사용
+                node_features = np.diag(cov).reshape(-1, 1)
+                
+                # 2. 인접 행렬 구성: Tangent 공간의 거리를 연결 강도로 해석
+                A = np.abs(tangent)
+                np.fill_diagonal(A, A.diagonal() + 1.0) # Self-loop 추가
+                
+                # 3. 정규화된 그래프 래플라시안 유도 (D^{-1/2} * A * D^{-1/2})
+                D_inv_sqrt = np.diag(1.0 / np.sqrt(np.sum(A, axis=1)))
+                A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+                
+                ep_A.append(A_norm)
+                ep_X.append(node_features)
+                
+            A_norm_seq.append(ep_A)
+            X_feat_seq.append(ep_X)
         
-        features = np.array(features)
-        
-        # 스케일링
-        scale_factor = np.max(np.abs(features))
-        if scale_factor > 0: features = features / scale_factor
+        A_norm_seq = np.array(A_norm_seq, dtype=np.float32) # (Epochs, 5, 64, 64)
+        X_feat_seq = np.array(X_feat_seq, dtype=np.float32) # (Epochs, 5, 64, 1)
 
-        # SNN Spatial Conv를 위해 채널 차원 추가 -> (Epochs, 5, 1, 64, 64)
-        torch.save(torch.tensor(features, dtype=torch.float32).unsqueeze(2), save_path_X)
+        # 노드 특징 스케일링
+        scale_X = np.max(np.abs(X_feat_seq))
+        if scale_X > 0: X_feat_seq = X_feat_seq / scale_X
+
+        torch.save(torch.tensor(A_norm_seq), save_path_A)
+        torch.save(torch.tensor(X_feat_seq), save_path_X)
         torch.save(torch.tensor(labels, dtype=torch.long), save_path_y)
         
     except Exception as e:
-        pass
+        print(f"🚨 {subj} 전처리 중 에러 발생: {e}")
 
-print("🚀 1단계: Temporal Dynamics 추출 및 텐서 저장 시작")
+print("🚀 1단계: 라플라시안 그래프 텐서 변환 및 저장 시작")
 for subj in tqdm(all_subjects):
-    process_and_save_subject(subj)
+    process_and_save_subject_graph(subj)
 
 # =====================================================================
-# 3. 데이터 로드 및 모델 구조 (Spatio-Temporal Injection)
+# 2. 데이터 로드 및 Dense GCN 모듈
 # =====================================================================
-def load_subjects_data(subject_list):
-    X_list, y_list = [], []
+def load_graph_data(subject_list):
+    A_list, X_list, y_list = [], [], []
     for subj in subject_list:
-        if os.path.exists(f"{SAVE_DIR}/{subj}_X.pt"):
+        if os.path.exists(f"{SAVE_DIR}/{subj}_A.pt"):
+            A_list.append(torch.load(f"{SAVE_DIR}/{subj}_A.pt", weights_only=True))
             X_list.append(torch.load(f"{SAVE_DIR}/{subj}_X.pt", weights_only=True))
             y_list.append(torch.load(f"{SAVE_DIR}/{subj}_y.pt", weights_only=True))
-    if not X_list: return None, None
-    return torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
+    if not A_list: return None, None, None
+    return torch.cat(A_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
-class RiemannianSNN(nn.Module):
+# 순수 PyTorch로 구현한 배치 연산 지원 Dense Graph Convolution
+class DenseGCNConv(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.Tensor(in_features, out_features))
+        self.bias = nn.Parameter(torch.Tensor(out_features))
+        nn.init.xavier_uniform_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, A_norm, X):
+        # A_norm: [Batch, Nodes, Nodes], X: [Batch, Nodes, Features]
+        support = torch.matmul(X, self.weight) # [Batch, 64, out_features]
+        out = torch.bmm(A_norm, support)       # 그래프 위상에 따라 정보 전달!
+        return out + self.bias
+
+# =====================================================================
+# 3. Riemannian Graph-SNN (RG-SNN) 모델
+# =====================================================================
+class RiemannianGraphSNN(nn.Module):
     def __init__(self, num_steps=15):
         super().__init__()
         self.num_steps = num_steps
-        spike_grad = surrogate.fast_sigmoid(slope=25) 
+        spike_grad = surrogate.fast_sigmoid(slope=25)
         
-        # 💡 개선 1: 네트워크 용량 증대 및 Dropout 추가
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, padding=2),
-            nn.BatchNorm2d(32),
-            nn.MaxPool2d(2),
-        )
-        # 뉴런의 망각률(beta)을 다양하게 분리 (Hybrid Response 흉내)
+        # 💡 CNN 대신 위상을 타는 GCN 적용
+        self.gcn1 = DenseGCNConv(1, 16)
         self.lif1 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
         
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.drop2 = nn.Dropout2d(0.3) # 피험자 간 과적합 방지
-        self.pool2 = nn.MaxPool2d(2)
+        self.gcn2 = DenseGCNConv(16, 32)
+        self.lif2 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
         
-        # 💡 개선 2: Hybrid Response 메커니즘 
-        # 빠른 반응 뉴런(beta=0.5)과 느린 기억 뉴런(beta=0.95)을 섞음
-        self.lif2_fast = snn.Leaky(beta=0.5, spike_grad=spike_grad)
-        self.lif2_slow = snn.Leaky(beta=0.95, spike_grad=spike_grad)
+        self.dropout = nn.Dropout(0.4)
         
-        self.flatten = nn.Flatten()
-        
-        # 💡 개선 3: 시간 정보를 평균 내지 않고, 통째로 분류기에 넣기 위한 차원 확장
-        # 64채널 * 16 * 16 (공간) * 15 (시간) = 분류기가 시간 흐름 전체를 봄
+        # 시간 특징을 모두 살리기 위한 차원: 64노드 * 32피처 * 15스텝
         self.classifier = nn.Sequential(
-            nn.Linear(64 * 16 * 16 * 15, 256),
+            nn.Linear(64 * 32 * 15, 128),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 4)
+            nn.Dropout(0.3),
+            nn.Linear(128, 4)
         )
 
-    def forward(self, x):
-        # x shape: [Batch, 5, 1, 64, 64]
-        x = x * 10.0 
-        
+    def forward(self, A_norm_seq, X_feat_seq):
+        # A_norm_seq: [Batch, 5, 64, 64], X_feat_seq: [Batch, 5, 64, 1]
         mem1 = self.lif1.init_leaky()
-        mem2_f = self.lif2_fast.init_leaky()
-        mem2_s = self.lif2_slow.init_leaky()
+        mem2 = self.lif2.init_leaky()
         
         spk2_rec = []
         steps_per_window = self.num_steps // 5
@@ -196,31 +214,29 @@ class RiemannianSNN(nn.Module):
             w_idx = step // steps_per_window
             if w_idx >= 5: w_idx = 4
             
-            current_x = x[:, w_idx] 
+            A_current = A_norm_seq[:, w_idx]
+            X_current = X_feat_seq[:, w_idx]
             
-            # Layer 1
-            cur1 = self.feature_extractor(current_x)
+            # 그래프 구조를 타고 SNN으로 정보가 흐름
+            cur1 = self.gcn1(A_current, X_current)
             spk1, mem1 = self.lif1(cur1, mem1)
             
-            # Layer 2 (Hybrid Response)
-            cur2 = self.drop2(self.pool2(self.bn2(self.conv2(spk1))))
+            cur2 = self.gcn2(A_current, spk1)
+            spk2, mem2 = self.lif2(cur2, mem2)
             
-            spk2_f, mem2_f = self.lif2_fast(cur2, mem2_f)
-            spk2_s, mem2_s = self.lif2_slow(cur2, mem2_s)
+            # [Batch, 64, 32] -> [Batch, 64*32]
+            spk2_rec.append(torch.flatten(spk2, start_dim=1))
             
-            # Fast와 Slow 뉴런의 스파이크를 더해서 풍부한 시간 특징 생성
-            spk2_combined = spk2_f + spk2_s 
-            spk2_rec.append(self.flatten(spk2_combined))
-            
-        # [Time, Batch, Features] -> [Batch, Time * Features]
-        # 시간축 데이터를 믹서기(mean)에 갈지 않고, 길게 쭉 펴서 공간+시간 특징을 보존함
+        # 모든 타임스텝의 공간 정보를 잃지 않고 길게 펼침
+        # [Time, Batch, 64*32] -> [Batch, Time * 64 * 32]
         all_time_features = torch.stack(spk2_rec).transpose(0, 1).contiguous()
-        flat_spatio_temporal = all_time_features.view(all_time_features.size(0), -1)
+        flat_spatio_temporal = self.dropout(all_time_features.view(all_time_features.size(0), -1))
         
         out = self.classifier(flat_spatio_temporal)
-        return out # 주의: 이제 m_mean.max(1)이 아니라 그냥 out.max(1)로 바로 CrossEntropy에 넣으면 됨
+        return out 
+
 # =====================================================================
-# 4. 5-Fold 교차 검증 (Global Training -> True Global Acc -> SSTL)
+# 4. 학습 파이프라인 (5-Fold & SSTL)
 # =====================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -229,7 +245,7 @@ global_acc_list = []
 sstl_acc_list = []
 
 print("\n" + "="*50)
-print("🌍 본격적인 5-Fold 논문 파이프라인 가동 (시간 정보 포함)")
+print("🧠 Riemannian Graph-SNN (RG-SNN) 5-Fold 학습 시작")
 print("="*50)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -237,74 +253,72 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     global_train_subjs = [all_subjects[i] for i in train_idx]
     global_test_subjs = [all_subjects[i] for i in test_idx]
     
-    # 1. Global Training
-    X_train, y_train = load_subjects_data(global_train_subjs)
-    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=128, shuffle=True)
+    A_train, X_train, y_train = load_graph_data(global_train_subjs)
+    if A_train is None:
+        raise ValueError(f"🚨 [Fold {fold+1}] 데이터 로드 실패. 전처리 로그를 확인하세요.")
+        
+    train_loader = DataLoader(TensorDataset(A_train, X_train, y_train), batch_size=128, shuffle=True)
     
-    net = RiemannianSNN(num_steps=15).to(device)
+    net = RiemannianGraphSNN(num_steps=15).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     
     net.train()
-    for epoch in range(20): 
-        for data, targets in train_loader:
-            data, targets = data.to(device), targets.to(device)
-            # 수정됨: .mean(dim=0) 제거
-            outputs = net(data)
+    for epoch in range(25): 
+        for A_batch, X_batch, targets in train_loader:
+            A_batch, X_batch, targets = A_batch.to(device), X_batch.to(device), targets.to(device)
+            outputs = net(A_batch, X_batch)
             loss = criterion(outputs, targets)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
-    # 2. 진짜 Global Test Accuracy (Unseen Subjects) 측정
-    X_unseen, y_unseen = load_subjects_data(global_test_subjs)
-    unseen_loader = DataLoader(TensorDataset(X_unseen, y_unseen), batch_size=128, shuffle=False)
+    # 2. 진짜 Global Test Accuracy (Unseen)
+    A_unseen, X_unseen, y_unseen = load_graph_data(global_test_subjs)
+    unseen_loader = DataLoader(TensorDataset(A_unseen, X_unseen, y_unseen), batch_size=128, shuffle=False)
     
     net.eval()
-    unseen_correct, unseen_total = 0, 0
+    unseen_corr, unseen_tot = 0, 0
     with torch.no_grad():
-        for data, targets in unseen_loader:
-            data, targets = data.to(device), targets.to(device)
-            # 수정됨: .mean(dim=0) 제거
-            outputs = net(data)
+        for A_batch, X_batch, targets in unseen_loader:
+            A_batch, X_batch, targets = A_batch.to(device), X_batch.to(device), targets.to(device)
+            outputs = net(A_batch, X_batch)
             _, predicted = outputs.max(1)
-            unseen_total += targets.size(0)
-            unseen_correct += (predicted == targets).sum().item()
+            unseen_tot += targets.size(0)
+            unseen_corr += (predicted == targets).sum().item()
             
-    true_global_acc = 100 * unseen_correct / unseen_total
+    true_global_acc = 100 * unseen_corr / unseen_tot
     global_acc_list.append(true_global_acc)
     print(f"🔥 Fold {fold + 1} 진짜 Global Test Acc (p0): {true_global_acc:.2f}%")
     
-    # 3. SSTL 진행
+    # 3. SSTL
     global_model_state = net.state_dict()
     fold_sstl_accs = []
     
     for subj in global_test_subjs:
-        X_sub, y_sub = load_subjects_data([subj])
-        if X_sub is None: continue
+        A_sub, X_sub, y_sub = load_graph_data([subj])
+        if A_sub is None: continue
         
         kf_sub = KFold(n_splits=4, shuffle=True, random_state=42)
         subj_fold_accs = []
         
-        for sub_train_idx, sub_test_idx in kf_sub.split(X_sub):
-            sstl_net = RiemannianSNN(num_steps=15).to(device)
+        for sub_train_idx, sub_test_idx in kf_sub.split(A_sub):
+            sstl_net = RiemannianGraphSNN(num_steps=15).to(device)
             sstl_net.load_state_dict(global_model_state)
             
-            # 파인튜닝: Classifier만 열어줌
             for name, param in sstl_net.named_parameters():
                 if 'classifier' not in name: param.requires_grad = False
                     
             sstl_optimizer = torch.optim.Adam(sstl_net.classifier.parameters(), lr=5e-4)
             
-            sub_train_loader = DataLoader(TensorDataset(X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=32, shuffle=True)
-            sub_test_loader = DataLoader(TensorDataset(X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=32, shuffle=False)
+            sub_train_loader = DataLoader(TensorDataset(A_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=32, shuffle=True)
+            sub_test_loader = DataLoader(TensorDataset(A_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=32, shuffle=False)
             
             sstl_net.train()
-            for _ in range(10): 
-                for data, targets in sub_train_loader:
-                    data, targets = data.to(device), targets.to(device)
-                    # 수정됨: .mean(dim=0) 제거
-                    loss = criterion(sstl_net(data), targets)
+            for _ in range(15): # SSTL 에폭을 15로 증가
+                for A_batch, X_batch, targets in sub_train_loader:
+                    A_batch, X_batch, targets = A_batch.to(device), X_batch.to(device), targets.to(device)
+                    loss = criterion(sstl_net(A_batch, X_batch), targets)
                     sstl_optimizer.zero_grad()
                     loss.backward()
                     sstl_optimizer.step()
@@ -312,10 +326,9 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             sstl_net.eval()
             corr, tot = 0, 0
             with torch.no_grad():
-                for data, targets in sub_test_loader:
-                    data, targets = data.to(device), targets.to(device)
-                    # 수정됨: .mean(dim=0) 제거
-                    _, predicted = sstl_net(data).max(1)
+                for A_batch, X_batch, targets in sub_test_loader:
+                    A_batch, X_batch, targets = A_batch.to(device), X_batch.to(device), targets.to(device)
+                    _, predicted = sstl_net(A_batch, X_batch).max(1)
                     tot += targets.size(0)
                     corr += (predicted == targets).sum().item()
             subj_fold_accs.append(100 * corr / tot)

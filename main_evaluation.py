@@ -42,7 +42,7 @@ def spike_fn_bwd(res, g):
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 # =========================================================
-# [2] Pure Geo-ALIF Architecture
+# [2] Pure Geo-ALIF Architecture (Tracer Leak 수정 완료)
 # =========================================================
 class Pure_Geo_ALIF_SNN(nn.Module):
     eeg_ch: int = 64
@@ -51,20 +51,14 @@ class Pure_Geo_ALIF_SNN(nn.Module):
     out_ch: int = 4
 
     def setup(self):
-        # 파라미터를 극단적으로 줄임 (과적합 원천 차단)
-        # 1. 인코딩된 스파이크를 받을 공간 결합 가중치
         self.w_eeg = nn.Dense(features=self.hid_ch, use_bias=False)
-        
-        # 2. Geo 피처로 감쇠계수(tau)와 임계값(theta)을 조절할 가중치
         self.w_tau = nn.Dense(features=self.hid_ch)
         self.w_theta = nn.Dense(features=self.hid_ch)
         
-        # 기본 ALIF 파라미터
         self.theta_0 = 0.5
         self.tau_a = 0.36
         self.beta = 1.8
         
-        # 3. 분류기
         self.classifier_drop = nn.Dropout(rate=0.5)
         self.fc_out = nn.Dense(features=self.out_ch)
 
@@ -72,38 +66,32 @@ class Pure_Geo_ALIF_SNN(nn.Module):
     def __call__(self, x_eeg, x_geo, train: bool = True):
         B, T, _ = x_eeg.shape
         
-        # 🔥 BSA 스타일의 결정론적(Deterministic) 스파이크 인코딩
-        # 가중치 학습 없이 뇌파의 시간적 차이(Delta)가 임계값(0.1)을 넘으면 스파이크 생성
-        # (첫 스텝은 0으로 패딩하여 길이 맞춤)
+        # BSA 스타일 인코딩
         eeg_diff = x_eeg[:, 1:, :] - x_eeg[:, :-1, :]
         encoded_spikes = spike_fn(jnp.abs(eeg_diff) - 0.1) 
         zero_pad = jnp.zeros((B, 1, self.eeg_ch))
-        x_eeg_spikes = jnp.concatenate([zero_pad, encoded_spikes], axis=1) # [B, T, 64]
+        x_eeg_spikes = jnp.concatenate([zero_pad, encoded_spikes], axis=1)
         
-        # 스파이크를 은닉 차원으로 매핑
+        # 스파이크 및 기하학적 피처 사전 연산 (Pre-compute) -> Tracer Leak 해결의 핵심
         eeg_mapped = self.w_eeg(x_eeg_spikes) # [B, T, hid_ch]
+        
+        geo_tau_seq = nn.sigmoid(self.w_tau(x_geo)) # [B, T, hid_ch]
+        geo_theta_seq = nn.softplus(self.w_theta(x_geo)) # [B, T, hid_ch]
         
         def scan_fn(carry, inputs):
             mem_alif, eta, mem_li, prev_spk = carry
-            cur_eeg_spk, cur_geo = inputs
+            cur_eeg_spk, cur_tau_mod, cur_theta_mod = inputs
             
-            # 🔥 핵심 원칙 반영: Geo 피처가 뉴런 반응성(tau, theta)을 직접 제어
-            # 1. 감쇠계수 제어 (Sigmoid로 0.5~0.99 사이로 바운드)
-            tau_m = 0.5 + 0.49 * nn.sigmoid(self.w_tau(cur_geo)) 
-            
-            # 2. 임계값 제어 (기본 theta_0에서 Geo 변화량만큼 하락)
-            # Softplus를 써서 항상 양수만큼만 깎이도록 제어
-            geo_theta_shift = nn.softplus(self.w_theta(cur_geo))
+            tau_m = 0.5 + 0.49 * cur_tau_mod
+            geo_theta_shift = cur_theta_mod
             
             eta = self.tau_a * eta + (1 - self.tau_a) * prev_spk
             theta_t = self.theta_0 + self.beta * eta - geo_theta_shift
             
-            # 막전위 업데이트 및 발화
             mem_alif = tau_m * mem_alif + cur_eeg_spk
             spk_alif = spike_fn(mem_alif - theta_t)
             mem_alif = mem_alif * (1.0 - spk_alif)
             
-            # 출력 풀링을 위한 누적기(Leaky Integrator)
             mem_li = 0.9 * mem_li + spk_alif
             
             return (mem_alif, eta, mem_li, spk_alif), mem_li
@@ -113,17 +101,21 @@ class Pure_Geo_ALIF_SNN(nn.Module):
             jnp.zeros((B, self.hid_ch)), jnp.zeros((B, self.hid_ch))
         )
         
-        inputs = (jnp.swapaxes(eeg_mapped, 0, 1), jnp.swapaxes(x_geo, 0, 1))
+        # 사전에 계산된 시계열 텐서들을 시간축(axis=1) 기준으로 스캔
+        inputs = (
+            jnp.swapaxes(eeg_mapped, 0, 1), 
+            jnp.swapaxes(geo_tau_seq, 0, 1),
+            jnp.swapaxes(geo_theta_seq, 0, 1)
+        )
         _, mem_li_seq = jax.lax.scan(scan_fn, init_carry, inputs)
         
         mem_li_seq = jnp.swapaxes(mem_li_seq, 0, 1) 
         
-        # Temporal DP-Pooling (10개 구간)
         windows = mem_li_seq.reshape((B, 10, 32, self.hid_ch))
         start_mean = jnp.mean(windows[:, :, :16, :], axis=2) 
         end_mean = jnp.mean(windows[:, :, 16:, :], axis=2)   
         
-        dp_feat = (end_mean - start_mean).reshape((B, -1)) # [B, 10 * hid_ch]
+        dp_feat = (end_mean - start_mean).reshape((B, -1)) 
         
         out = self.classifier_drop(dp_feat, deterministic=not train)
         out = self.fc_out(out)
@@ -146,7 +138,7 @@ def create_train_state(rng, model, eeg_shape, geo_shape, max_epochs, steps_per_e
     scheduler = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=max_epochs * steps_per_epoch, alpha=0.01)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.add_decayed_weights(1e-2), # 과적합 방지를 위해 Weight Decay 강화
+        optax.add_decayed_weights(1e-2), 
         optax.adamw(learning_rate=scheduler)
     )
     

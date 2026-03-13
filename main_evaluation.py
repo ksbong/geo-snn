@@ -40,10 +40,9 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 exclude_subjects = ['S088', 'S092', 'S100', 'S104']
 all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
-
 def process_and_save_subject_graph(subj):
-    save_path_A = f"{SAVE_DIR}/{subj}_A.pt" # Graph Adjacency
-    save_path_X = f"{SAVE_DIR}/{subj}_X.pt" # Node Features
+    save_path_A = f"{SAVE_DIR}/{subj}_A.pt" 
+    save_path_X = f"{SAVE_DIR}/{subj}_X.pt" 
     save_path_y = f"{SAVE_DIR}/{subj}_y.pt"
     if os.path.exists(save_path_A): return
         
@@ -52,6 +51,7 @@ def process_and_save_subject_graph(subj):
     epochs_list = []
     
     try:
+        # (데이터 로드 및 윈도우 분할 등 이전과 동일 부분 생략, 아래 루프가 핵심)
         for run in runs_hands:
             path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
             if not os.path.exists(path): continue
@@ -82,45 +82,36 @@ def process_and_save_subject_graph(subj):
         hardy_signals = project_to_hardy_space(data, sfreq)
         envelopes = np.abs(hardy_signals)
         
-        win_len = 160
-        stride = 80
-        num_windows = 5
+        win_len = 160; stride = 80; num_windows = 5
         
         X_covs_seq = []
         for w in range(num_windows):
-            start = w * stride
-            end = start + win_len
+            start = w * stride; end = start + win_len
             env_win = envelopes[:, :, start:end]
-            covs = np.array([compute_spd_cov(env) for env in env_win])
-            X_covs_seq.append(covs)
-            
-        X_covs_seq = np.stack(X_covs_seq, axis=1) # (Epochs, 5, 64, 64)
+            X_covs_seq.append(np.array([compute_spd_cov(env) for env in env_win]))
+        X_covs_seq = np.stack(X_covs_seq, axis=1)
 
         rest_covs = X_covs_seq[labels == 0]
         p_rest = np.mean(rest_covs, axis=(0, 1)) 
         p_rest_sqrt = sqrtm(p_rest).real
         p_rest_inv_sqrt = inv(p_rest_sqrt)
 
-        # 💡 위상수학적 그래프 구조 생성 (Normalized Laplacian Base)
         A_norm_seq = []
         X_feat_seq = []
         
         for ep_idx in range(X_covs_seq.shape[0]):
-            ep_A = []
-            ep_X = []
+            ep_A = []; ep_X = []
             for w in range(num_windows):
                 cov = X_covs_seq[ep_idx, w]
                 inner = p_rest_inv_sqrt @ cov @ p_rest_inv_sqrt
                 tangent = p_rest_sqrt @ logm(inner).real @ p_rest_sqrt
                 
-                # 1. 노드 특성: 각 채널의 분산(대각 원소)을 뇌파 고유 특징으로 사용
-                node_features = np.diag(cov).reshape(-1, 1)
+                # 💡 핵심 수정: Tangent Matrix 자체(64x64)를 노드 피처로 통째로 사용!
+                node_features = tangent 
                 
-                # 2. 인접 행렬 구성: Tangent 공간의 거리를 연결 강도로 해석
                 A = np.abs(tangent)
-                np.fill_diagonal(A, A.diagonal() + 1.0) # Self-loop 추가
+                np.fill_diagonal(A, A.diagonal() + 1.0) 
                 
-                # 3. 정규화된 그래프 래플라시안 유도 (D^{-1/2} * A * D^{-1/2})
                 D_inv_sqrt = np.diag(1.0 / np.sqrt(np.sum(A, axis=1)))
                 A_norm = D_inv_sqrt @ A @ D_inv_sqrt
                 
@@ -130,10 +121,9 @@ def process_and_save_subject_graph(subj):
             A_norm_seq.append(ep_A)
             X_feat_seq.append(ep_X)
         
-        A_norm_seq = np.array(A_norm_seq, dtype=np.float32) # (Epochs, 5, 64, 64)
-        X_feat_seq = np.array(X_feat_seq, dtype=np.float32) # (Epochs, 5, 64, 1)
+        A_norm_seq = np.array(A_norm_seq, dtype=np.float32) 
+        X_feat_seq = np.array(X_feat_seq, dtype=np.float32) # 이제 (Epochs, 5, 64, 64)가 됨!
 
-        # 노드 특징 스케일링
         scale_X = np.max(np.abs(X_feat_seq))
         if scale_X > 0: X_feat_seq = X_feat_seq / scale_X
 
@@ -142,7 +132,7 @@ def process_and_save_subject_graph(subj):
         torch.save(torch.tensor(labels, dtype=torch.long), save_path_y)
         
     except Exception as e:
-        print(f"🚨 {subj} 전처리 중 에러 발생: {e}")
+        print(f"🚨 {subj} 전처리 에러: {e}")
 
 print("🚀 1단계: 라플라시안 그래프 텐서 변환 및 저장 시작")
 for subj in tqdm(all_subjects):
@@ -185,25 +175,24 @@ class RiemannianGraphSNN(nn.Module):
         self.num_steps = num_steps
         spike_grad = surrogate.fast_sigmoid(slope=25)
         
-        # 💡 CNN 대신 위상을 타는 GCN 적용
-        self.gcn1 = DenseGCNConv(1, 16)
+        # 💡 입력 피처가 1차원 -> 64차원(Tangent 행벡터)으로 확장됨!
+        self.gcn1 = DenseGCNConv(64, 128) # 64 -> 128 채널로 펌핑
         self.lif1 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
         
-        self.gcn2 = DenseGCNConv(16, 32)
+        self.gcn2 = DenseGCNConv(128, 64)
         self.lif2 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
         
         self.dropout = nn.Dropout(0.4)
         
-        # 시간 특징을 모두 살리기 위한 차원: 64노드 * 32피처 * 15스텝
+        # 차원: 64노드 * 64특징 * 15스텝
         self.classifier = nn.Sequential(
-            nn.Linear(64 * 32 * 15, 128),
+            nn.Linear(64 * 64 * 15, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 4)
+            nn.Dropout(0.4),
+            nn.Linear(256, 4)
         )
 
     def forward(self, A_norm_seq, X_feat_seq):
-        # A_norm_seq: [Batch, 5, 64, 64], X_feat_seq: [Batch, 5, 64, 1]
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
         
@@ -215,26 +204,21 @@ class RiemannianGraphSNN(nn.Module):
             if w_idx >= 5: w_idx = 4
             
             A_current = A_norm_seq[:, w_idx]
-            X_current = X_feat_seq[:, w_idx]
+            X_current = X_feat_seq[:, w_idx] * 10.0 # 스파이크 발화 강제 펌핑
             
-            # 그래프 구조를 타고 SNN으로 정보가 흐름
             cur1 = self.gcn1(A_current, X_current)
             spk1, mem1 = self.lif1(cur1, mem1)
             
             cur2 = self.gcn2(A_current, spk1)
             spk2, mem2 = self.lif2(cur2, mem2)
             
-            # [Batch, 64, 32] -> [Batch, 64*32]
             spk2_rec.append(torch.flatten(spk2, start_dim=1))
             
-        # 모든 타임스텝의 공간 정보를 잃지 않고 길게 펼침
-        # [Time, Batch, 64*32] -> [Batch, Time * 64 * 32]
         all_time_features = torch.stack(spk2_rec).transpose(0, 1).contiguous()
         flat_spatio_temporal = self.dropout(all_time_features.view(all_time_features.size(0), -1))
         
         out = self.classifier(flat_spatio_temporal)
-        return out 
-
+        return out
 # =====================================================================
 # 4. 학습 파이프라인 (5-Fold & SSTL)
 # =====================================================================

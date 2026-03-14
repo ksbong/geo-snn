@@ -16,7 +16,7 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =====================================================================
-# 1. 기하학적 특징 및 라플라시안 그래프 전처리 (480스텝 원본 보존!)
+# 1. 기하학적 특징 및 라플라시안 그래프 전처리 (480스텝 연속 인코딩)
 # =====================================================================
 def project_to_hardy_space(data, sfreq, l_freq=8.0, h_freq=30.0):
     n_times = data.shape[-1]
@@ -40,6 +40,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 exclude_subjects = ['S088', 'S092', 'S100', 'S104']
 all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
+
 def process_and_save_subject_graph(subj):
     save_path_L = f"{SAVE_DIR}/{subj}_L.pt" 
     save_path_X = f"{SAVE_DIR}/{subj}_X.pt" 
@@ -81,7 +82,7 @@ def process_and_save_subject_graph(subj):
         hardy_signals = project_to_hardy_space(data, sfreq)
         envelopes = np.abs(hardy_signals) 
         
-        # 💡 치명적 오류 해결: 481스텝을 480스텝으로 칼같이 자름
+        # 481스텝을 480스텝으로 칼같이 자름
         envelopes = envelopes[:, :, :480]
         
         rest_idx = (labels == 0)
@@ -95,7 +96,7 @@ def process_and_save_subject_graph(subj):
         X_feat_list = []
         
         for ep_idx in range(envelopes.shape[0]):
-            env = envelopes[ep_idx] # 이제 완벽한 (64, 480) 형태
+            env = envelopes[ep_idx] 
             
             cov_full = compute_spd_cov(env)
             inner = p_rest_inv_sqrt @ cov_full @ p_rest_inv_sqrt
@@ -116,7 +117,7 @@ def process_and_save_subject_graph(subj):
             D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
             L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A_sparse @ D_inv_sqrt)
             
-            # 리쉐이프 에러 없이 깔끔하게 통과
+            # 480스텝 리쉐이프
             X_seq = env.T.reshape(480, 64, 1) 
             
             L_norm_list.append(L_norm)
@@ -131,29 +132,22 @@ def process_and_save_subject_graph(subj):
         torch.save(torch.tensor(L_norm_list), save_path_L)
         torch.save(torch.tensor(X_feat_list), save_path_X)
         torch.save(torch.tensor(labels, dtype=torch.long), save_path_y)
-        return None # 성공 시 None 반환
+        return None 
         
     except Exception as e:
-        # 💡 에러 발생 시 출력하지 않고 문자열로 반환만 함
         return f"🚨 {subj} 전처리 에러: {e}"
 
 print("🚀 1단계: O(N^3) 최적화 전처리 (480스텝 연속 인코딩) 실행")
 error_logs = []
-# 진행 바가 깔끔하게 한 줄로만 렌더링됨
 for subj in tqdm(all_subjects, desc="Processing", leave=True):
     err = process_and_save_subject_graph(subj)
     if err:
         error_logs.append(err)
 
-# 에러는 다 끝나고 한 번에 출력
 if error_logs:
     print("\n⚠️ 발생한 에러 목록:")
     for error_msg in error_logs:
         print(error_msg)
-    
-print("🚀 1단계: O(N^3) 최적화 전처리 (480스텝 연속 인코딩) 실행")
-for subj in tqdm(all_subjects):
-    process_and_save_subject_graph(subj)
 
 def load_graph_data(subject_list):
     L_list, X_list, y_list = [], [], []
@@ -167,7 +161,7 @@ def load_graph_data(subject_list):
 
 
 # =====================================================================
-# 2. 동적 리만 라플라시안 GCN 및 Spiking TCN 모듈
+# 2. 동적 리만 라플라시안 GCN 및 Spiking TCN 모듈 (속도 최적화)
 # =====================================================================
 class DynamicLaplacianConv(nn.Module):
     def __init__(self, in_features, out_features, num_nodes=64):
@@ -179,10 +173,8 @@ class DynamicLaplacianConv(nn.Module):
         nn.init.xavier_uniform_(self.weight)
         nn.init.zeros_(self.bias)
 
-    def forward(self, L_norm, X):
-        mask = torch.sigmoid(self.spatial_mask + self.spatial_mask.T) / 2.0
-        L_dynamic = L_norm * mask.unsqueeze(0) 
-
+    # 💡 무거운 L_dynamic 행렬 곱을 시간 루프 밖에서 미리 계산해서 받아옴
+    def forward(self, L_dynamic, X):
         support = torch.matmul(X, self.weight) 
         out = torch.bmm(L_dynamic, support)       
         return out + self.bias
@@ -220,7 +212,6 @@ class TemporalAttentionDecoder(nn.Module):
         )
 
     def forward(self, x_seq):
-        # 💡 아까 에러났던 변수명(Feat) 완벽 수정됨
         B, T, Feat = x_seq.size() 
         
         attn_scores = self.attention(x_seq.view(B * T, Feat)).view(B, T, 1)
@@ -231,10 +222,10 @@ class TemporalAttentionDecoder(nn.Module):
 
 
 # =====================================================================
-# 3. Ultimate 모델: Dynamic 리만 그래프 + Spiking TCN (480스텝)
+# 3. Ultimate 모델: 시간축 압축(160스텝) + 연산 병목 제거
 # =====================================================================
 class Ultimate_STCN_GraphSNN(nn.Module):
-    def __init__(self, num_steps=480):
+    def __init__(self, num_steps=160):
         super().__init__()
         self.num_steps = num_steps
         spike_grad = surrogate.fast_sigmoid(slope=25)
@@ -253,9 +244,19 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def forward(self, L_norm, X_seq):
         B = X_seq.size(0)
         
-        # X_seq: [B, 480, 64, 1] -> [B, 64, 480]
+        # 💡 결정타: 시간축을 3칸씩 건너뛰어서 정보 손실 없이 160스텝으로 압축
+        X_seq = X_seq[:, ::3, :, :] 
+        
+        # X_seq: [B, 160, 64, 1] -> [B, 64, 160]
         x_tcn_in = X_seq.squeeze(-1).transpose(1, 2) 
         x_tcn_out = self.tcn_proj(x_tcn_in) 
+        
+        # 💡 결정타: for문 돌기 전에 동적 그래프를 딱 한 번만 계산해서 던져줌!
+        mask1 = torch.sigmoid(self.gcn1.spatial_mask + self.gcn1.spatial_mask.T) / 2.0
+        L_dynamic1 = L_norm * mask1.unsqueeze(0)
+        
+        mask2 = torch.sigmoid(self.gcn2.spatial_mask + self.gcn2.spatial_mask.T) / 2.0
+        L_dynamic2 = L_norm * mask2.unsqueeze(0)
         
         mem_tcn = self.lif_tcn.init_leaky()
         mem_g1 = self.lif_gcn1.init_leaky()
@@ -263,20 +264,20 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         potentials_rec = []
         
-        # 480스텝 리얼 타임 다이나믹스
         for step in range(self.num_steps):
             tcn_step = x_tcn_out[:, :, step].unsqueeze(-1) 
             spk_tcn, mem_tcn = self.lif_tcn(tcn_step, mem_tcn)
             
-            cur1 = self.gcn1(L_norm, spk_tcn)
+            # 여기서 무거운 그래프 연산 없이 L_dynamic을 바로 꽂아 넣음
+            cur1 = self.gcn1(L_dynamic1, spk_tcn)
             spk1, mem_g1 = self.lif_gcn1(cur1, mem_g1)
             
-            cur2 = self.gcn2(L_norm, spk1)
+            cur2 = self.gcn2(L_dynamic2, spk1)
             spk2, mem_g2 = self.lif_gcn2(cur2, mem_g2)
             
             potentials_rec.append(torch.flatten(mem_g2, start_dim=1))
             
-        # [B, 480, 64*32]
+        # [B, 160, 64*32]
         all_time_potentials = torch.stack(potentials_rec, dim=1) 
         
         out = self.decoder(all_time_potentials)
@@ -284,7 +285,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
 
 
 # =====================================================================
-# 4. 학습 파이프라인 (OOM 방지용 배치 사이즈 축소 적용)
+# 4. 학습 파이프라인
 # =====================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -292,7 +293,7 @@ global_acc_list = []
 sstl_acc_list = []
 
 print("\n" + "="*50)
-print("🧠 진짜 리얼 타임(480스텝) 동적 리만 + Spiking TCN 학습 시작")
+print("🧠 리만 기하학 + Spiking TCN (160스텝 고속 최적화) 5-Fold 학습 시작")
 print("="*50)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -302,10 +303,10 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     
     L_train, X_train, y_train = load_graph_data(global_train_subjs)
     if L_train is None: continue
-    # 💡 480스텝으로 메모리 사용량이 급증하므로 batch_size를 32로 낮춤
     train_loader = DataLoader(TensorDataset(L_train, X_train, y_train), batch_size=32, shuffle=True)
     
-    net = Ultimate_STCN_GraphSNN(num_steps=480).to(device)
+    # 여기서 num_steps=160으로 세팅됨
+    net = Ultimate_STCN_GraphSNN(num_steps=160).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     
@@ -347,17 +348,15 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         subj_fold_accs = []
         
         for sub_train_idx, sub_test_idx in kf_sub.split(L_sub):
-            sstl_net = Ultimate_STCN_GraphSNN(num_steps=480).to(device)
+            sstl_net = Ultimate_STCN_GraphSNN(num_steps=160).to(device)
             sstl_net.load_state_dict(global_model_state)
             
-            # SSTL 파인튜닝: 디코더 전체(Attention + Classifier) 업데이트
             for name, param in sstl_net.named_parameters():
                 if 'decoder' not in name: 
                     param.requires_grad = False
                     
             sstl_optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, sstl_net.parameters()), lr=5e-4)
             
-            # 💡 파인튜닝 시 메모리 안전을 위해 배치 16으로 설정
             sub_train_loader = DataLoader(TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=16, shuffle=True)
             sub_test_loader = DataLoader(TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=16, shuffle=False)
             

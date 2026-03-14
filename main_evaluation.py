@@ -40,12 +40,11 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 exclude_subjects = ['S088', 'S092', 'S100', 'S104']
 all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
-
 def process_and_save_subject_graph(subj):
     save_path_L = f"{SAVE_DIR}/{subj}_L.pt" 
     save_path_X = f"{SAVE_DIR}/{subj}_X.pt" 
     save_path_y = f"{SAVE_DIR}/{subj}_y.pt"
-    if os.path.exists(save_path_L): return
+    if os.path.exists(save_path_L): return None
         
     runs_hands = ['R04', 'R08', 'R12']
     runs_feet = ['R06', 'R10', 'R14']
@@ -72,7 +71,7 @@ def process_and_save_subject_graph(subj):
                             tmin=1.0, tmax=4.0, baseline=None, preload=True, verbose=False)
             epochs_list.append(ep)
             
-        if not epochs_list: return
+        if not epochs_list: return None
         epochs_all = mne.concatenate_epochs(epochs_list, verbose=False)
         
         data = epochs_all.get_data() * 1e6  
@@ -81,6 +80,9 @@ def process_and_save_subject_graph(subj):
 
         hardy_signals = project_to_hardy_space(data, sfreq)
         envelopes = np.abs(hardy_signals) 
+        
+        # 💡 치명적 오류 해결: 481스텝을 480스텝으로 칼같이 자름
+        envelopes = envelopes[:, :, :480]
         
         rest_idx = (labels == 0)
         rest_envelopes = envelopes[rest_idx]
@@ -93,7 +95,7 @@ def process_and_save_subject_graph(subj):
         X_feat_list = []
         
         for ep_idx in range(envelopes.shape[0]):
-            env = envelopes[ep_idx] # shape: (64, 480)
+            env = envelopes[ep_idx] # 이제 완벽한 (64, 480) 형태
             
             cov_full = compute_spd_cov(env)
             inner = p_rest_inv_sqrt @ cov_full @ p_rest_inv_sqrt
@@ -114,8 +116,8 @@ def process_and_save_subject_graph(subj):
             D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
             L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A_sparse @ D_inv_sqrt)
             
-            # 💡 욕먹어 마땅했던 15청크 평균 삭제! 480스텝 연속 데이터 그대로 보존
-            X_seq = env.T.reshape(480, 64, 1) # shape: (480, 64, 1)
+            # 리쉐이프 에러 없이 깔끔하게 통과
+            X_seq = env.T.reshape(480, 64, 1) 
             
             L_norm_list.append(L_norm)
             X_feat_list.append(X_seq) 
@@ -123,17 +125,32 @@ def process_and_save_subject_graph(subj):
         L_norm_list = np.array(L_norm_list, dtype=np.float32) 
         X_feat_list = np.array(X_feat_list, dtype=np.float32) 
 
-        # 정규화
         scale_X = np.max(np.abs(X_feat_list))
         if scale_X > 0: X_feat_list = X_feat_list / scale_X
 
         torch.save(torch.tensor(L_norm_list), save_path_L)
         torch.save(torch.tensor(X_feat_list), save_path_X)
         torch.save(torch.tensor(labels, dtype=torch.long), save_path_y)
+        return None # 성공 시 None 반환
         
     except Exception as e:
-        print(f"🚨 {subj} 전처리 에러: {e}")
+        # 💡 에러 발생 시 출력하지 않고 문자열로 반환만 함
+        return f"🚨 {subj} 전처리 에러: {e}"
 
+print("🚀 1단계: O(N^3) 최적화 전처리 (480스텝 연속 인코딩) 실행")
+error_logs = []
+# 진행 바가 깔끔하게 한 줄로만 렌더링됨
+for subj in tqdm(all_subjects, desc="Processing", leave=True):
+    err = process_and_save_subject_graph(subj)
+    if err:
+        error_logs.append(err)
+
+# 에러는 다 끝나고 한 번에 출력
+if error_logs:
+    print("\n⚠️ 발생한 에러 목록:")
+    for error_msg in error_logs:
+        print(error_msg)
+    
 print("🚀 1단계: O(N^3) 최적화 전처리 (480스텝 연속 인코딩) 실행")
 for subj in tqdm(all_subjects):
     process_and_save_subject_graph(subj)

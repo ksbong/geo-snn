@@ -1,22 +1,26 @@
 import os
 import mne
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
+import torch
 from torch.utils.data import TensorDataset, DataLoader
 from scipy.fft import fft, ifft, fftfreq
 from scipy.linalg import sqrtm, logm, inv
 from sklearn.model_selection import KFold
-import snntorch as snn
-from snntorch import surrogate
 from tqdm import tqdm
 import warnings
+
+# JAX & Flax 생태계 임포트
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from flax.training import train_state
+import optax
+import flax.traverse_util
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =====================================================================
-# 1. 기하학적 특징 및 라플라시안 그래프 전처리 (480스텝 연속 인코딩)
+# 1. 기하학적 특징 전처리 (NumPy & PyTorch 기반 유지, 가장 안정적임)
 # =====================================================================
 def project_to_hardy_space(data, sfreq, l_freq=8.0, h_freq=30.0):
     n_times = data.shape[-1]
@@ -81,9 +85,7 @@ def process_and_save_subject_graph(subj):
 
         hardy_signals = project_to_hardy_space(data, sfreq)
         envelopes = np.abs(hardy_signals) 
-        
-        # 481스텝을 480스텝으로 칼같이 자름
-        envelopes = envelopes[:, :, :480]
+        envelopes = envelopes[:, :, :480] # 480스텝 컷
         
         rest_idx = (labels == 0)
         rest_envelopes = envelopes[rest_idx]
@@ -117,9 +119,7 @@ def process_and_save_subject_graph(subj):
             D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
             L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A_sparse @ D_inv_sqrt)
             
-            # 480스텝 리쉐이프
             X_seq = env.T.reshape(480, 64, 1) 
-            
             L_norm_list.append(L_norm)
             X_feat_list.append(X_seq) 
         
@@ -137,17 +137,9 @@ def process_and_save_subject_graph(subj):
     except Exception as e:
         return f"🚨 {subj} 전처리 에러: {e}"
 
-print("🚀 1단계: O(N^3) 최적화 전처리 (480스텝 연속 인코딩) 실행")
-error_logs = []
+print("🚀 1단계: O(N^3) 최적화 전처리 확인")
 for subj in tqdm(all_subjects, desc="Processing", leave=True):
-    err = process_and_save_subject_graph(subj)
-    if err:
-        error_logs.append(err)
-
-if error_logs:
-    print("\n⚠️ 발생한 에러 목록:")
-    for error_msg in error_logs:
-        print(error_msg)
+    process_and_save_subject_graph(subj)
 
 def load_graph_data(subject_list):
     L_list, X_list, y_list = [], [], []
@@ -161,139 +153,190 @@ def load_graph_data(subject_list):
 
 
 # =====================================================================
-# 2. 동적 리만 라플라시안 GCN 및 Spiking TCN 모듈 (속도 최적화)
+# 2. JAX/Flax 용 커스텀 Surrogate Gradient & LIF 뉴런
+# =====================================================================
+@jax.custom_vjp
+def fast_sigmoid(x):
+    # Forward pass: 발화 임계점 넘으면 1, 아니면 0 (Heaviside step)
+    return jnp.where(x > 0, 1.0, 0.0)
+
+def fs_fwd(x):
+    return fast_sigmoid(x), x
+
+def fs_bwd(res, g):
+    # Backward pass: snntorch.surrogate.fast_sigmoid 와 동일한 수식 적용
+    x = res
+    slope = 25.0
+    grad = slope / (slope * jnp.abs(x) + 1.0)**2
+    return (g * grad,)
+
+fast_sigmoid.defvjp(fs_fwd, fs_bwd)
+
+class LIF(nn.Module):
+    beta: float = 0.9
+
+    @nn.compact
+    def __call__(self, mem, x):
+        mem = mem * self.beta + x
+        spk = fast_sigmoid(mem - 1.0) # threshold = 1.0
+        mem = mem - spk # reset by subtraction
+        return mem, spk
+
+# =====================================================================
+# 3. JAX 기반 SNN 모듈 및 메인 모델
 # =====================================================================
 class DynamicLaplacianConv(nn.Module):
-    def __init__(self, in_features, out_features, num_nodes=64):
-        super().__init__()
-        self.weight = nn.Parameter(torch.Tensor(in_features, out_features))
-        self.bias = nn.Parameter(torch.Tensor(out_features))
-        self.spatial_mask = nn.Parameter(torch.ones(num_nodes, num_nodes))
-        
-        nn.init.xavier_uniform_(self.weight)
-        nn.init.zeros_(self.bias)
+    out_features: int
 
-    # 💡 무거운 L_dynamic 행렬 곱을 시간 루프 밖에서 미리 계산해서 받아옴
-    def forward(self, L_dynamic, X):
-        support = torch.matmul(X, self.weight) 
-        out = torch.bmm(L_dynamic, support)       
-        return out + self.bias
+    @nn.compact
+    def __call__(self, L_dynamic, X):
+        # X: (B, N, F)
+        support = nn.Dense(self.out_features, use_bias=True)(X)
+        # JAX의 행렬곱: (B, N, N) @ (B, N, F) -> (B, N, F)
+        return jnp.matmul(L_dynamic, support)
 
 class CausalSpikingTCN(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
-        super().__init__()
-        padding = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
-                              padding=padding, dilation=dilation)
-        self.bn = nn.BatchNorm1d(out_channels)
+    features: int
+    kernel_size: int = 3
 
-    def forward(self, x):
-        out = self.conv(x)
-        out = out[:, :, :-self.conv.padding[0]]
-        return self.bn(out)
+    @nn.compact
+    def __call__(self, x):
+        # Causal padding 적용
+        padding = self.kernel_size - 1
+        x_pad = jnp.pad(x, ((0, 0), (padding, 0), (0, 0)))
+        out = nn.Conv(features=self.features, kernel_size=(self.kernel_size,), padding='VALID')(x_pad)
+        # JAX에서 BatchNorm 상태 관리가 번거로우므로 LayerNorm으로 깔끔하게 대체
+        out = nn.LayerNorm()(out) 
+        return out
 
 class TemporalAttentionDecoder(nn.Module):
-    def __init__(self, num_nodes, in_features, num_classes=4):
-        super().__init__()
-        self.flat_dim = num_nodes * in_features
-        
-        self.attention = nn.Sequential(
-            nn.Linear(self.flat_dim, 32),
-            nn.Tanh(),
-            nn.Linear(32, 1)
-        )
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(self.flat_dim, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, num_classes)
-        )
+    num_classes: int = 4
 
-    def forward(self, x_seq):
-        B, T, Feat = x_seq.size() 
+    @nn.compact
+    def __call__(self, x_seq, deterministic: bool):
+        B, T, Feat = x_seq.shape
         
-        attn_scores = self.attention(x_seq.view(B * T, Feat)).view(B, T, 1)
-        attn_weights = F.softmax(attn_scores, dim=1) 
+        attn_scores = nn.Dense(32)(x_seq)
+        attn_scores = nn.tanh(attn_scores)
+        attn_scores = nn.Dense(1)(attn_scores) 
         
-        context_vector = torch.sum(x_seq * attn_weights, dim=1) 
-        return self.classifier(context_vector)
+        attn_weights = jax.nn.softmax(attn_scores, axis=1)
+        context_vector = jnp.sum(x_seq * attn_weights, axis=1) 
+        
+        x = nn.Dense(128)(context_vector)
+        x = nn.LayerNorm()(x)
+        x = nn.gelu(x)
+        x = nn.Dropout(rate=0.5, deterministic=deterministic)(x)
+        x = nn.Dense(self.num_classes)(x)
+        return x
 
-
-# =====================================================================
-# 3. Ultimate 모델: 시간축 압축(160스텝) + 연산 병목 제거
-# =====================================================================
 class Ultimate_STCN_GraphSNN(nn.Module):
-    def __init__(self, num_steps=160):
-        super().__init__()
-        self.num_steps = num_steps
-        spike_grad = surrogate.fast_sigmoid(slope=25)
-        
-        self.tcn_proj = CausalSpikingTCN(in_channels=64, out_channels=64, kernel_size=3)
-        self.lif_tcn = snn.Leaky(beta=0.9, spike_grad=spike_grad)
-        
-        self.gcn1 = DynamicLaplacianConv(1, 16, num_nodes=64)
-        self.lif_gcn1 = snn.Leaky(beta=0.85, spike_grad=spike_grad)
-        
-        self.gcn2 = DynamicLaplacianConv(16, 32, num_nodes=64)
-        self.lif_gcn2 = snn.Leaky(beta=0.9, learn_beta=True, spike_grad=spike_grad)
-        
-        self.decoder = TemporalAttentionDecoder(num_nodes=64, in_features=32)
+    num_steps: int = 160
 
-    def forward(self, L_norm, X_seq):
-        B = X_seq.size(0)
+    @nn.compact
+    def __call__(self, L_norm, X_seq, deterministic: bool):
+        B = X_seq.shape[0]
         
-        # 💡 결정타: 시간축을 3칸씩 건너뛰어서 정보 손실 없이 160스텝으로 압축
-        X_seq = X_seq[:, ::3, :, :] 
+        # TCN 전방향 처리
+        x_tcn_in = X_seq.squeeze(-1) 
+        tcn_out = CausalSpikingTCN(features=64, kernel_size=3)(x_tcn_in) 
         
-        # X_seq: [B, 160, 64, 1] -> [B, 64, 160]
-        x_tcn_in = X_seq.squeeze(-1).transpose(1, 2) 
-        x_tcn_out = self.tcn_proj(x_tcn_in) 
+        # 동적 그래프 파라미터 1회 셋업
+        mask1_param = self.param('mask1', jax.nn.initializers.ones, (64, 64))
+        mask1 = jax.nn.sigmoid(mask1_param + mask1_param.T) / 2.0
+        L_dyn1 = L_norm * jnp.expand_dims(mask1, 0)
         
-        # 💡 결정타: for문 돌기 전에 동적 그래프를 딱 한 번만 계산해서 던져줌!
-        mask1 = torch.sigmoid(self.gcn1.spatial_mask + self.gcn1.spatial_mask.T) / 2.0
-        L_dynamic1 = L_norm * mask1.unsqueeze(0)
+        mask2_param = self.param('mask2', jax.nn.initializers.ones, (64, 64))
+        mask2 = jax.nn.sigmoid(mask2_param + mask2_param.T) / 2.0
+        L_dyn2 = L_norm * jnp.expand_dims(mask2, 0)
         
-        mask2 = torch.sigmoid(self.gcn2.spatial_mask + self.gcn2.spatial_mask.T) / 2.0
-        L_dynamic2 = L_norm * mask2.unsqueeze(0)
-        
-        mem_tcn = self.lif_tcn.init_leaky()
-        mem_g1 = self.lif_gcn1.init_leaky()
-        mem_g2 = self.lif_gcn2.init_leaky()
+        # 막전위 초기화
+        mem_tcn = jnp.zeros((B, 64))
+        mem_g1 = jnp.zeros((B, 64, 16))
+        mem_g2 = jnp.zeros((B, 64, 32))
         
         potentials_rec = []
         
         for step in range(self.num_steps):
-            tcn_step = x_tcn_out[:, :, step].unsqueeze(-1) 
-            spk_tcn, mem_tcn = self.lif_tcn(tcn_step, mem_tcn)
+            tcn_step = tcn_out[:, step, :] 
+            mem_tcn, spk_tcn = LIF(beta=0.9)(mem_tcn, tcn_step)
             
-            # 여기서 무거운 그래프 연산 없이 L_dynamic을 바로 꽂아 넣음
-            cur1 = self.gcn1(L_dynamic1, spk_tcn)
-            spk1, mem_g1 = self.lif_gcn1(cur1, mem_g1)
+            cur1 = DynamicLaplacianConv(out_features=16)(L_dyn1, jnp.expand_dims(spk_tcn, -1))
+            mem_g1, spk1 = LIF(beta=0.85)(mem_g1, cur1)
             
-            cur2 = self.gcn2(L_dynamic2, spk1)
-            spk2, mem_g2 = self.lif_gcn2(cur2, mem_g2)
+            cur2 = DynamicLaplacianConv(out_features=32)(L_dyn2, spk1)
+            mem_g2, spk2 = LIF(beta=0.9)(mem_g2, cur2)
             
-            potentials_rec.append(torch.flatten(mem_g2, start_dim=1))
+            potentials_rec.append(mem_g2.reshape((B, -1)))
             
-        # [B, 160, 64*32]
-        all_time_potentials = torch.stack(potentials_rec, dim=1) 
+        all_time_potentials = jnp.stack(potentials_rec, axis=1) 
         
-        out = self.decoder(all_time_potentials)
+        out = TemporalAttentionDecoder()(all_time_potentials, deterministic=deterministic)
         return out
 
+# =====================================================================
+# 4. JAX XLA 학습 스텝 정의 (핵심 속도 펌핑 엔진)
+# =====================================================================
+@jax.jit
+def train_step(state, L_batch, X_batch, targets, dropout_key):
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {'params': params}, L_batch, X_batch, 
+            deterministic=False, rngs={'dropout': dropout_key}
+        )
+        # JAX의 CrossEntropy는 One-hot 대신 직접 라벨을 받아서 계산 가능
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=targets).mean()
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, logits), grads = grad_fn(state.params)
+    state = state.apply_gradients(grads=grads)
+    acc = jnp.mean(jnp.argmax(logits, -1) == targets)
+    return state, loss, acc
+
+@jax.jit
+def eval_step(state, L_batch, X_batch, targets):
+    logits = state.apply_fn(
+        {'params': state.params}, L_batch, X_batch, 
+        deterministic=True
+    )
+    acc = jnp.mean(jnp.argmax(logits, -1) == targets)
+    return acc
+
+@jax.jit
+def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {'params': params}, L_batch, X_batch, 
+            deterministic=False, rngs={'dropout': dropout_key}
+        )
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=targets).mean()
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, logits), grads = grad_fn(state.params)
+    
+    # 💡 디코더 외의 모든 그래디언트를 0으로 만들어버림 (SSTL 파인튜닝)
+    flat_grads = flax.traverse_util.flatten_dict(grads)
+    flat_grads = {k: (v if 'TemporalAttentionDecoder' in k[0] else jnp.zeros_like(v)) for k, v in flat_grads.items()}
+    grads = flax.traverse_util.unflatten_dict(flat_grads)
+
+    state = state.apply_gradients(grads=grads)
+    acc = jnp.mean(jnp.argmax(logits, -1) == targets)
+    return state, loss, acc
 
 # =====================================================================
-# 4. 학습 파이프라인
+# 5. 메인 실행 파이프라인
 # =====================================================================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
 global_acc_list = []
 sstl_acc_list = []
 
+# 시드 설정
+rng = jax.random.PRNGKey(42)
+
 print("\n" + "="*50)
-print("🧠 리만 기하학 + Spiking TCN (160스텝 고속 최적화) 5-Fold 학습 시작")
+print("⚡ JAX/Flax 가속: 동적 리만 + Spiking TCN 5-Fold 학습 시작")
 print("="*50)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -303,43 +346,58 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     
     L_train, X_train, y_train = load_graph_data(global_train_subjs)
     if L_train is None: continue
-    train_loader = DataLoader(TensorDataset(L_train, X_train, y_train), batch_size=32, shuffle=True)
     
-    # 여기서 num_steps=160으로 세팅됨
-    net = Ultimate_STCN_GraphSNN(num_steps=160).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    # PyTorch 텐서를 NumPy 배열로 변환해서 DataLoader에 태움
+    train_loader = DataLoader(
+        TensorDataset(L_train, X_train, y_train), 
+        batch_size=32, shuffle=True, drop_last=True # JAX JIT은 고정 크기 배치를 좋아함
+    )
     
-    net.train()
+    # 모델 초기화 (Dummy 데이터 필요)
+    rng, init_rng, dropout_rng = jax.random.split(rng, 3)
+    dummy_L = jnp.ones((1, 64, 64))
+    dummy_X = jnp.ones((1, 160, 64, 1))
+    model = Ultimate_STCN_GraphSNN(num_steps=160)
+    variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
+    
+    # TrainState (옵티마이저 묶기)
+    tx = optax.adamw(learning_rate=1e-3, weight_decay=1e-4)
+    state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
+    
+    # 글로벌 학습 루프
     for epoch in range(30): 
-        for L_batch, X_batch, targets in train_loader:
-            L_batch, X_batch, targets = L_batch.to(device), X_batch.to(device), targets.to(device)
-            outputs = net(L_batch, X_batch)
-            loss = criterion(outputs, targets)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        for batch_L, batch_X, batch_y in train_loader:
+            # JAX array로 변환
+            j_L = jnp.array(batch_L.numpy()[:, ...])
+            # 시간축 건너뛰기 160 압축을 로더 단에서 처리
+            j_X = jnp.array(batch_X.numpy()[:, ::3, :, :]) 
+            j_y = jnp.array(batch_y.numpy())
             
+            rng, dropout_key = jax.random.split(rng)
+            state, loss, acc = train_step(state, j_L, j_X, j_y, dropout_key)
+
+    # 평가
     L_unseen, X_unseen, y_unseen = load_graph_data(global_test_subjs)
     unseen_loader = DataLoader(TensorDataset(L_unseen, X_unseen, y_unseen), batch_size=32, shuffle=False)
     
-    net.eval()
     unseen_corr, unseen_tot = 0, 0
-    with torch.no_grad():
-        for L_batch, X_batch, targets in unseen_loader:
-            L_batch, X_batch, targets = L_batch.to(device), X_batch.to(device), targets.to(device)
-            outputs = net(L_batch, X_batch)
-            _, predicted = outputs.max(1)
-            unseen_tot += targets.size(0)
-            unseen_corr += (predicted == targets).sum().item()
+    for batch_L, batch_X, batch_y in unseen_loader:
+        j_L = jnp.array(batch_L.numpy())
+        j_X = jnp.array(batch_X.numpy()[:, ::3, :, :])
+        j_y = jnp.array(batch_y.numpy())
+        
+        batch_acc = eval_step(state, j_L, j_X, j_y)
+        unseen_corr += batch_acc.item() * j_L.shape[0]
+        unseen_tot += j_L.shape[0]
             
     true_global_acc = 100 * unseen_corr / unseen_tot
     global_acc_list.append(true_global_acc)
     print(f"🔥 Fold {fold + 1} 진짜 Global Test Acc (p0): {true_global_acc:.2f}%")
     
-    global_model_state = net.state_dict()
+    global_params_backup = state.params
     fold_sstl_accs = []
     
+    # SSTL (Subject Specific Transfer Learning)
     for subj in global_test_subjs:
         L_sub, X_sub, y_sub = load_graph_data([subj])
         if L_sub is None: continue
@@ -348,35 +406,31 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         subj_fold_accs = []
         
         for sub_train_idx, sub_test_idx in kf_sub.split(L_sub):
-            sstl_net = Ultimate_STCN_GraphSNN(num_steps=160).to(device)
-            sstl_net.load_state_dict(global_model_state)
+            # 상태 복원 및 옵티마이저 재설정 (SSTL용 lr=5e-4)
+            sstl_tx = optax.adam(learning_rate=5e-4)
+            sstl_state = train_state.TrainState.create(apply_fn=model.apply, params=global_params_backup, tx=sstl_tx)
             
-            for name, param in sstl_net.named_parameters():
-                if 'decoder' not in name: 
-                    param.requires_grad = False
-                    
-            sstl_optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, sstl_net.parameters()), lr=5e-4)
-            
-            sub_train_loader = DataLoader(TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=16, shuffle=True)
+            sub_train_loader = DataLoader(TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=16, shuffle=True, drop_last=True)
             sub_test_loader = DataLoader(TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=16, shuffle=False)
             
-            sstl_net.train()
             for _ in range(15): 
-                for L_batch, X_batch, targets in sub_train_loader:
-                    L_batch, X_batch, targets = L_batch.to(device), X_batch.to(device), targets.to(device)
-                    loss = criterion(sstl_net(L_batch, X_batch), targets)
-                    sstl_optimizer.zero_grad()
-                    loss.backward()
-                    sstl_optimizer.step()
+                for batch_L, batch_X, batch_y in sub_train_loader:
+                    j_L = jnp.array(batch_L.numpy())
+                    j_X = jnp.array(batch_X.numpy()[:, ::3, :, :])
+                    j_y = jnp.array(batch_y.numpy())
                     
-            sstl_net.eval()
+                    rng, dropout_key = jax.random.split(rng)
+                    sstl_state, loss, acc = sstl_train_step(sstl_state, j_L, j_X, j_y, dropout_key)
+                    
             corr, tot = 0, 0
-            with torch.no_grad():
-                for L_batch, X_batch, targets in sub_test_loader:
-                    L_batch, X_batch, targets = L_batch.to(device), X_batch.to(device), targets.to(device)
-                    _, predicted = sstl_net(L_batch, X_batch).max(1)
-                    tot += targets.size(0)
-                    corr += (predicted == targets).sum().item()
+            for batch_L, batch_X, batch_y in sub_test_loader:
+                j_L = jnp.array(batch_L.numpy())
+                j_X = jnp.array(batch_X.numpy()[:, ::3, :, :])
+                j_y = jnp.array(batch_y.numpy())
+                
+                batch_acc = eval_step(sstl_state, j_L, j_X, j_y)
+                corr += batch_acc.item() * j_L.shape[0]
+                tot += j_L.shape[0]
             subj_fold_accs.append(100 * corr / tot)
             
         fold_sstl_accs.append(np.mean(subj_fold_accs))

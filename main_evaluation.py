@@ -210,14 +210,13 @@ class TemporalAttentionDecoder(nn.Module):
         )
 
     def forward(self, x_seq):
-        B, T, F = x_seq.size()
+        B, T, Feat = x_seq.size()
         
-        attn_scores = self.attention(x_seq.view(B * T, F)).view(B, T, 1)
+        attn_scores = self.attention(x_seq.view(B * T, Feat)).view(B, T, 1)
         attn_weights = F.softmax(attn_scores, dim=1) 
         
         context_vector = torch.sum(x_seq * attn_weights, dim=1) 
         return self.classifier(context_vector)
-
 
 # =====================================================================
 # 3. Ultimate 모델: Dynamic 리만 그래프 + Spiking TCN

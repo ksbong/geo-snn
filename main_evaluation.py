@@ -1,5 +1,4 @@
 import os
-import shutil
 import mne
 import torch
 import torch.nn as nn
@@ -16,7 +15,7 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =====================================================================
-# 1. 기하학적 특징 및 라플라시안 그래프 전처리 (최종 완성형)
+# 1. 기하학적 특징 및 라플라시안 그래프 전처리 (너의 Novelty 완벽 유지)
 # =====================================================================
 def project_to_hardy_space(data, sfreq, l_freq=8.0, h_freq=30.0):
     n_times = data.shape[-1]
@@ -79,11 +78,9 @@ def process_and_save_subject_graph(subj):
         labels = np.array(epochs_all.events[:, 2]) - 1 
         sfreq = epochs_all.info['sfreq']
 
-        # Hardy Space 투영 후 Envelope 추출
         hardy_signals = project_to_hardy_space(data, sfreq)
-        envelopes = np.abs(hardy_signals) # Shape: (Epochs, 64, 480)
+        envelopes = np.abs(hardy_signals) 
         
-        # 💡 Rest 상태 공분산 계산 (Reference Point)
         rest_idx = (labels == 0)
         rest_envelopes = envelopes[rest_idx]
         rest_covs = np.array([compute_spd_cov(env) for env in rest_envelopes])
@@ -95,17 +92,15 @@ def process_and_save_subject_graph(subj):
         X_feat_list = []
         
         num_steps = 15
-        chunk_size = envelopes.shape[-1] // num_steps # 480 // 15 = 32
+        chunk_size = envelopes.shape[-1] // num_steps 
         
         for ep_idx in range(envelopes.shape[0]):
-            env = envelopes[ep_idx] # (64, 480)
+            env = envelopes[ep_idx] 
             
-            # 💡 1. 지도 제작: 3초 전체 데이터에서 O(N^3) 연산은 딱 한 번만 수행
             cov_full = compute_spd_cov(env)
             inner = p_rest_inv_sqrt @ cov_full @ p_rest_inv_sqrt
             tangent = p_rest_sqrt @ logm(inner).real @ p_rest_sqrt
             
-            # k-NN 라플라시안 그래프 생성 (k=8)
             A = np.abs(tangent)
             np.fill_diagonal(A, 0) 
             
@@ -121,18 +116,16 @@ def process_and_save_subject_graph(subj):
             D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
             L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A_sparse @ D_inv_sqrt)
             
-            # 💡 2. 자동차 제작: 3초 궤적을 15조각으로 쪼개서 순차적 시계열 피처 생성
             X_seq = []
             for t in range(num_steps):
                 chunk = env[:, t*chunk_size : (t+1)*chunk_size]
-                # 각 조각의 평균 에너지를 노드 피처로 사용
                 X_seq.append(np.mean(chunk, axis=1, keepdims=True)) 
             
             L_norm_list.append(L_norm)
-            X_feat_list.append(np.stack(X_seq, axis=0)) # (15, 64, 1)
+            X_feat_list.append(np.stack(X_seq, axis=0)) 
         
-        L_norm_list = np.array(L_norm_list, dtype=np.float32) # (Epochs, 64, 64)
-        X_feat_list = np.array(X_feat_list, dtype=np.float32) # (Epochs, 15, 64, 1)
+        L_norm_list = np.array(L_norm_list, dtype=np.float32) 
+        X_feat_list = np.array(X_feat_list, dtype=np.float32) 
 
         scale_X = np.max(np.abs(X_feat_list))
         if scale_X > 0: X_feat_list = X_feat_list / scale_X
@@ -148,9 +141,6 @@ print("🚀 1단계: O(N^3) 최적화 전처리 시작")
 for subj in tqdm(all_subjects):
     process_and_save_subject_graph(subj)
 
-# =====================================================================
-# 2. 데이터 로드 및 Laplacian GCN 모듈
-# =====================================================================
 def load_graph_data(subject_list):
     L_list, X_list, y_list = [], [], []
     for subj in subject_list:
@@ -161,6 +151,9 @@ def load_graph_data(subject_list):
     if not L_list: return None, None, None
     return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
+# =====================================================================
+# 2. 모델 모듈: HR-SNN 아키텍처 결합
+# =====================================================================
 class DenseLaplacianConv(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -170,59 +163,110 @@ class DenseLaplacianConv(nn.Module):
         nn.init.zeros_(self.bias)
 
     def forward(self, L_norm, X):
-        # L_norm: [B, 64, 64], X: [B, 64, in_features]
         support = torch.matmul(X, self.weight) 
         out = torch.bmm(L_norm, support)       
         return out + self.bias
 
+# 💡 하이브리드 응답(HR) GCN 모듈 + 스킵 연결
+class HR_GCN_Module(nn.Module):
+    def __init__(self, in_feat, out_feat):
+        super().__init__()
+        self.gcn = DenseLaplacianConv(in_feat, out_feat)
+        self.skip = nn.Linear(in_feat, out_feat) # 펄스 소멸 방지용 스킵 브랜치
+        
+        spike_grad = surrogate.fast_sigmoid(slope=25)
+        
+        # 3개의 서로 다른 응답 특성을 가진 뉴런 세트 구성
+        self.lif_act = snn.Leaky(beta=0.8, threshold=0.8, spike_grad=spike_grad)   # 쉽게 발화, 빨리 잊음
+        self.lif_neu = snn.Leaky(beta=0.9, threshold=1.0, spike_grad=spike_grad)   # 중립
+        self.lif_mem = snn.Leaky(beta=0.95, threshold=1.5, spike_grad=spike_grad)  # 어렵게 발화, 오래 기억
+
+    def forward(self, L_norm, x, mem_act, mem_neu, mem_mem):
+        cur = self.gcn(L_norm, x)
+        
+        spk_act, mem_act = self.lif_act(cur, mem_act)
+        spk_neu, mem_neu = self.lif_neu(cur, mem_neu)
+        spk_mem, mem_mem = self.lif_mem(cur, mem_mem)
+        
+        # 스파이크 병합 및 스킵 연결 더하기
+        spk_out = spk_act + spk_neu + spk_mem + self.skip(x)
+        return spk_out, mem_act, mem_neu, mem_mem
+
+    def init_hidden(self):
+        return self.lif_act.init_leaky(), self.lif_neu.init_leaky(), self.lif_mem.init_leaky()
+
+# 💡 DP-Pooling 스파이킹 디코더
+class DP_SpikingDecoder(nn.Module):
+    def __init__(self, in_features, num_classes=4, n_dp=5):
+        super().__init__()
+        self.n_dp = n_dp # 양끝에서 평균을 낼 타임스텝 수 (15스텝 중 5스텝씩)
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, potentials):
+        # potentials: [B, 15, Features]
+        start_pool = potentials[:, :self.n_dp, :].mean(dim=1)
+        end_pool = potentials[:, -self.n_dp:, :].mean(dim=1)
+        
+        # 시간의 흐름에 따른 전위차(Difference of Potential) 추출
+        dp_feat = end_pool - start_pool 
+        
+        out = self.classifier(dp_feat)
+        return out
+
 # =====================================================================
-# 3. 모델 정의: 고정 지도 위에서 15개의 피처가 주행
+# 3. 메인 모델: 리만 그래프 + HR-SNN
 # =====================================================================
-class RiemannianGraphSNN(nn.Module):
+class RiemannianGraph_HRSNN(nn.Module):
     def __init__(self, num_steps=15):
         super().__init__()
         self.num_steps = num_steps
-        spike_grad = surrogate.fast_sigmoid(slope=25)
         
-        # 입력 에너지가 1차원(스칼라)이므로 1 -> 16 -> 32로 특징 추출
-        self.gcn1 = DenseLaplacianConv(1, 16) 
-        self.lif1 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
+        # 하드코딩된 *10 대신, 아날로그 에너지를 다차원 특징으로 투영하여 스파이크 생성을 유도
+        self.input_proj = nn.Linear(1, 16) 
         
-        self.gcn2 = DenseLaplacianConv(16, 32)
-        self.lif2 = snn.Leaky(beta=0.9, spike_grad=spike_grad)
+        # 다중 임계값 HR-GCN 모듈을 직렬로 연결
+        self.hr_gcn1 = HR_GCN_Module(16, 32)
+        self.hr_gcn2 = HR_GCN_Module(32, 64)
         
+        # 마지막은 연속적인 전위값을 출력하는 Leaky Integrator (LI) 레이어
+        self.li_layer = snn.Leaky(beta=0.9, reset_mechanism="none") 
+        
+        # 공간 축을 쫙 편 크기(64 노드 * 64 차원)를 DP 디코더에 전달
+        self.decoder = DP_SpikingDecoder(in_features=64 * 64, num_classes=4, n_dp=5)
         self.dropout = nn.Dropout(0.5)
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(64 * 32 * 15, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 4)
-        )
 
     def forward(self, L_norm, X_seq):
-        # L_norm: [B, 64, 64], X_seq: [B, 15, 64, 1]
-        mem1 = self.lif1.init_leaky()
-        mem2 = self.lif2.init_leaky()
+        B = X_seq.size(0)
         
-        spk2_rec = []
+        # 모든 뉴런의 막 전위 초기화
+        m1_a, m1_n, m1_m = self.hr_gcn1.init_hidden()
+        m2_a, m2_n, m2_m = self.hr_gcn2.init_hidden()
+        mem_li = self.li_layer.init_leaky()
         
-        # 💡 3. 주행: 고정된 라플라시안 지도(L_norm) 위에서 시간에 따른 에너지 변동(X_current) 주입
+        potentials = []
+        
         for step in range(self.num_steps):
-            X_current = X_seq[:, step] * 10.0 # 강제 스파이크 발화 펌핑
+            x_t = X_seq[:, step] # [B, 64, 1]
+            x_t = self.input_proj(x_t) # [B, 64, 16] (Learnable Encoding)
             
-            cur1 = self.gcn1(L_norm, X_current)
-            spk1, mem1 = self.lif1(cur1, mem1)
+            spk1, m1_a, m1_n, m1_m = self.hr_gcn1(L_norm, x_t, m1_a, m1_n, m1_m)
+            spk2, m2_a, m2_n, m2_m = self.hr_gcn2(L_norm, spk1, m2_a, m2_n, m2_m)
             
-            cur2 = self.gcn2(L_norm, spk1)
-            spk2, mem2 = self.lif2(cur2, mem2)
+            # LI 레이어로 최종 스파이크를 연속적인 전위(Potential)로 누적 변환
+            _, mem_li = self.li_layer(spk2, mem_li)
+            potentials.append(torch.flatten(mem_li, start_dim=1)) # [B, 64*64]
             
-            spk2_rec.append(torch.flatten(spk2, start_dim=1))
-            
-        all_time_features = torch.stack(spk2_rec).transpose(0, 1).contiguous()
-        flat_spatio_temporal = self.dropout(all_time_features.view(all_time_features.size(0), -1))
+        # 모든 타임스텝의 전위 기록 병합: [B, 15, 4096]
+        all_time_potentials = torch.stack(potentials, dim=1) 
+        all_time_potentials = self.dropout(all_time_potentials)
         
-        out = self.classifier(flat_spatio_temporal)
+        # DP-Spiking Decoder로 전위차 기반 분류
+        out = self.decoder(all_time_potentials)
         return out 
 
 # =====================================================================
@@ -234,7 +278,7 @@ global_acc_list = []
 sstl_acc_list = []
 
 print("\n" + "="*50)
-print("🧠 극비 효율화 RG-SNN (1 Graph + 15 Time Chunks) 5-Fold 학습 시작")
+print("🧠 리만 기하학 + HR-SNN (DP Decoder 장착) 5-Fold 학습 시작")
 print("="*50)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -246,12 +290,12 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     if L_train is None: continue
     train_loader = DataLoader(TensorDataset(L_train, X_train, y_train), batch_size=128, shuffle=True)
     
-    net = RiemannianGraphSNN(num_steps=15).to(device)
+    net = RiemannianGraph_HRSNN(num_steps=15).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     
     net.train()
-    for epoch in range(25): 
+    for epoch in range(30): # 복잡해진 모델을 위해 에폭 약간 증가
         for L_batch, X_batch, targets in train_loader:
             L_batch, X_batch, targets = L_batch.to(device), X_batch.to(device), targets.to(device)
             outputs = net(L_batch, X_batch)
@@ -288,13 +332,14 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         subj_fold_accs = []
         
         for sub_train_idx, sub_test_idx in kf_sub.split(L_sub):
-            sstl_net = RiemannianGraphSNN(num_steps=15).to(device)
+            sstl_net = RiemannianGraph_HRSNN(num_steps=15).to(device)
             sstl_net.load_state_dict(global_model_state)
             
+            # Classifier 부분만 파인튜닝 (SSTL 원칙)
             for name, param in sstl_net.named_parameters():
-                if 'classifier' not in name: param.requires_grad = False
+                if 'decoder.classifier' not in name: param.requires_grad = False
                     
-            sstl_optimizer = torch.optim.Adam(sstl_net.classifier.parameters(), lr=5e-4)
+            sstl_optimizer = torch.optim.Adam(sstl_net.decoder.classifier.parameters(), lr=5e-4)
             
             sub_train_loader = DataLoader(TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=32, shuffle=True)
             sub_test_loader = DataLoader(TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=32, shuffle=False)

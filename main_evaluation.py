@@ -152,10 +152,10 @@ def process_and_save_subject_graph(subj):
         return None 
         
     except Exception as e:
-        return f"🚨 {subj} 전처리 에러: {e}"
+        return f"[Error] {subj} Preprocessing failed: {e}"
 
-print(f"🚀 1단계: 캐시된 전처리 데이터 확인 중 (대상 기기: A5000 1 GPU)")
-for subj in tqdm(all_subjects, desc="Data Preprocessing", leave=True):
+print("Step 1: Checking cached preprocessing data (A5000 Single GPU)")
+for subj in tqdm(all_subjects, desc="Preprocessing", leave=True):
     process_and_save_subject_graph(subj)
 
 def load_graph_data(subject_list):
@@ -170,7 +170,7 @@ def load_graph_data(subject_list):
 
 
 # =====================================================================
-# 2. Surrogate Gradient (Fast Sigmoid) & LIF 뉴런
+# 2. Surrogate Gradient & LIF
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -181,7 +181,6 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    # 🔥 기울기 소실 방지: alpha를 5.0으로 키워서 날카롭고 강한 역전파 생성
     alpha = 5.0  
     grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
     return (g * grad,)
@@ -190,7 +189,7 @@ spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
     beta: float = 0.8
-    threshold: float = 1.0  # SNN 정석 임계값
+    threshold: float = 1.0
     
     @nn.compact
     def __call__(self, mem, x):
@@ -201,7 +200,7 @@ class LIF(nn.Module):
 
 
 # =====================================================================
-# 3. 모델 아키텍처: 뉴런 부활 및 1.38 완벽 탈출 구조
+# 3. 모델 아키텍처: 시간의 흐름(ERD/ERS) 보존 완벽 수술
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -209,22 +208,18 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        # 🔥 인공 심박동 부여: 입력단 Bias 초기값을 0.5로 두어 무조건 발화 유도
         enc_in = nn.Dense(8, use_bias=True, bias_init=nn.initializers.constant(0.5))(current_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
-        # 리만 매니폴드 맵핑 & CSP 공간 압축
         gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 4))
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
-        gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) # (B, 32)
+        gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
         
-        # 🔥 음수 표류(Negative Drift) 완벽 차단: use_bias=True 필수
         cur_s = nn.Dense(32, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_flat)
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        # Leaky Integrator (미분 고속도로)
-        cur_out = nn.Dense(32, use_bias=True)(spk_s)
+        cur_out = nn.Dense(16, use_bias=True)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 
         
         new_mems = (mem_enc, mem_s, mem_out)
@@ -237,7 +232,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        # 광역 TCN 
         ann_out = nn.Conv(features=8, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
         ann_out = nn.relu(ann_out) 
         
@@ -249,7 +243,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
 
         mem_enc = jnp.zeros((B, 64, 8))
         mem_s = jnp.zeros((B, 32))
-        mem_out = jnp.zeros((B, 32))
+        mem_out = jnp.zeros((B, 16))
         
         mems = (mem_enc, mem_s, mem_out)
         init_carry = (mems, L_norm)
@@ -261,10 +255,15 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        # EEGNet 정석: Temporal Average Pooling
-        pooled_feat = jnp.mean(mem_out_seq, axis=1) # (B, 32)
+        # 시간 정보 뭉개기 버그 수정: 10개의 구간으로 나누어 시계열 흐름 보존
+        num_chunks = 10
+        chunk_size = T // num_chunks
+        chunks = mem_out_seq.reshape((B, num_chunks, chunk_size, 16))
+        pooled_feat = jnp.mean(chunks, axis=2) # (B, 10, 16)
         
-        y = nn.Dropout(rate=0.5, deterministic=deterministic)(pooled_feat)
+        flat_feat = pooled_feat.reshape((B, -1)) # (B, 160)
+        
+        y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
         
         firing_rate = (jnp.mean(spk_enc) + jnp.mean(spk_s)) / 2.0 
@@ -273,7 +272,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
 
 
 # =====================================================================
-# 4. JAX Single-GPU (jit) 학습 스텝 (🔥 뉴런 자살 페널티 삭제)
+# 4. JAX Single-GPU (jit) 학습 스텝
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -287,19 +286,16 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
             deterministic=False, rngs={'dropout': dropout_key}
         )
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
-        
-        # 🔥 모델이 뇌사 상태를 선택하게 만들던 FR_Loss의 저주 완벽 철거!
-        loss = ce_loss 
-        return loss, (logits, firing_rate, ce_loss, jnp.array(0.0))
+        loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
+        return loss, (logits, firing_rate)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (logits, firing_rate, ce_loss, fr_loss)), grads = grad_fn(state.params)
+    (loss, (logits, firing_rate)), grads = grad_fn(state.params)
     
     state = state.apply_gradients(grads=grads)
     acc = jnp.mean(jnp.argmax(logits, -1) == targets)
     
-    return state, loss, acc, firing_rate, fr_loss
+    return state, loss, acc, firing_rate
     
 @jax.jit
 def eval_step(state, L_batch, X_batch, targets):
@@ -338,12 +334,12 @@ sstl_acc_list = []
 
 rng = jax.random.PRNGKey(42)
 
-print("\n" + "="*55)
-print(f"⚡ JAX Single-GPU (A5000 Optimized): Brain-Death CPR Complete")
-print("="*55)
+print("\n" + "="*50)
+print("JAX Single-GPU Optimized SNN Pipeline")
+print("="*50)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
-    print(f"\n🚀 [Fold {fold + 1}/5] 시작")
+    print(f"\n[Fold {fold + 1}/5] Start")
     global_train_subjs = [all_subjects[i] for i in train_idx]
     global_test_subjs = [all_subjects[i] for i in test_idx]
     
@@ -396,20 +392,16 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
     
     for epoch in range(200): 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False, bar_format='{l_bar}{bar:20}{r_bar}')
         for batch_L, batch_X, batch_y in pbar:
             j_L = jnp.array(batch_L.numpy())
             j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
             j_y = jnp.array(batch_y.numpy())
             
             rng, dropout_key = jax.random.split(rng)
-            state, loss, acc, firing_rate, fr_loss = train_step(state, j_L, j_X, j_y, dropout_key)
+            state, loss, acc, firing_rate = train_step(state, j_L, j_X, j_y, dropout_key)
                 
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}", 
-                'acc': f"{acc.item():.4f}",
-                'FR': f"{firing_rate.item():.3f}"
-            })
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{acc.item():.4f}", 'FR': f"{firing_rate.item():.3f}"})
 
         if (epoch + 1) % 10 == 0:
             unseen_corr, unseen_tot = 0, 0
@@ -423,7 +415,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
                 unseen_tot += j_L.shape[0]
                 
             current_test_acc = 100 * unseen_corr / unseen_tot
-            print(f"⏳ [Epoch {epoch+1:03d}] 실시간 Global Test Acc (Unseen): {current_test_acc:.2f}%")
+            print(f"[Epoch {epoch+1:03d}] Global Test Acc: {current_test_acc:.2f}%")
 
     unseen_corr, unseen_tot = 0, 0
     for batch_L, batch_X, batch_y in unseen_loader:
@@ -437,13 +429,13 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             
     true_global_acc = 100 * unseen_corr / unseen_tot
     global_acc_list.append(true_global_acc)
-    print(f"🔥 Fold {fold + 1} 최종 Global Test Acc (p0): {true_global_acc:.2f}%")
+    print(f"Fold {fold + 1} Final Global Test Acc: {true_global_acc:.2f}%")
     
     global_params_backup = state.params
     fold_sstl_accs = []
     
-    print(f"🎯 Fold {fold + 1} SSTL 진행 중...")
-    for subj in tqdm(global_test_subjs, desc="SSTL", leave=False):
+    print(f"Fold {fold + 1} SSTL Transfer Learning...")
+    for subj in tqdm(global_test_subjs, desc="SSTL", leave=False, bar_format='{l_bar}{bar:20}{r_bar}'):
         L_sub, X_sub, y_sub = load_graph_data([subj])
         if X_sub is None: continue
         
@@ -492,9 +484,9 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         
     avg_sstl_fold = np.mean(fold_sstl_accs)
     sstl_acc_list.append(avg_sstl_fold)
-    print(f"🎯 Fold {fold + 1} SSTL 평균 정확도 (ps): {avg_sstl_fold:.2f}%")
+    print(f"Fold {fold + 1} SSTL Mean Acc: {avg_sstl_fold:.2f}%")
 
 print("\n" + "="*50)
-print(f"🏆 5-Fold 최종 평균 Global Test Acc (p0): {np.mean(global_acc_list):.2f}%")
-print(f"🏆 5-Fold 최종 평균 SSTL Acc (ps): {np.mean(sstl_acc_list):.2f}%")
+print(f"5-Fold Final Global Test Acc: {np.mean(global_acc_list):.2f}%")
+print(f"5-Fold Final SSTL Acc: {np.mean(sstl_acc_list):.2f}%")
 print("="*50)

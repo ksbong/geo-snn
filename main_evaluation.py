@@ -18,11 +18,11 @@ import optax
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-# 🔥 A5000(Ampere) 극한 최적화: TF32 가속 온! (행렬 곱셈 속도 2~3배 폭발)
+# 🔥 A5000(Ampere) 극한 최적화: TF32 가속 온!
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =====================================================================
-# 1. 생물학적 4채널 인코딩 (아날로그 특징 추출)
+# 1. 생물학적 4채널 인코딩 
 # =====================================================================
 def extract_snn_encoded_features(data, sfreq):
     n_times = data.shape[-1]
@@ -50,10 +50,9 @@ def compute_spd_cov(signal):
     return cov + np.eye(cov.shape[0]) * epsilon
 
 # =====================================================================
-# 2. 다수 피험자 데이터 로딩 (RunPod 최적화)
+# 2. 다수 피험자 데이터 로딩 (캐싱 작동 확인)
 # =====================================================================
 def load_all_graph_data():
-    # RunPod 보통 /workspace 를 기본으로 씀. 알아서 찾게 세팅.
     base_search_dir = '/workspace' if os.path.exists('/workspace') else '.'
     DATA_DIR = None
 
@@ -64,7 +63,7 @@ def load_all_graph_data():
             break
 
     if DATA_DIR is None:
-        raise FileNotFoundError("❌ 데이터셋 경로를 찾을 수 없어. RunPod에 데이터 압축 제대로 풀었는지 확인해.")
+        raise FileNotFoundError("❌ 데이터셋 경로를 찾을 수 없어.")
 
     exclude_subjects = ['S088', 'S092', 'S100', 'S104']
     all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
@@ -178,7 +177,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 4. 네 오리지널 모델 아키텍처 (100% 복원)
+# 4. 네 오리지널 모델 아키텍처 (에러 수정 완료)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -204,7 +203,9 @@ class SNNStep(nn.Module):
         cur_out = nn.Dense(32)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 
         
-        return (mem_enc, mem_s, mem_out), (mem_out, spk_enc, spk_s)
+        # [수정] 들어온 carry 구조(mems, L_norm)와 완벽하게 동일한 구조로 반환!
+        new_mems = (mem_enc, mem_s, mem_out)
+        return (new_mems, L_norm), (mem_out, spk_enc, spk_s)
 
 class Ultimate_STCN_GraphSNN(nn.Module):
     num_classes: int = 4
@@ -274,8 +275,9 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
     (loss, logits), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
     return state, loss, jnp.mean(jnp.argmax(logits, -1) == targets)
+
 # =====================================================================
-# 6. 메인 실행 파이프라인 (A5000 극한 병렬화 + Best Model + SSTL)
+# 6. 메인 실행 파이프라인 (A5000 병렬화 + Best Model + SSTL)
 # =====================================================================
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
 global_acc_list, sstl_acc_list = [], []
@@ -289,7 +291,6 @@ print("="*50)
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(valid_subjects)):
     print(f"\n[Fold {fold + 1}/5] Start")
     
-    # [핵심 수정] 여기서 변수를 명확히 선언해야 밑에 SSTL에서 쓸 수 있음
     global_train_subjs = [valid_subjects[i] for i in train_idx]
     global_test_subjs = [valid_subjects[i] for i in test_idx]
     
@@ -297,7 +298,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(valid_subjects)):
     L_unseen, X_unseen, y_unseen = get_combined_data(global_test_subjs)
     if X_train is None: continue
     
-    # 🔥 GPU Feeding 병목 제거: 핀 메모리 + 다중 워커 + 프리패치
     train_loader = DataLoader(
         TensorDataset(L_train, X_train, y_train), 
         batch_size=128, shuffle=True, drop_last=True,
@@ -326,140 +326,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(valid_subjects)):
     # 1. Global Training (150 Epochs)
     for epoch in range(1, 151): 
         for batch_L, batch_X, batch_y in train_loader:
-            # 🔥 jax.device_put으로 GPU 다이렉트 전송 (비동기 통신 가속)
-            j_L = jax.device_put(jnp.array(batch_L.numpy()))
-            j_X = jax.device_put(jnp.array(batch_X.numpy()))
-            j_y = jax.device_put(jnp.array(batch_y.numpy()))
-            
-            rng, dropout_key = jax.random.split(rng)
-            state, loss, acc, firing_rate = train_step(state, j_L, j_X, j_y, dropout_key)
-
-        if epoch % 5 == 0:
-            unseen_corr, unseen_tot = 0, 0
-            for batch_L, batch_X, batch_y in unseen_loader:
-                j_L = jax.device_put(jnp.array(batch_L.numpy()))
-                j_X = jax.device_put(jnp.array(batch_X.numpy()))
-                j_y = jax.device_put(jnp.array(batch_y.numpy()))
-                
-                batch_acc = eval_step(state, j_L, j_X, j_y)
-                unseen_corr += batch_acc.item() * len(j_y)
-                unseen_tot += len(j_y)
-                
-            current_test_acc = 100 * unseen_corr / unseen_tot
-            
-            if current_test_acc > best_test_acc:
-                best_test_acc = current_test_acc
-                best_params = state.params
-                print(f"[Epoch {epoch:03d}] ⭐ 최고 기록! Global Test Acc: {current_test_acc:.2f}% | FR: {firing_rate.item():.3f}")
-            else:
-                print(f"[Epoch {epoch:03d}] Global Test Acc: {current_test_acc:.2f}% | FR: {firing_rate.item():.3f}")
-    
-    global_acc_list.append(best_test_acc)
-    print(f"Fold {fold + 1} Final Global Test Acc (Best Checkpoint): {best_test_acc:.2f}%")
-    
-    # 2. SSTL Transfer Learning (20 Epochs)
-    print(f"Fold {fold + 1} SSTL Transfer Learning (20 Epochs)...")
-    fold_sstl_accs = []
-    
-    for subj in tqdm(global_test_subjs, desc="SSTL", leave=False):
-        L_sub, X_sub, y_sub = subject_data_dict[subj]['L'], subject_data_dict[subj]['X'], subject_data_dict[subj]['y']
-        subj_fold_accs = []
-        
-        for sub_train_idx, sub_test_idx in KFold(n_splits=4, shuffle=True, random_state=42).split(X_sub):
-            sstl_tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=5e-4, weight_decay=1e-4))
-            sstl_state = train_state.TrainState.create(apply_fn=model.apply, params=best_params, tx=sstl_tx)
-            
-            sub_train_loader = DataLoader(
-                TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), 
-                batch_size=16, shuffle=True, drop_last=True, num_workers=4, pin_memory=True
-            )
-            sub_test_loader = DataLoader(
-                TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), 
-                batch_size=16, shuffle=False, drop_last=False, num_workers=4, pin_memory=True
-            )
-            
-            for _ in range(20): 
-                for batch_L, batch_X, batch_y in sub_train_loader:
-                    j_L = jax.device_put(jnp.array(batch_L.numpy()))
-                    j_X = jax.device_put(jnp.array(batch_X.numpy()))
-                    j_y = jax.device_put(jnp.array(batch_y.numpy()))
-                    
-                    rng, dropout_key = jax.random.split(rng)
-                    sstl_state, loss, acc = sstl_train_step(sstl_state, j_L, j_X, j_y, dropout_key)
-                    
-            corr, tot = 0, 0
-            for batch_L, batch_X, batch_y in sub_test_loader:
-                j_L = jax.device_put(jnp.array(batch_L.numpy()))
-                j_X = jax.device_put(jnp.array(batch_X.numpy()))
-                j_y = jax.device_put(jnp.array(batch_y.numpy()))
-                
-                batch_acc = eval_step(sstl_state, j_L, j_X, j_y)
-                corr += batch_acc.item() * len(j_y)
-                tot += len(j_y)
-            subj_fold_accs.append(100 * corr / tot)
-            
-        fold_sstl_accs.append(np.mean(subj_fold_accs))
-        
-    avg_sstl_fold = np.mean(fold_sstl_accs)
-    sstl_acc_list.append(avg_sstl_fold)
-    print(f"Fold {fold + 1} SSTL Mean Acc: {avg_sstl_fold:.2f}%")
-
-print("\n" + "="*50)
-print(f"5-Fold Final Global Test Acc (Best Checkpoint): {np.mean(global_acc_list):.2f}%")
-print(f"5-Fold Final SSTL Acc: {np.mean(sstl_acc_list):.2f}%")
-print("="*50)# =====================================================================
-# 6. 메인 실행 파이프라인 (A5000 극한 병렬화 + Best Model + SSTL)
-# =====================================================================
-kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
-global_acc_list, sstl_acc_list = [], []
-
-rng = jax.random.PRNGKey(42)
-
-print("\n" + "="*50)
-print("🚀 A5000 풀 파워 가동: JAX 순정 SNN 파이프라인 시작 🚀")
-print("="*50)
-
-for fold, (train_idx, test_idx) in enumerate(kf_global.split(valid_subjects)):
-    print(f"\n[Fold {fold + 1}/5] Start")
-    
-    # [핵심 수정] 여기서 변수를 명확히 선언해야 밑에 SSTL에서 쓸 수 있음
-    global_train_subjs = [valid_subjects[i] for i in train_idx]
-    global_test_subjs = [valid_subjects[i] for i in test_idx]
-    
-    L_train, X_train, y_train = get_combined_data(global_train_subjs)
-    L_unseen, X_unseen, y_unseen = get_combined_data(global_test_subjs)
-    if X_train is None: continue
-    
-    # 🔥 GPU Feeding 병목 제거: 핀 메모리 + 다중 워커 + 프리패치
-    train_loader = DataLoader(
-        TensorDataset(L_train, X_train, y_train), 
-        batch_size=128, shuffle=True, drop_last=True,
-        num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True
-    )
-    unseen_loader = DataLoader(
-        TensorDataset(L_unseen, X_unseen, y_unseen), 
-        batch_size=128, shuffle=False, drop_last=False,
-        num_workers=8, pin_memory=True, persistent_workers=True
-    )
-    
-    rng, init_rng, dropout_rng = jax.random.split(rng, 3)
-    dummy_L = jnp.ones((1, 64, 64))
-    dummy_X = jnp.ones((1, 480, 64, 4))
-    
-    model = Ultimate_STCN_GraphSNN()
-    variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
-    
-    lr_schedule = optax.warmup_cosine_decay_schedule(init_value=1e-4, peak_value=2e-3, warmup_steps=100, decay_steps=len(train_loader)*150)
-    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=lr_schedule, weight_decay=1e-4))
-    state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
-    
-    best_test_acc = 0.0
-    best_params = state.params 
-    
-    # 1. Global Training (150 Epochs)
-    for epoch in range(1, 151): 
-        for batch_L, batch_X, batch_y in train_loader:
-            # 🔥 jax.device_put으로 GPU 다이렉트 전송 (비동기 통신 가속)
             j_L = jax.device_put(jnp.array(batch_L.numpy()))
             j_X = jax.device_put(jnp.array(batch_X.numpy()))
             j_y = jax.device_put(jnp.array(batch_y.numpy()))

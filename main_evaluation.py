@@ -164,7 +164,7 @@ def load_graph_data(subject_list):
     return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
 # =====================================================================
-# 2. Surrogate Gradient & LIF (Learnable Threshold 적용)
+# 2. Surrogate Gradient (Fast Sigmoid) & LIF 
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -175,37 +175,27 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    h, s, sigma = 0.15, 6.0, 0.5
-    
-    def gaussian(u, mu, std):
-        return jnp.exp(-0.5 * jnp.square((u - mu) / std)) / (std * jnp.sqrt(2 * jnp.pi))
-        
-    term1 = (1.0 + h) * gaussian(x, 0.0, sigma)
-    term2 = h * gaussian(x, s * sigma, s * sigma)
-    term3 = h * gaussian(x, -s * sigma, s * sigma)
-    grad = term1 - term2 - term3
-    
+    # [핵심 수정] 무한대 꼬리를 가져 죽은 뉴런도 살려내는 Fast Sigmoid로 교체
+    alpha = 2.0
+    grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
     return (g * grad,)
 
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
     beta: float = 0.8  
-    init_threshold: float = 0.1  # 시작점일 뿐, 모델이 데이터를 보고 최적화함
+    # [핵심 수정] 임계값은 정석대로 1.0 고정. 가중치와 LayerNorm이 스케일을 맞춤.
+    threshold: float = 1.0 
     
     @nn.compact
     def __call__(self, mem, x):
-        # [핵심 수정] 임계값 자체를 신경망의 파라미터로 등록하여 알아서 스케일에 맞게 학습하도록 함
-        th = self.param('threshold', nn.initializers.constant(self.init_threshold), (1,))
-        th = jnp.abs(th) + 1e-3  # 임계값이 0 이하로 떨어지는 현상 방지
-        
         mem = mem * self.beta + x
-        spk = spike_fn(mem - th) 
-        mem = mem - jax.lax.stop_gradient(spk) * th 
+        spk = spike_fn(mem - self.threshold) 
+        mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 ( Laplacian 해결 & Bias 포함 )
+# 3. 모델 아키텍처 
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -214,6 +204,8 @@ class SNNStep(nn.Module):
         mem_enc, mem_s, mem_out = mems
         
         enc_in = nn.Dense(32, use_bias=True)(current_in)
+        # [핵심 수정] 평균이 0이 되어 막전위가 음수로 빠지는 걸 막기 위해 양수 편향(0.1) 추가
+        enc_in = nn.LayerNorm(bias_init=nn.initializers.constant(0.1))(enc_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
         adj_matrix = jnp.eye(64) - L_norm
@@ -223,6 +215,7 @@ class SNNStep(nn.Module):
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         
         cur_s = nn.Dense(64, use_bias=True)(gx_pooled)
+        cur_s = nn.LayerNorm(bias_init=nn.initializers.constant(0.1))(cur_s)
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
         cur_out = nn.Dense(32, use_bias=True)(spk_s)
@@ -278,7 +271,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         return logits, firing_rate
 
 # =====================================================================
-# 4. JAX 학습 스텝 ( Range Penalty 도입 )
+# 4. JAX 학습 스텝 ( FR 페널티 완전 삭제 )
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -292,13 +285,11 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
             deterministic=False, rngs={'dropout': dropout_key}
         )
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        fr_penalty = jnp.maximum(0.0, firing_rate - 0.20) + jnp.maximum(0.0, 0.05 - firing_rate)
-        fr_loss = fr_penalty * 0.5 
+        # [핵심 수정] 식물인간을 유발하던 FR Penalty 완전 삭제. 오직 분류만 집중하게 만듦.
+        loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        total_loss = ce_loss + fr_loss
-        return total_loss, (logits, firing_rate)
+        return loss, (logits, firing_rate)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, (logits, firing_rate)), grads = grad_fn(state.params)
@@ -325,13 +316,8 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
             deterministic=False, rngs={'dropout': dropout_key}
         )
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
-        
-        fr_penalty = jnp.maximum(0.0, firing_rate - 0.20) + jnp.maximum(0.0, 0.05 - firing_rate)
-        fr_loss = fr_penalty * 0.5 
-        
-        total_loss = ce_loss + fr_loss
-        return total_loss, logits 
+        loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
+        return loss, logits 
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, logits), grads = grad_fn(state.params)
@@ -386,7 +372,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     dummy_L = jnp.ones((1, 64, 64))
     dummy_X = jnp.ones((1, 480, 64, 4))
     
-    # 더 이상 쓰레기같은 동적 임계값 주입 안 함. 모델이 알아서 학습함.
     model = Ultimate_STCN_GraphSNN()
     variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
     

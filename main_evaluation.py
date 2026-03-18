@@ -182,7 +182,7 @@ def spike_bwd(res, g):
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    # [수정] 0.9에서 0.85로 낮춰서 스파이크 난사 억제
+    # 막전위 유지율 0.85로 밸런스 패치
     beta: float = 0.85  
     threshold: float = 1.0
     
@@ -194,7 +194,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처
+# 3. 모델 아키텍처 (공간 정보 및 시간 맥락 보존)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -208,14 +208,17 @@ class SNNStep(nn.Module):
         
         gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
-        gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
         
-        cur_s = nn.Dense(128, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_flat)
+        # [수정] Flatten 제거. 공간(16) 차원 유지 -> (B, 16, 32)
+        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
+        
+        # [수정] 공간 노드별 독립적 연산 -> (B, 16, 64)
+        cur_s = nn.Dense(64, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_pooled)
         cur_s = nn.LayerNorm()(cur_s) 
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        cur_out = nn.Dense(64, use_bias=True)(spk_s)
+        # [수정] 출력부도 공간 차원 유지 -> (B, 16, 32)
+        cur_out = nn.Dense(32, use_bias=True)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 
         
         new_mems = (mem_enc, mem_s, mem_out)
@@ -237,9 +240,10 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
+        # [수정] SNNStep 구조 변경에 맞춰 mems 차원 조정
         mem_enc = jnp.zeros((B, 64, 32))
-        mem_s = jnp.zeros((B, 128))
-        mem_out = jnp.zeros((B, 64))
+        mem_s = jnp.zeros((B, 16, 64))
+        mem_out = jnp.zeros((B, 16, 32))
         
         mems = (mem_enc, mem_s, mem_out)
         init_carry = (mems, L_norm)
@@ -251,9 +255,18 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        flat_feat = jnp.mean(mem_out_seq, axis=1) 
+        # [수정] 전체 뭉개기 금지. 6개의 시간적 청크로 분할하여 맥락 살리기
+        num_chunks = 6
+        chunk_size = T // num_chunks
         
-        y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
+        chunks = mem_out_seq[:, :num_chunks*chunk_size, :, :]
+        chunks = chunks.reshape((B, num_chunks, chunk_size, 16, 32))
+        
+        chunked_feat = jnp.mean(chunks, axis=2) # (B, 6, 16, 32)
+        flat_feat = chunked_feat.reshape((B, -1)) 
+        
+        # [수정] 과적합 방지를 위해 Dropout 강화 (0.5 -> 0.6)
+        y = nn.Dropout(rate=0.6, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
         
         firing_rate = (jnp.mean(spk_enc) + jnp.mean(spk_s)) / 2.0 
@@ -277,7 +290,6 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        # [수정] 난사와 기절의 타협점 0.2
         target_fr = 0.1 
         fr_loss = jnp.square(firing_rate - target_fr) * 0.2
         
@@ -311,7 +323,6 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        # [수정] SSTL도 동일하게 0.2
         target_fr = 0.1 
         fr_loss = jnp.square(firing_rate - target_fr) * 0.2
         

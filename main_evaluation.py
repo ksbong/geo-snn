@@ -373,9 +373,8 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
     acc = jnp.mean(jnp.argmax(logits, -1) == targets)
     return state, loss, acc
 
-
 # =====================================================================
-# 5. 메인 실행 파이프라인
+# 5. 메인 실행 파이프라인 (차원 에러 픽스 완)
 # =====================================================================
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
 global_acc_list = []
@@ -425,17 +424,16 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         optax.adamw(learning_rate=lr_schedule, weight_decay=1e-5) 
     )
     
-    # 단일 GPU이므로 state.replicate 불필요
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
     
     for epoch in range(200): 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False)
         for batch_L, batch_X, batch_y in pbar:
             j_L = jnp.array(batch_L.numpy())
-            j_X = jnp.array(batch_X.numpy()) 
+            # 🔥 해결: 480스텝을 240으로 다운샘플링하는 슬라이싱 복구
+            j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
             j_y = jnp.array(batch_y.numpy())
             
-            # 단일 GPU 최적화: RNG split 간소화
             rng, dropout_key = jax.random.split(rng)
             
             state, loss, acc, firing_rate, fr_loss = train_step(state, j_L, j_X, j_y, dropout_key)
@@ -450,7 +448,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             unseen_corr, unseen_tot = 0, 0
             for batch_L, batch_X, batch_y in unseen_loader:
                 j_L = jnp.array(batch_L.numpy())
-                j_X = jnp.array(batch_X.numpy())
+                # 🔥 해결: 실시간 평가에도 슬라이싱 적용
+                j_X = jnp.array(batch_X.numpy()[:, ::2, :, :])
                 j_y = jnp.array(batch_y.numpy())
                 
                 batch_acc = eval_step(state, j_L, j_X, j_y)
@@ -464,7 +463,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     unseen_corr, unseen_tot = 0, 0
     for batch_L, batch_X, batch_y in unseen_loader:
         j_L = jnp.array(batch_L.numpy())
-        j_X = jnp.array(batch_X.numpy())
+        # 🔥 해결: 최종 평가에도 슬라이싱 적용
+        j_X = jnp.array(batch_X.numpy()[:, ::2, :, :])
         j_y = jnp.array(batch_y.numpy())
         
         batch_acc = eval_step(state, j_L, j_X, j_y)
@@ -476,7 +476,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     global_acc_list.append(true_global_acc)
     print(f"🔥 Fold {fold + 1} 최종 Global Test Acc (p0): {true_global_acc:.2f}%")
     
-    # 단일 GPU이므로 state.unreplicate 불필요
     global_params_backup = state.params
     fold_sstl_accs = []
     
@@ -501,7 +500,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             for _ in range(5): 
                 for batch_L, batch_X, batch_y in sub_train_loader:
                     j_L = jnp.array(batch_L.numpy())
-                    j_X = jnp.array(batch_X.numpy()) 
+                    # 🔥 해결: SSTL 학습에도 슬라이싱 적용
+                    j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
                     j_y = jnp.array(batch_y.numpy())
                     
                     rng, dropout_key = jax.random.split(rng)
@@ -510,7 +510,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             corr, tot = 0, 0
             for batch_L, batch_X, batch_y in sub_test_loader:
                 j_L = jnp.array(batch_L.numpy())
-                j_X = jnp.array(batch_X.numpy()) 
+                # 🔥 해결: SSTL 평가에도 슬라이싱 적용
+                j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
                 j_y = jnp.array(batch_y.numpy())
                 
                 batch_acc = eval_step(sstl_state, j_L, j_X, j_y)

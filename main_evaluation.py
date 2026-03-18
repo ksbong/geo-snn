@@ -49,7 +49,7 @@ def compute_spd_cov(signal):
     return cov + np.eye(cov.shape[0]) * epsilon
 
 # RunPod 환경에 맞게 경로 확인 필수
-DATA_DIR = '/workspace/full-physionet/07_Data'
+DATA_DIR = './07_Data'
 if not os.path.exists(DATA_DIR):
     DATA_DIR = './07_Data' # 현재 디렉토리에 데이터가 있을 경우
 

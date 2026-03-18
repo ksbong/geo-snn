@@ -262,16 +262,32 @@ class SNNStep(nn.Module):
         new_mems = (mem_enc, mem_s, mem_out)
         return (new_mems, L_norm), (mem_out, spk_enc, spk_s)
 
-
 class Ultimate_STCN_GraphSNN(nn.Module):
     num_classes: int = 4
 
     @nn.compact
     def __call__(self, L_norm, X_seq, deterministic: bool):
-        B = X_seq.shape[0]
+        B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=16, kernel_size=(16, 1), strides=(4, 1), padding='SAME')(X_seq)
-        ann_out = nn.relu(ann_out) 
+        # 🚨 [EEGNet 철학 적용 1] 훈련 중에만 데이터에 가우시안 노이즈 강제 주입
+        if not deterministic:
+            noise_rng = self.make_rng('dropout') # JAX rng 재사용
+            # 신호의 10% 수준의 노이즈를 섞어서 피험자 고유 패턴 암기 방해
+            noise = jax.random.normal(noise_rng, X_seq.shape) * 0.1 
+            X_seq = X_seq + noise
+            
+            # 🚨 [EEGNet 철학 적용 2] Spatial Dropout (채널 자체를 랜덤하게 블랙아웃)
+            # 채널 64개 중 20%를 아예 꺼버려서 특정 채널 과의존 방지
+            drop_rng = self.make_rng('dropout')
+            channel_mask = jax.random.bernoulli(drop_rng, p=0.8, shape=(B, 1, C, 1))
+            X_seq = X_seq * channel_mask / 0.8
+            
+        # 이후 네 원래 Laplacian 필터링 및 Conv 로직 그대로 진행
+        gx_lap = jnp.einsum('bnm, btmf -> btnf', L_norm, X_seq)
+        X_seq_filtered = X_seq - 0.5 * gx_lap
+        
+        ann_out = nn.Conv(features=16, kernel_size=(16, 1), strides=(4, 1), padding='SAME')(X_seq_filtered)
+        ann_out = nn.relu(ann_out)
         
         if not deterministic:
             ann_out = nn.Dropout(rate=0.3, deterministic=deterministic)(ann_out)

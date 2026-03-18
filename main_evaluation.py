@@ -19,7 +19,7 @@ import optax
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =====================================================================
-# 1. 생물학적 4채널 인코딩 & 전처리 (캐시 유지)
+# 1. 생물학적 4채널 인코딩 & 전처리 
 # =====================================================================
 def extract_snn_encoded_features(data, sfreq):
     n_times = data.shape[-1]
@@ -182,9 +182,9 @@ def spike_bwd(res, g):
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    # 막전위 유지율 0.85로 밸런스 패치
     beta: float = 0.85  
-    threshold: float = 1.0
+    # [수정] 스파이크 문턱값을 1.0에서 0.5로 대폭 낮춤
+    threshold: float = 0.5 
     
     @nn.compact
     def __call__(self, mem, x):
@@ -194,7 +194,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 (공간 정보 및 시간 맥락 보존)
+# 3. 모델 아키텍처 (LayerNorm 제거, Graph Residual 추가)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -202,22 +202,21 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
+        # [수정] LayerNorm 완전 삭제. bias를 온전히 살려서 입력
         enc_in = nn.Dense(32, use_bias=True, bias_init=nn.initializers.constant(0.5))(current_in)
-        enc_in = nn.LayerNorm()(enc_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
-        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
+        # [수정] Graph Laplacian을 뺄셈으로 섞어서 공간 로우패스 필터 효과 (Residual)
+        gx_lap = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
+        gx_res = spk_enc - 0.5 * gx_lap 
+        
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
+        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx_res, spatial_w) 
         
-        # [수정] Flatten 제거. 공간(16) 차원 유지 -> (B, 16, 32)
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
-        
-        # [수정] 공간 노드별 독립적 연산 -> (B, 16, 64)
         cur_s = nn.Dense(64, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_pooled)
-        cur_s = nn.LayerNorm()(cur_s) 
+        # [수정] LayerNorm 삭제
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        # [수정] 출력부도 공간 차원 유지 -> (B, 16, 32)
         cur_out = nn.Dense(32, use_bias=True)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 
         
@@ -240,7 +239,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
-        # [수정] SNNStep 구조 변경에 맞춰 mems 차원 조정
         mem_enc = jnp.zeros((B, 64, 32))
         mem_s = jnp.zeros((B, 16, 64))
         mem_out = jnp.zeros((B, 16, 32))
@@ -255,18 +253,17 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        # [수정] 전체 뭉개기 금지. 6개의 시간적 청크로 분할하여 맥락 살리기
         num_chunks = 6
         chunk_size = T // num_chunks
         
         chunks = mem_out_seq[:, :num_chunks*chunk_size, :, :]
         chunks = chunks.reshape((B, num_chunks, chunk_size, 16, 32))
         
-        chunked_feat = jnp.mean(chunks, axis=2) # (B, 6, 16, 32)
+        chunked_feat = jnp.mean(chunks, axis=2) 
         flat_feat = chunked_feat.reshape((B, -1)) 
         
-        # [수정] 과적합 방지를 위해 Dropout 강화 (0.5 -> 0.6)
-        y = nn.Dropout(rate=0.6, deterministic=deterministic)(flat_feat)
+        # [수정] 0.6은 너무 가혹해서 0.4로 완화
+        y = nn.Dropout(rate=0.4, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
         
         firing_rate = (jnp.mean(spk_enc) + jnp.mean(spk_s)) / 2.0 

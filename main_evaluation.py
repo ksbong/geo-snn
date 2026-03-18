@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax.training import train_state
 import optax
+import flax.traverse_util
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -164,7 +165,7 @@ def load_graph_data(subject_list):
     return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
 # =====================================================================
-# 2. Surrogate Gradient (Fast Sigmoid) & LIF 구조 수정
+# 2. Surrogate Gradient (Fast Sigmoid) & LIF 구조
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -193,7 +194,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 (LayerNorm 제거 & 공간적 피처 축소)
+# 3. 모델 아키텍처 
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -201,7 +202,6 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s1, mem_s2, mem_s3, mem_out = mems
         
-        # [핵심 수술 1] 뉴런을 질식시키던 LayerNorm 싹 다 제거!
         enc_in = nn.Dense(32)(current_in)
         mem_enc, spk_enc = LIF(beta=0.8, threshold=1.0)(mem_enc, enc_in)
         
@@ -235,7 +235,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        # [핵심 수술 2] BPTT 기울기 소실 방지. strides=(4, 1)로 480스텝을 120스텝으로 압축
         ann_out = nn.Conv(features=32, kernel_size=(32, 1), strides=(4, 1), padding='SAME')(X_seq)
         ann_out = nn.relu(ann_out) 
         
@@ -261,23 +260,19 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        # 압축된 120 스텝에 맞춘 DP Pooling
         L_DP = 12
         N_DP = 6
-        num_chunks = 120 // L_DP # 10 chunks
+        num_chunks = 120 // L_DP 
         
         reshaped = mem_out_seq.reshape((B, num_chunks, L_DP, 16, 32))
         
         start_avg = jnp.mean(reshaped[:, :, :N_DP, :, :], axis=2)
         end_avg = jnp.mean(reshaped[:, :, L_DP-N_DP:, :, :], axis=2)
-        dp_feat = end_avg - start_avg # (B, 10, 16, 32)
+        dp_feat = end_avg - start_avg 
         
-        # [핵심 수술 3] 과적합을 막기 위해 16개의 공간 노드를 평균 내어 피처 크기 축소 (10240 -> 320 차원)
-        dp_feat_pooled = jnp.mean(dp_feat, axis=2) # (B, 10, 32)
+        dp_feat_pooled = jnp.mean(dp_feat, axis=2) 
         
-        flat_feat = dp_feat_pooled.reshape((B, -1)) # (B, 320)
-        
-        # 시계열 루프 밖에서는 LayerNorm 사용이 안전하고 유용함
+        flat_feat = dp_feat_pooled.reshape((B, -1)) 
         flat_feat = nn.LayerNorm()(flat_feat) 
         
         y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
@@ -294,69 +289,20 @@ def smooth_labels(labels, num_classes, smoothing=0.2):
     one_hot = jax.nn.one_hot(labels, num_classes)
     return one_hot * (1.0 - smoothing) + (smoothing / num_classes)
 
-@jax.jit
-def train_step(state, L_batch, X_batch, targets, dropout_key):
-    def loss_fn(params):
-        logits, firing_rate = state.apply_fn(
-            {'params': params}, L_batch, X_batch, 
-            deterministic=False, rngs={'dropout': dropout_key}
-        )
-        smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
-        return loss, (logits, firing_rate)
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (logits, firing_rate)), grads = grad_fn(state.params)
-    
-    state = state.apply_gradients(grads=grads)
-    acc = jnp.mean(jnp.argmax(logits, -1) == targets)
-    
-    return state, loss, acc, firing_rate
-    
-@jax.jit
-def eval_step(state, L_batch, X_batch, targets):
-    logits, firing_rate = state.apply_fn(
-        {'params': state.params}, L_batch, X_batch, 
-        deterministic=True
-    )
-    acc = jnp.mean(jnp.argmax(logits, -1) == targets)
-    return acc
-
-@jax.jit
-def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
-    def loss_fn(params):
-        logits, firing_rate = state.apply_fn(
-            {'params': params}, L_batch, X_batch, 
-            deterministic=False, rngs={'dropout': dropout_key}
-        )
-        smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
-        return loss, logits 
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
-    
-    state = state.apply_gradients(grads=grads)
-    acc = jnp.mean(jnp.argmax(logits, -1) == targets)
-    return state, loss, acc
-
 # =====================================================================
-# 5. 메인 실행 파이프라인
+# 5. 메인 실행 파이프라인 (디버깅 특화)
 # =====================================================================
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
-global_acc_list = []
-sstl_acc_list = []
 
 rng = jax.random.PRNGKey(42)
 
 print("\n" + "="*50)
-print("JAX Single-GPU Optimized SNN Pipeline")
+print("JAX Single-GPU Optimized SNN Pipeline - DEBUG MODE")
 print("="*50)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     print(f"\n[Fold {fold + 1}/5] Start")
     global_train_subjs = [all_subjects[i] for i in train_idx]
-    global_test_subjs = [all_subjects[i] for i in test_idx]
     
     L_train, X_train, y_train = load_graph_data(global_train_subjs)
     if X_train is None: continue
@@ -371,17 +317,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         persistent_workers=True 
     )
     
-    L_unseen, X_unseen, y_unseen = load_graph_data(global_test_subjs)
-    unseen_loader = DataLoader(
-        TensorDataset(L_unseen, X_unseen, y_unseen), 
-        batch_size=128, 
-        shuffle=False, 
-        drop_last=True,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True
-    )
-    
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy_L = jnp.ones((1, 64, 64))
     dummy_X = jnp.ones((1, 480, 64, 4))
@@ -389,119 +324,58 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     model = Ultimate_STCN_GraphSNN()
     variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
     
-    total_train_steps = len(train_loader) * 200
-    warmup_steps = len(train_loader) * 10 
-    
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-4, 
-        peak_value=2e-3, 
-        warmup_steps=warmup_steps, 
-        decay_steps=total_train_steps
-    )
-    
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=lr_schedule, weight_decay=1e-4) 
+        optax.adamw(learning_rate=1e-3, weight_decay=1e-4) 
     )
     
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
     
-    for epoch in range(200): 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False, bar_format='{l_bar}{bar:20}{r_bar}')
-        for batch_L, batch_X, batch_y in pbar:
-            j_L = jnp.array(batch_L.numpy())
-            j_X = jnp.array(batch_X.numpy()) 
-            j_y = jnp.array(batch_y.numpy())
-            
-            rng, dropout_key = jax.random.split(rng)
-            state, loss, acc, firing_rate = train_step(state, j_L, j_X, j_y, dropout_key)
-                
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{acc.item():.4f}", 'FR': f"{firing_rate.item():.3f}"})
+    # ---------------------------------------------------------
+    # 🚨 HARDCORE TENSOR DEBUGGING 🚨
+    # ---------------------------------------------------------
+    print("\n" + "="*50)
+    print("🚨 HARDCORE TENSOR DEBUGGING 🚨")
+    print("="*50)
 
-        if (epoch + 1) % 10 == 0:
-            unseen_corr, unseen_tot = 0, 0
-            for batch_L, batch_X, batch_y in unseen_loader:
-                j_L = jnp.array(batch_L.numpy())
-                j_X = jnp.array(batch_X.numpy())
-                j_y = jnp.array(batch_y.numpy())
-                
-                batch_acc = eval_step(state, j_L, j_X, j_y)
-                unseen_corr += batch_acc.item() * j_L.shape[0]
-                unseen_tot += j_L.shape[0]
-                
-            current_test_acc = 100 * unseen_corr / unseen_tot
-            print(f"[Epoch {epoch+1:03d}] Global Test Acc: {current_test_acc:.2f}%")
-    
-    unseen_corr, unseen_tot = 0, 0
-    for batch_L, batch_X, batch_y in unseen_loader:
-        j_L = jnp.array(batch_L.numpy())
-        j_X = jnp.array(batch_X.numpy())
-        j_y = jnp.array(batch_y.numpy())
-        
-        batch_acc = eval_step(state, j_L, j_X, j_y)
-        unseen_corr += batch_acc.item() * j_L.shape[0]
-        unseen_tot += j_L.shape[0]
-            
-    true_global_acc = 100 * unseen_corr / unseen_tot
-    global_acc_list.append(true_global_acc)
-    print(f"Fold {fold + 1} Final Global Test Acc: {true_global_acc:.2f}%")
-    
-    global_params_backup = state.params
-    fold_sstl_accs = []
-    
-    print(f"Fold {fold + 1} SSTL Transfer Learning...")
-    for subj in tqdm(global_test_subjs, desc="SSTL", leave=False, bar_format='{l_bar}{bar:20}{r_bar}'):
-        L_sub, X_sub, y_sub = load_graph_data([subj])
-        if X_sub is None: continue
-        
-        kf_sub = KFold(n_splits=4, shuffle=True, random_state=42)
-        subj_fold_accs = []
-        
-        for sub_train_idx, sub_test_idx in kf_sub.split(X_sub):
-            sstl_tx = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.adamw(learning_rate=5e-4, weight_decay=1e-4) 
-            )
-            sstl_state = train_state.TrainState.create(apply_fn=model.apply, params=global_params_backup, tx=sstl_tx)
-            
-            sub_train_loader = DataLoader(
-                TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), 
-                batch_size=16, shuffle=True, drop_last=True,
-                num_workers=8, pin_memory=True, persistent_workers=True
-            )
-            sub_test_loader = DataLoader(
-                TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), 
-                batch_size=16, shuffle=False, drop_last=True,
-                num_workers=8, pin_memory=True, persistent_workers=True
-            )
-            
-            for _ in range(5): 
-                for batch_L, batch_X, batch_y in sub_train_loader:
-                    j_L = jnp.array(batch_L.numpy())
-                    j_X = jnp.array(batch_X.numpy()) 
-                    j_y = jnp.array(batch_y.numpy())
-                    
-                    rng, dropout_key = jax.random.split(rng)
-                    sstl_state, loss, acc = sstl_train_step(sstl_state, j_L, j_X, j_y, dropout_key)
-                    
-            corr, tot = 0, 0
-            for batch_L, batch_X, batch_y in sub_test_loader:
-                j_L = jnp.array(batch_L.numpy())
-                j_X = jnp.array(batch_X.numpy()) 
-                j_y = jnp.array(batch_y.numpy())
-                
-                batch_acc = eval_step(sstl_state, j_L, j_X, j_y)
-                corr += batch_acc.item() * j_X.shape[0]
-                tot += j_X.shape[0]
-            subj_fold_accs.append(100 * corr / tot)
-            
-        fold_sstl_accs.append(np.mean(subj_fold_accs))
-        
-    avg_sstl_fold = np.mean(fold_sstl_accs)
-    sstl_acc_list.append(avg_sstl_fold)
-    print(f"Fold {fold + 1} SSTL Mean Acc: {avg_sstl_fold:.2f}%")
+    batch_L, batch_X, batch_y = next(iter(train_loader))
+    j_L = jnp.array(batch_L.numpy())
+    j_X = jnp.array(batch_X.numpy())
+    j_y = jnp.array(batch_y.numpy())
 
-print("\n" + "="*50)
-print(f"5-Fold Final Global Test Acc: {np.mean(global_acc_list):.2f}%")
-print(f"5-Fold Final SSTL Acc: {np.mean(sstl_acc_list):.2f}%")
-print("="*50)
+    print("\n[1] Input Data (j_X) Scale")
+    print(f"Max: {jnp.max(j_X):.4f}, Min: {jnp.min(j_X):.4f}, Mean: {jnp.mean(j_X):.4f}, Std: {jnp.std(j_X):.4f}")
+
+    rng, dropout_key = jax.random.split(rng)
+    logits, fr = model.apply({'params': variables['params']}, j_L, j_X, deterministic=True)
+    print("\n[2] Initial Forward Pass")
+    print(f"Firing Rate: {fr:.4f}")
+    print(f"Logits (first 5 samples):\n{logits[:5]}")
+    preds = jnp.argmax(logits, axis=-1)
+    print(f"Predictions (first 20): {preds[:20]}")
+    print(f"Actual Labels (first 20): {j_y[:20]}")
+
+    def debug_loss_fn(params):
+        logits_out, firing_rate_out = model.apply({'params': params}, j_L, j_X, deterministic=False, rngs={'dropout': dropout_key})
+        smoothed_targets = smooth_labels(j_y, 4, smoothing=0.2)
+        loss = optax.softmax_cross_entropy(logits=logits_out, labels=smoothed_targets).mean()
+        return loss
+
+    grad_fn = jax.value_and_grad(debug_loss_fn)
+    loss_val, grads = grad_fn(variables['params'])
+
+    print(f"\n[3] Initial Loss: {loss_val:.4f}")
+    print("\n[4] Gradient Norms per Layer (BPTT Survival Check)")
+    flat_grads = flax.traverse_util.flatten_dict(grads)
+    for k, v in flat_grads.items():
+        layer_name = '/'.join(k)
+        grad_norm = jnp.linalg.norm(v)
+        is_dead = "💀 DEAD" if grad_norm < 1e-6 else "✅ OK"
+        is_exploding = "🔥 EXPLODING" if grad_norm > 10.0 else ""
+        print(f"{layer_name:60s} | Norm: {grad_norm:.6f} {is_dead} {is_exploding}")
+
+    print("\n" + "="*50)
+    print("🚨 디버깅 완료! 프로그램 강제 종료. 위 로그를 확인하세요 🚨")
+    print("="*50)
+    import sys
+    sys.exit(0)

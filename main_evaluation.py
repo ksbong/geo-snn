@@ -182,7 +182,6 @@ def spike_bwd(res, g):
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    # 각 뉴런 그룹이 다르게 반응할 수 있도록 파라미터화
     beta: float 
     threshold: float 
     
@@ -194,7 +193,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 (HR Module & DP-Pooling 적용)
+# 3. 모델 아키텍처 (LayerNorm 제거 & 공간적 피처 축소)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -202,8 +201,8 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s1, mem_s2, mem_s3, mem_out = mems
         
+        # [핵심 수술 1] 뉴런을 질식시키던 LayerNorm 싹 다 제거!
         enc_in = nn.Dense(32)(current_in)
-        enc_in = nn.LayerNorm()(enc_in)
         mem_enc, spk_enc = LIF(beta=0.8, threshold=1.0)(mem_enc, enc_in)
         
         gx_lap = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
@@ -212,23 +211,15 @@ class SNNStep(nn.Module):
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         
-        # [핵심 수술 1] HR Module: 3개의 병렬 LIF 세트를 사용하여 다양한 시간 응답 특성 학습
-        # 1. 민감하고 빨리 잊음 (Low threshold, Fast decay)
         c1 = nn.Dense(32)(gx_pooled)
-        c1 = nn.LayerNorm()(c1)
         mem_s1, spk1 = LIF(beta=0.8, threshold=0.6)(mem_s1, c1) 
         
-        # 2. 뉴트럴 (Neutral)
         c2 = nn.Dense(32)(gx_pooled)
-        c2 = nn.LayerNorm()(c2)
         mem_s2, spk2 = LIF(beta=0.9, threshold=1.0)(mem_s2, c2) 
         
-        # 3. 둔감하지만 오래 기억함 (High threshold, Slow decay)
         c3 = nn.Dense(32)(gx_pooled)
-        c3 = nn.LayerNorm()(c3)
         mem_s3, spk3 = LIF(beta=0.95, threshold=1.4)(mem_s3, c3) 
         
-        # 세 가지 다른 응답을 융합
         spk_cat = jnp.concatenate([spk1, spk2, spk3], axis=-1)
         
         cur_out = nn.Dense(32)(spk_cat)
@@ -244,7 +235,8 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME')(X_seq)
+        # [핵심 수술 2] BPTT 기울기 소실 방지. strides=(4, 1)로 480스텝을 120스텝으로 압축
+        ann_out = nn.Conv(features=32, kernel_size=(32, 1), strides=(4, 1), padding='SAME')(X_seq)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
@@ -253,7 +245,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
-        # 3개의 병렬 메모리를 위한 초기화 추가
         mem_enc = jnp.zeros((B, 64, 32))
         mem_s1 = jnp.zeros((B, 16, 32))
         mem_s2 = jnp.zeros((B, 16, 32))
@@ -270,24 +261,25 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        # [핵심 수술 2] DP (Diff-Potential) Pooling
-        # 480 프레임을 길이 24 단위(L_DP)로 쪼갠 후, 첫 12 스텝(N_DP)과 마지막 12 스텝의 평균 차이 계산
-        L_DP = 24
-        N_DP = 12
-        num_chunks = T // L_DP # 20 chunks
+        # 압축된 120 스텝에 맞춘 DP Pooling
+        L_DP = 12
+        N_DP = 6
+        num_chunks = 120 // L_DP # 10 chunks
         
-        # 형태 변환: (B, 20, 24, 16, 32)
         reshaped = mem_out_seq.reshape((B, num_chunks, L_DP, 16, 32))
         
-        # 앞부분 평균과 뒷부분 평균의 차이(Diff-Potential)로 ERD/ERS 시간적 변화량 추출
         start_avg = jnp.mean(reshaped[:, :, :N_DP, :, :], axis=2)
         end_avg = jnp.mean(reshaped[:, :, L_DP-N_DP:, :, :], axis=2)
-        dp_feat = end_avg - start_avg 
+        dp_feat = end_avg - start_avg # (B, 10, 16, 32)
         
-        flat_feat = dp_feat.reshape((B, -1)) 
-        flat_feat = nn.LayerNorm()(flat_feat) # 분류기 전 정규화로 안정성 추가
+        # [핵심 수술 3] 과적합을 막기 위해 16개의 공간 노드를 평균 내어 피처 크기 축소 (10240 -> 320 차원)
+        dp_feat_pooled = jnp.mean(dp_feat, axis=2) # (B, 10, 32)
         
-        # 과적합 억제를 위해 드롭아웃 강화
+        flat_feat = dp_feat_pooled.reshape((B, -1)) # (B, 320)
+        
+        # 시계열 루프 밖에서는 LayerNorm 사용이 안전하고 유용함
+        flat_feat = nn.LayerNorm()(flat_feat) 
+        
         y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
         

@@ -164,7 +164,7 @@ def load_graph_data(subject_list):
     return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
 # =====================================================================
-# 2. Surrogate Gradient (Multi-Gaussian) & LIF 
+# 2. Surrogate Gradient & LIF (Learnable Threshold 적용)
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -175,9 +175,7 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    h = 0.15
-    s = 6.0
-    sigma = 0.5
+    h, s, sigma = 0.15, 6.0, 0.5
     
     def gaussian(u, mu, std):
         return jnp.exp(-0.5 * jnp.square((u - mu) / std)) / (std * jnp.sqrt(2 * jnp.pi))
@@ -192,19 +190,22 @@ def spike_bwd(res, g):
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    # 안정적인 스파이크 생성과 기억 유지를 위한 표준 파라미터 복구
     beta: float = 0.8  
-    threshold: float = 1.0 
+    init_threshold: float = 0.1  # 시작점일 뿐, 모델이 데이터를 보고 최적화함
     
     @nn.compact
     def __call__(self, mem, x):
+        # [핵심 수정] 임계값 자체를 신경망의 파라미터로 등록하여 알아서 스케일에 맞게 학습하도록 함
+        th = self.param('threshold', nn.initializers.constant(self.init_threshold), (1,))
+        th = jnp.abs(th) + 1e-3  # 임계값이 0 이하로 떨어지는 현상 방지
+        
         mem = mem * self.beta + x
-        spk = spike_fn(mem - self.threshold) 
-        mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
+        spk = spike_fn(mem - th) 
+        mem = mem - jax.lax.stop_gradient(spk) * th 
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 ( Laplacian 저주 해결 및 Bias 복구 )
+# 3. 모델 아키텍처 ( Laplacian 해결 & Bias 포함 )
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -212,12 +213,9 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        # [수정] 편향(Bias) 부활. 뉴런이 자체적으로 기저 전류를 만들도록 허용
         enc_in = nn.Dense(32, use_bias=True)(current_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
-        # [핵심 수정] Graph Laplacian의 저주 해결!
-        # Laplacian(L) 대신 인접행렬(I - L)을 사용하여 신호 소멸을 막고 공간 특징 융합
         adj_matrix = jnp.eye(64) - L_norm
         gx = jnp.einsum('bnm, bmf -> bnf', adj_matrix, spk_enc)
         
@@ -228,8 +226,6 @@ class SNNStep(nn.Module):
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
         cur_out = nn.Dense(32, use_bias=True)(spk_s)
-        
-        # ResNet Identity Shortcut
         mem_out = mem_out * 0.95 + cur_out + gx_pooled
         
         new_mems = (mem_enc, mem_s, mem_out)
@@ -242,7 +238,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        # [수정] Conv 층에도 Bias 부활
         ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
         ann_out = nn.relu(ann_out) 
         
@@ -299,7 +294,6 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        # [핵심 수정] 안전지대(Range) 페널티: FR이 5% ~ 20% 사이면 관여하지 않음
         fr_penalty = jnp.maximum(0.0, firing_rate - 0.20) + jnp.maximum(0.0, 0.05 - firing_rate)
         fr_loss = fr_penalty * 0.5 
         
@@ -392,6 +386,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     dummy_L = jnp.ones((1, 64, 64))
     dummy_X = jnp.ones((1, 480, 64, 4))
     
+    # 더 이상 쓰레기같은 동적 임계값 주입 안 함. 모델이 알아서 학습함.
     model = Ultimate_STCN_GraphSNN()
     variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
     

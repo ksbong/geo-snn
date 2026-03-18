@@ -49,7 +49,7 @@ def compute_spd_cov(signal):
     epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
     return cov + np.eye(cov.shape[0]) * epsilon
 
-# RunPod 환경에 맞게 경로 확인 필수
+# RunPod 환경 경로
 DATA_DIR = './07_Data'
 if not os.path.exists(DATA_DIR):
     DATA_DIR = './07_Data' 
@@ -172,7 +172,7 @@ def load_graph_data(subject_list):
 
 
 # =====================================================================
-# 2. Surrogate Gradient (🚀 가속화 세팅) & LIF 뉴런
+# 2. Surrogate Gradient & LIF 뉴런
 # =====================================================================
 @jax.custom_vjp
 def multi_gaussian_spike(x):
@@ -193,7 +193,7 @@ multi_gaussian_spike.defvjp(mg_fwd, mg_bwd)
 
 class LIF(nn.Module):
     beta: float = 0.9
-    threshold: float = 0.5 
+    threshold: float = 0.3 
     @nn.compact
     def __call__(self, mem, x):
         mem = mem * self.beta + x
@@ -202,16 +202,22 @@ class LIF(nn.Module):
         mem = mem - spk * self.threshold 
         return mem, spk
 
-
 # =====================================================================
-# 3. 모델 아키텍처 V24 Final: CSP + Concat Decoder 완벽 적용
+# 3. 모델 아키텍처 V26 Final: 시냅스 복구 + LayerNorm + Concat 디코더
 # =====================================================================
 class MultiBetaLIF(nn.Module):
     @nn.compact
     def __call__(self, mems, x):
-        mem1, spk1 = LIF(beta=0.8, threshold=0.5)(mems[0], x)
-        mem2, spk2 = LIF(beta=0.9, threshold=0.3)(mems[1], x)
-        mem3, spk3 = LIF(beta=0.95, threshold=0.2)(mems[2], x)
+        # 💡 초경량 '착한 Dense' (1024 파라미터) + LayerNorm으로 뇌사 방지
+        c1 = nn.LayerNorm()(nn.Dense(32, use_bias=False)(x))
+        mem1, spk1 = LIF(beta=0.8, threshold=0.3)(mems[0], c1)
+        
+        c2 = nn.LayerNorm()(nn.Dense(32, use_bias=False)(x))
+        mem2, spk2 = LIF(beta=0.9, threshold=0.3)(mems[1], c2)
+        
+        c3 = nn.LayerNorm()(nn.Dense(32, use_bias=False)(x))
+        mem3, spk3 = LIF(beta=0.95, threshold=0.2)(mems[2], c3)
+        
         spk_out = jnp.concatenate([spk1, spk2, spk3], axis=-1) 
         return [mem1, mem2, mem3], spk_out
 
@@ -229,12 +235,11 @@ class DPPoolingDecoder(nn.Module):
         start_mean = jnp.mean(chunks[:, :, :self.N_DP, :], axis=2)
         end_mean = jnp.mean(chunks[:, :, -self.N_DP:, :], axis=2)
         
-        # 🔥 치명적 버그 수정: 뺄셈으로 0이 되는 현상 방지, Concat으로 정보량 100% 보존
+        # 🔥 1.38 늪 탈출 치트키: 뺄셈 대신 Concat으로 ERD/ERS 정보량 100% 보존
         dp_feat = jnp.concatenate([start_mean, end_mean], axis=-1) 
         
-        x = dp_feat.reshape((B, -1)) 
+        x = dp_feat.reshape((B, -1)) # (B, 10청크 * 32피처 = 320차원)
         
-        # 디코더단 강력한 과적합 방지
         x = nn.Dropout(rate=0.5, deterministic=deterministic)(x)
         x = nn.Dense(32)(x)
         x = nn.LayerNorm(epsilon=1e-5)(x) 
@@ -249,37 +254,32 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out = mems
         
-        # 1. BSA 스파이크 인코딩
         mem_enc, spk_enc = LIF(beta=0.8, threshold=0.5)(mem_enc, current_in)
         
-        # 2. 리만 매니폴드 맵핑 (Graph Convolution)
-        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc) # (B, 64채널, 8피처)
+        # 리만 매니폴드 맵핑 (Graph Convolution)
+        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
         
-        # 🔥 3. CSP 스타일 진짜 가중합 평균 (Spatial Pooling)
-        # 64채널을 4개의 보편적 핵심 공간 패턴으로 스마트하게 압축 (피험자 지문 소거)
+        # CSP 스타일 공간 압축 (64채널의 지문을 지우고 4개 소스로 압축)
         spatial_w = self.param('spatial_w', nn.initializers.glorot_uniform(), (64, 4))
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) # (B, 4소스, 8피처)
-        
-        # (4소스 * 8피처) = 32차원으로 초경량화 완료
+        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) # (B, 32)
         
-        cur_s = nn.Dense(32, use_bias=False)(gx_flat)
-        mem_s, spk_s = LIF(beta=0.85, threshold=0.3)(mem_s, cur_s) # (B, 32)
+        cur_s = nn.LayerNorm()(nn.Dense(32, use_bias=False)(gx_flat))
+        mem_s, spk_s = LIF(beta=0.85, threshold=0.3)(mem_s, cur_s) 
         
-        # 4. HR-Module (시계열 동역학)
         mems_hr_input = [mem_hr1, mem_hr2, mem_hr3]
         mems_hr_output, spk_hr = MultiBetaLIF()(mems_hr_input, spk_s) # (B, 96)
         mem_hr1, mem_hr2, mem_hr3 = mems_hr_output
         
-        # 5. Trainable Skip Connection (기울기 보존)
-        skip_gx = nn.Dense(16, use_bias=False)(gx_flat)
-        skip_s  = nn.Dense(16, use_bias=False)(spk_s)
+        skip_gx = nn.LayerNorm()(nn.Dense(16, use_bias=False)(gx_flat))
+        skip_s  = nn.LayerNorm()(nn.Dense(16, use_bias=False)(spk_s))
+        cur_out = nn.LayerNorm()(nn.Dense(16, use_bias=False)(spk_hr))
         
-        cur_out = nn.Dense(16, use_bias=False)(spk_hr) 
-        mem_out, spk_out = LIF(beta=0.9, threshold=0.3)(mem_out, cur_out + skip_gx + skip_s) # (B, 16)
+        # 🔥 Leaky Integrator (스파이크 끄고 연속적인 전위 흐름 보장 -> 기울기 통과)
+        mem_out = mem_out * 0.95 + cur_out + skip_gx + skip_s 
         
         new_mems = (mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out)
-        return (new_mems, L_norm), (mem_out, spk_enc, spk_s, spk_hr, spk_out)
+        return (new_mems, L_norm), (mem_out, spk_enc, spk_s, spk_hr, mem_out)
         
 class Ultimate_STCN_GraphSNN(nn.Module):
     num_steps: int = 240 
@@ -288,19 +288,16 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B = X_seq.shape[0]
         
-        # 🔥 근시안 TCN 수정: kernel_size를 32(약 0.2초)로 늘려 뇌파 주기 파악 능력 극대화
         ann_out = nn.Conv(features=8, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
         ann_out = nn.LayerNorm(epsilon=1e-5)(ann_out)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
             ann_out = nn.Dropout(rate=0.3, deterministic=deterministic)(ann_out)
-            # L_norm 의존성 강화를 막기 위한 DropEdge 부활
             rng = self.make_rng('dropout')
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
-        # 공간 압축에 맞춘 메모리 차원 
         mem_enc = jnp.zeros((B, 64, 8))
         mem_s = jnp.zeros((B, 32))
         mem_hr1 = jnp.zeros((B, 32))
@@ -316,20 +313,19 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             split_rngs={'params': False}, in_axes=1, out_axes=1
         )
         
-        _, (all_time_potentials, spk_enc, spk_s, spk_hr, spk_out) = ScanSNN()(init_carry, ann_out)
+        _, (all_time_potentials, spk_enc, spk_s, spk_hr, mem_out_seq) = ScanSNN()(init_carry, ann_out)
         
         out = DPPoolingDecoder()(all_time_potentials, deterministic=deterministic)
         
         fr_enc = jnp.mean(spk_enc)
         fr_s = jnp.mean(spk_s)
         fr_hr = jnp.mean(spk_hr)
-        fr_out = jnp.mean(spk_out)
-        mean_firing_rate = (fr_enc + fr_s + fr_hr + fr_out) / 4.0
+        mean_firing_rate = (fr_enc + fr_s + fr_hr) / 3.0 
         
         return out, mean_firing_rate
 
 # =====================================================================
-# 4. JAX Single-GPU (jit) 학습 스텝 최적화 🔥
+# 4. JAX Single-GPU (jit) 학습 스텝 최적화
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -392,7 +388,7 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
     return state, loss, acc
 
 # =====================================================================
-# 5. 메인 실행 파이프라인 (데이터로더 병목 해결 완)
+# 5. 메인 실행 파이프라인
 # =====================================================================
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
 global_acc_list = []
@@ -401,7 +397,7 @@ sstl_acc_list = []
 rng = jax.random.PRNGKey(42)
 
 print("\n" + "="*55)
-print(f"⚡ JAX Single-GPU (A5000 Optimized): Ultimate Hybrid SNN")
+print(f"⚡ JAX Single-GPU (A5000 Optimized): The Final V26 SNN")
 print("="*55)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -452,7 +448,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=lr_schedule, weight_decay=1e-5) 
+        optax.adamw(learning_rate=lr_schedule, weight_decay=1e-4) 
     )
     
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
@@ -461,7 +457,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False)
         for batch_L, batch_X, batch_y in pbar:
             j_L = jnp.array(batch_L.numpy())
-            # 480 -> 240 다운샘플링 복구 완
+            # 다운샘플링 유지
             j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
             j_y = jnp.array(batch_y.numpy())
             
@@ -523,7 +519,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             )
             sstl_state = train_state.TrainState.create(apply_fn=model.apply, params=global_params_backup, tx=sstl_tx)
             
-            # 🔥 SSTL 데이터로더 가속화 완벽 적용
+            # 🔥 SSTL 가속 로더 적용
             sub_train_loader = DataLoader(
                 TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), 
                 batch_size=16, shuffle=True, drop_last=True,

@@ -164,7 +164,7 @@ def load_graph_data(subject_list):
     return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
 # =====================================================================
-# 2. Surrogate Gradient & LIF 
+# 2. Surrogate Gradient (Multi-Gaussian) & LIF 
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -175,16 +175,27 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    alpha = 5.0  
-    grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
+    # HR-SNN 논문의 Multi-Gaussian 파라미터 적용
+    h = 0.15
+    s = 6.0
+    sigma = 0.5
+    
+    def gaussian(u, mu, std):
+        return jnp.exp(-0.5 * jnp.square((u - mu) / std)) / (std * jnp.sqrt(2 * jnp.pi))
+        
+    term1 = (1.0 + h) * gaussian(x, 0.0, sigma)
+    term2 = h * gaussian(x, s * sigma, s * sigma)
+    term3 = h * gaussian(x, -s * sigma, s * sigma)
+    grad = term1 - term2 - term3
+    
     return (g * grad,)
 
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
     beta: float = 0.85  
-    # [수정] 스파이크 문턱값을 1.0에서 0.5로 대폭 낮춤
-    threshold: float = 0.5 
+    # 스파이크 임계값을 논문 파라미터대로 정상화
+    threshold: float = 0.08 
     
     @nn.compact
     def __call__(self, mem, x):
@@ -194,7 +205,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 (LayerNorm 제거, Graph Residual 추가)
+# 3. 모델 아키텍처 (ResNet Identity Shortcut 적용)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -202,23 +213,21 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        # [수정] LayerNorm 완전 삭제. bias를 온전히 살려서 입력
-        enc_in = nn.Dense(32, use_bias=True, bias_init=nn.initializers.constant(0.5))(current_in)
+        # 편향 제거 (use_bias=False)
+        enc_in = nn.Dense(32, use_bias=False)(current_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
-        # [수정] Graph Laplacian을 뺄셈으로 섞어서 공간 로우패스 필터 효과 (Residual)
-        gx_lap = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
-        gx_res = spk_enc - 0.5 * gx_lap 
-        
+        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx_res, spatial_w) 
+        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         
-        cur_s = nn.Dense(64, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_pooled)
-        # [수정] LayerNorm 삭제
+        cur_s = nn.Dense(64, use_bias=False)(gx_pooled)
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        cur_out = nn.Dense(32, use_bias=True)(spk_s)
-        mem_out = mem_out * 0.95 + cur_out 
+        cur_out = nn.Dense(32, use_bias=False)(spk_s)
+        
+        # ResNet 방식의 진짜 Identity Shortcut 추가
+        mem_out = mem_out * 0.95 + cur_out + gx_pooled
         
         new_mems = (mem_enc, mem_s, mem_out)
         return (new_mems, L_norm), (mem_out, spk_enc, spk_s)
@@ -230,7 +239,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
+        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=False)(X_seq)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
@@ -262,7 +271,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         chunked_feat = jnp.mean(chunks, axis=2) 
         flat_feat = chunked_feat.reshape((B, -1)) 
         
-        # [수정] 0.6은 너무 가혹해서 0.4로 완화
         y = nn.Dropout(rate=0.4, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
         

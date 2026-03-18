@@ -48,15 +48,87 @@ def compute_spd_cov(signal):
     cov = np.cov(signal)
     epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
     return cov + np.eye(cov.shape[0]) * epsilon
+# =====================================================================
+# 2. 다수 피험자 데이터 로딩 (진짜 멀티프로세싱 CPU 풀가동)
+# =====================================================================
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
-# =====================================================================
-# 2. 다수 피험자 데이터 로딩 (캐싱 작동 확인)
-# =====================================================================
+def process_single_subject(args):
+    subj, DATA_DIR = args
+    runs_hands = ['R04', 'R08', 'R12']
+    runs_feet = ['R06', 'R10', 'R14']
+    epochs_list = []
+    
+    try:
+        for run in runs_hands + runs_feet:
+            path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
+            if not os.path.exists(path): continue
+            
+            # 로그 끄고 조용히 로드
+            raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
+            evs, ev_dict = mne.events_from_annotations(raw, verbose=False)
+            
+            t1_id, t2_id = ev_dict.get('T1'), ev_dict.get('T2')
+            if t1_id is None or t2_id is None: continue
+            
+            events_fixed = evs.copy()
+            if run in runs_hands:
+                events_fixed[evs[:, 2] == t1_id, 2] = 1 
+                events_fixed[evs[:, 2] == t2_id, 2] = 2 
+            else:
+                events_fixed[evs[:, 2] == t1_id, 2] = 3 
+                events_fixed[evs[:, 2] == t2_id, 2] = 4 
+            
+            ep = mne.Epochs(raw, events_fixed, {'Left': 1, 'Right': 2} if run in runs_hands else {'BothHands': 3, 'BothFeet': 4}, 
+                            tmin=1.0, tmax=4.0, baseline=None, preload=True, on_missing='ignore', verbose=False)
+            
+            if len(ep) > 0: epochs_list.append(ep)
+            
+        if not epochs_list: return subj, None
+            
+        epochs_all = mne.concatenate_epochs(epochs_list, verbose=False)
+        labels = np.array(epochs_all.events[:, 2]) - 1
+        data = epochs_all.get_data() * 1e6  
+        sfreq = epochs_all.info['sfreq']
+        
+        mean_data = np.mean(data, axis=(0, 2), keepdims=True)
+        std_data = np.std(data, axis=(0, 2), keepdims=True)
+        data_norm = (data - mean_data) / (std_data + 1e-8)
+        
+        encoded_signals = extract_snn_encoded_features(data_norm, sfreq)[:, :, :480, :] 
+        
+        L_norm_list, X_feat_list = [], []
+        for ep_idx in range(encoded_signals.shape[0]):
+            seq = encoded_signals[ep_idx]
+            sig_for_cov = seq.reshape(seq.shape[0], -1)
+            
+            # 여기가 원래 제일 느렸던 CPU 병목 구간
+            cov_full = compute_spd_cov(sig_for_cov)
+            tangent = logm(cov_full).real
+            tau = np.std(tangent) if np.std(tangent) > 0 else 1.0
+            A = np.exp(tangent / tau)
+            np.fill_diagonal(A, 0) 
+            D = np.diag(np.sum(A, axis=1))
+            D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
+            L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A @ D_inv_sqrt)
+            
+            X_seq = np.transpose(seq, (1, 0, 2)) 
+            L_norm_list.append(L_norm)
+            X_feat_list.append(X_seq) 
+
+        return subj, {
+            'L': torch.tensor(np.nan_to_num(np.array(L_norm_list, dtype=np.float32))),
+            'X': torch.tensor(np.nan_to_num(np.array(X_feat_list, dtype=np.float32))),
+            'y': torch.tensor(labels, dtype=torch.long)
+        }
+    except Exception:
+        return subj, None
+
 def load_all_graph_data():
-    base_search_dir = './07_Data' if os.path.exists('/workspace') else '.'
+    base_search_dir = '/workspace' if os.path.exists('/workspace') else '.'
     DATA_DIR = None
 
-    print(f"\n>>> [{base_search_dir}] 뇌파 데이터 자동 탐색 중...")
     for root, dirs, files in os.walk(base_search_dir):
         if 'S001' in dirs:
             DATA_DIR = root
@@ -69,70 +141,18 @@ def load_all_graph_data():
     all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
     
     subject_data_dict = {}
-    print(f">>> A5000 파워 온! {len(all_subjects)}명 피험자 풀-데이터 병렬 로드 시작...\n")
+    num_cores = multiprocessing.cpu_count()
+    print(f"\n>>> RunPod vCPU {num_cores}코어 풀가동! {len(all_subjects)}명 진짜 멀티프로세싱 전처리 시작...")
     
-    for subj in tqdm(all_subjects, desc="Loading Data"):
-        runs_hands = ['R04', 'R08', 'R12']
-        runs_feet = ['R06', 'R10', 'R14']
-        epochs_list = []
+    # ProcessPoolExecutor로 여러 코어에 작업 찢어서 던지기
+    with ProcessPoolExecutor(max_workers=num_cores) as executor:
+        args_list = [(subj, DATA_DIR) for subj in all_subjects]
+        futures = {executor.submit(process_single_subject, arg): arg for arg in args_list}
         
-        try:
-            for run in runs_hands + runs_feet:
-                path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
-                if not os.path.exists(path): continue
-                raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
-                evs, ev_dict = mne.events_from_annotations(raw, verbose=False)
-                
-                t1_id, t2_id = ev_dict.get('T1'), ev_dict.get('T2')
-                if t1_id is None or t2_id is None: continue
-                
-                events_fixed = evs.copy()
-                if run in runs_hands:
-                    events_fixed[evs[:, 2] == t1_id, 2] = 1 
-                    events_fixed[evs[:, 2] == t2_id, 2] = 2 
-                    ep = mne.Epochs(raw, events_fixed, {'Left': 1, 'Right': 2}, tmin=1.0, tmax=4.0, baseline=None, preload=True, on_missing='ignore', verbose=False)
-                else:
-                    events_fixed[evs[:, 2] == t1_id, 2] = 3 
-                    events_fixed[evs[:, 2] == t2_id, 2] = 4 
-                    ep = mne.Epochs(raw, events_fixed, {'BothHands': 3, 'BothFeet': 4}, tmin=1.0, tmax=4.0, baseline=None, preload=True, on_missing='ignore', verbose=False)
-                
-                if len(ep) > 0: epochs_list.append(ep)
-                
-            if not epochs_list: continue
-                
-            epochs_all = mne.concatenate_epochs(epochs_list, verbose=False)
-            labels = np.array(epochs_all.events[:, 2]) - 1
-            data = epochs_all.get_data() * 1e6  
-            sfreq = epochs_all.info['sfreq']
-            
-            mean_data = np.mean(data, axis=(0, 2), keepdims=True)
-            std_data = np.std(data, axis=(0, 2), keepdims=True)
-            data_norm = (data - mean_data) / (std_data + 1e-8)
-            
-            encoded_signals = extract_snn_encoded_features(data_norm, sfreq)[:, :, :480, :] 
-            
-            L_norm_list, X_feat_list = [], []
-            for ep_idx in range(encoded_signals.shape[0]):
-                seq = encoded_signals[ep_idx]
-                sig_for_cov = seq.reshape(seq.shape[0], -1)
-                cov_full = compute_spd_cov(sig_for_cov)
-                tangent = logm(cov_full).real
-                tau = np.std(tangent) if np.std(tangent) > 0 else 1.0
-                A = np.exp(tangent / tau)
-                np.fill_diagonal(A, 0) 
-                D = np.diag(np.sum(A, axis=1))
-                D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
-                
-                L_norm_list.append(np.eye(A.shape[0]) - (D_inv_sqrt @ A @ D_inv_sqrt))
-                X_feat_list.append(np.transpose(seq, (1, 0, 2))) 
-
-            subject_data_dict[subj] = {
-                'L': torch.tensor(np.nan_to_num(np.array(L_norm_list, dtype=np.float32))),
-                'X': torch.tensor(np.nan_to_num(np.array(X_feat_list, dtype=np.float32))),
-                'y': torch.tensor(labels, dtype=torch.long)
-            }
-        except Exception:
-            continue
+        for future in tqdm(as_completed(futures), total=len(all_subjects), desc="Parallel Data Loading"):
+            subj, data = future.result()
+            if data is not None:
+                subject_data_dict[subj] = data
             
     return subject_data_dict, list(subject_data_dict.keys())
 

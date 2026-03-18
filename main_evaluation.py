@@ -201,9 +201,8 @@ class LIF(nn.Module):
         mem = mem - spk * self.threshold 
         return mem, spk
 
-
 # =====================================================================
-# 3. 모델 아키텍처 V22: SNN-Main 구조 + Trainable Skip Connection
+# 3. 모델 아키텍처 V23: CSP 공간 압축 + 광역 TCN 도입
 # =====================================================================
 class MultiBetaLIF(nn.Module):
     @nn.compact
@@ -231,6 +230,8 @@ class DPPoolingDecoder(nn.Module):
         
         x = dp_feat.reshape((B, -1)) 
         
+        # 디코더단 강력한 과적합 방지 (Dropout 추가)
+        x = nn.Dropout(rate=0.5, deterministic=deterministic)(x)
         x = nn.Dense(32)(x)
         x = nn.LayerNorm(epsilon=1e-5)(x) 
         x = nn.gelu(x)
@@ -244,24 +245,35 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out = mems
         
+        # 1. BSA 스파이크 인코딩
         mem_enc, spk_enc = LIF(beta=0.8, threshold=0.5)(mem_enc, current_in)
         
-        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
-        gx_flat = gx.reshape((gx.shape[0], -1))
+        # 2. 리만 매니폴드 맵핑 (Graph Convolution)
+        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc) # (B, 64채널, 8피처)
         
-        cur_s = nn.Dense(16, use_bias=False)(gx_flat)
-        mem_s, spk_s = LIF(beta=0.85, threshold=0.3)(mem_s, cur_s) 
+        # 🔥 3. CSP 스타일 진짜 가중합 평균 (Spatial Pooling)
+        # 64채널을 4개의 보편적 핵심 공간 패턴으로 스마트하게 압축 (피험자 지문 소거)
+        spatial_w = self.param('spatial_w', nn.initializers.glorot_uniform(), (64, 4))
+        # b: batch, c: channel, f: feature, s: spatial source
+        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) # (B, 4소소, 8피처)
         
+        # (4소스 * 8피처) = 32차원으로 초경량화 완료! 암기 원천 차단
+        gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) # (B, 32)
+        
+        cur_s = nn.Dense(32, use_bias=False)(gx_flat)
+        mem_s, spk_s = LIF(beta=0.85, threshold=0.3)(mem_s, cur_s) # (B, 32)
+        
+        # 4. HR-Module (시계열 동역학)
         mems_hr_input = [mem_hr1, mem_hr2, mem_hr3]
-        mems_hr_output, spk_hr = MultiBetaLIF()(mems_hr_input, spk_s) 
+        mems_hr_output, spk_hr = MultiBetaLIF()(mems_hr_input, spk_s) # (B, 96)
         mem_hr1, mem_hr2, mem_hr3 = mems_hr_output
         
-        # Trainable Skip Connection
-        skip_gx = nn.Dense(8, use_bias=False)(gx_flat)
-        skip_s  = nn.Dense(8, use_bias=False)(spk_s)
+        # 5. Trainable Skip Connection (기울기 보존)
+        skip_gx = nn.Dense(16, use_bias=False)(gx_flat)
+        skip_s  = nn.Dense(16, use_bias=False)(spk_s)
         
-        cur_out = nn.Dense(8, use_bias=False)(spk_hr) 
-        mem_out, spk_out = LIF(beta=0.9, threshold=0.3)(mem_out, cur_out + skip_gx + skip_s)
+        cur_out = nn.Dense(16, use_bias=False)(spk_hr) 
+        mem_out, spk_out = LIF(beta=0.9, threshold=0.3)(mem_out, cur_out + skip_gx + skip_s) # (B, 16)
         
         new_mems = (mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out)
         return (new_mems, L_norm), (mem_out, spk_enc, spk_s, spk_hr, spk_out)
@@ -273,19 +285,25 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B = X_seq.shape[0]
         
-        ann_out = nn.Conv(features=8, kernel_size=(15, 1), padding='SAME', use_bias=True)(X_seq)
+        # 🔥 근시안 TCN 수정: kernel_size를 32(약 0.2초)로 늘려 뇌파 주기 파악 능력 극대화
+        ann_out = nn.Conv(features=8, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
         ann_out = nn.LayerNorm(epsilon=1e-5)(ann_out)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
             ann_out = nn.Dropout(rate=0.3, deterministic=deterministic)(ann_out)
+            # L_norm 의존성 강화를 막기 위한 DropEdge 부활
+            rng = self.make_rng('dropout')
+            mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
+            L_norm = L_norm * mask / 0.7
 
+        # 공간 압축으로 인해 메모리 차원 변경 (에러 방지)
         mem_enc = jnp.zeros((B, 64, 8))
-        mem_s = jnp.zeros((B, 16))
-        mem_hr1 = jnp.zeros((B, 16))
-        mem_hr2 = jnp.zeros((B, 16))
-        mem_hr3 = jnp.zeros((B, 16))
-        mem_out = jnp.zeros((B, 8))
+        mem_s = jnp.zeros((B, 32))
+        mem_hr1 = jnp.zeros((B, 32))
+        mem_hr2 = jnp.zeros((B, 32))
+        mem_hr3 = jnp.zeros((B, 32))
+        mem_out = jnp.zeros((B, 16))
         
         mems = (mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out)
         init_carry = (mems, L_norm)
@@ -306,7 +324,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         mean_firing_rate = (fr_enc + fr_s + fr_hr + fr_out) / 4.0
         
         return out, mean_firing_rate
-
 
 # =====================================================================
 # 4. JAX Single-GPU (jit) 학습 스텝 최적화 🔥

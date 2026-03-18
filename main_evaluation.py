@@ -13,10 +13,10 @@ import functools
 # JAX & Flax 생태계 임포트
 import jax
 import jax.numpy as jnp
-import flax
 import flax.linen as nn
 from flax.training import train_state
 import optax
+import flax.traverse_util
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -52,7 +52,7 @@ def compute_spd_cov(signal):
 # RunPod 환경에 맞게 경로 확인 필수
 DATA_DIR = './07_Data'
 if not os.path.exists(DATA_DIR):
-    DATA_DIR = './07_Data' # 현재 디렉토리에 데이터가 있을 경우
+    DATA_DIR = './07_Data' 
 
 # 캐시 저장 경로
 SAVE_DIR = './processed_graph_tensors_fixed_v20_Riemannian_Weighted_SNN'
@@ -202,8 +202,9 @@ class LIF(nn.Module):
         mem = mem - spk * self.threshold 
         return mem, spk
 
+
 # =====================================================================
-# 3. 모델 아키텍처 V23: CSP 공간 압축 + 광역 TCN 도입
+# 3. 모델 아키텍처 V24 Final: CSP + Concat Decoder 완벽 적용
 # =====================================================================
 class MultiBetaLIF(nn.Module):
     @nn.compact
@@ -227,11 +228,13 @@ class DPPoolingDecoder(nn.Module):
         
         start_mean = jnp.mean(chunks[:, :, :self.N_DP, :], axis=2)
         end_mean = jnp.mean(chunks[:, :, -self.N_DP:, :], axis=2)
-        dp_feat = end_mean - start_mean 
+        
+        # 🔥 치명적 버그 수정: 뺄셈으로 0이 되는 현상 방지, Concat으로 정보량 100% 보존
+        dp_feat = jnp.concatenate([start_mean, end_mean], axis=-1) 
         
         x = dp_feat.reshape((B, -1)) 
         
-        # 디코더단 강력한 과적합 방지 (Dropout 추가)
+        # 디코더단 강력한 과적합 방지
         x = nn.Dropout(rate=0.5, deterministic=deterministic)(x)
         x = nn.Dense(32)(x)
         x = nn.LayerNorm(epsilon=1e-5)(x) 
@@ -255,10 +258,9 @@ class SNNStep(nn.Module):
         # 🔥 3. CSP 스타일 진짜 가중합 평균 (Spatial Pooling)
         # 64채널을 4개의 보편적 핵심 공간 패턴으로 스마트하게 압축 (피험자 지문 소거)
         spatial_w = self.param('spatial_w', nn.initializers.glorot_uniform(), (64, 4))
-        # b: batch, c: channel, f: feature, s: spatial source
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) # (B, 4소소, 8피처)
+        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) # (B, 4소스, 8피처)
         
-        # (4소스 * 8피처) = 32차원으로 초경량화 완료! 암기 원천 차단
+        # (4소스 * 8피처) = 32차원으로 초경량화 완료
         gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) # (B, 32)
         
         cur_s = nn.Dense(32, use_bias=False)(gx_flat)
@@ -298,7 +300,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
-        # 공간 압축으로 인해 메모리 차원 변경 (에러 방지)
+        # 공간 압축에 맞춘 메모리 차원 
         mem_enc = jnp.zeros((B, 64, 8))
         mem_s = jnp.zeros((B, 32))
         mem_hr1 = jnp.zeros((B, 32))
@@ -333,7 +335,6 @@ def smooth_labels(labels, num_classes, smoothing=0.2):
     one_hot = jax.nn.one_hot(labels, num_classes)
     return one_hot * (1.0 - smoothing) + (smoothing / num_classes)
 
-# 💡 pmap 제거, 순수 jit 컴파일로 오버헤드 0% 달성
 @jax.jit
 def train_step(state, L_batch, X_batch, targets, dropout_key):
     def loss_fn(params):
@@ -354,7 +355,6 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, (logits, firing_rate, ce_loss, fr_loss)), grads = grad_fn(state.params)
     
-    # 단일 GPU이므로 pmean(그래디언트 평균) 과정 불필요
     state = state.apply_gradients(grads=grads)
     acc = jnp.mean(jnp.argmax(logits, -1) == targets)
     
@@ -392,7 +392,7 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
     return state, loss, acc
 
 # =====================================================================
-# 5. 메인 실행 파이프라인 (차원 에러 픽스 완)
+# 5. 메인 실행 파이프라인 (데이터로더 병목 해결 완)
 # =====================================================================
 kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
 global_acc_list = []
@@ -401,7 +401,7 @@ sstl_acc_list = []
 rng = jax.random.PRNGKey(42)
 
 print("\n" + "="*55)
-print(f"⚡ JAX Single-GPU (A5000 Optimized): Fast Convergence SNN")
+print(f"⚡ JAX Single-GPU (A5000 Optimized): Ultimate Hybrid SNN")
 print("="*55)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -414,12 +414,12 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     
     train_loader = DataLoader(
         TensorDataset(L_train, X_train, y_train), 
-        batch_size=128,        # 🔥 한 번에 4배 많은 일감 투척 (메모리 남으면 256도 추천)
+        batch_size=128,        
         shuffle=True, 
         drop_last=True,
-        num_workers=8,         # 🔥 CPU 코어 8개 할당해서 데이터 준비 속도 가속
-        pin_memory=True,       # 🔥 RAM -> GPU 다이렉트 전송 고속도로 개통
-        persistent_workers=True # 워커 초기화 오버헤드 방지
+        num_workers=8,         
+        pin_memory=True,       
+        persistent_workers=True 
     )
     
     L_unseen, X_unseen, y_unseen = load_graph_data(global_test_subjs)
@@ -461,7 +461,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False)
         for batch_L, batch_X, batch_y in pbar:
             j_L = jnp.array(batch_L.numpy())
-            # 🔥 해결: 480스텝을 240으로 다운샘플링하는 슬라이싱 복구
+            # 480 -> 240 다운샘플링 복구 완
             j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
             j_y = jnp.array(batch_y.numpy())
             
@@ -479,7 +479,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             unseen_corr, unseen_tot = 0, 0
             for batch_L, batch_X, batch_y in unseen_loader:
                 j_L = jnp.array(batch_L.numpy())
-                # 🔥 해결: 실시간 평가에도 슬라이싱 적용
                 j_X = jnp.array(batch_X.numpy()[:, ::2, :, :])
                 j_y = jnp.array(batch_y.numpy())
                 
@@ -494,7 +493,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     unseen_corr, unseen_tot = 0, 0
     for batch_L, batch_X, batch_y in unseen_loader:
         j_L = jnp.array(batch_L.numpy())
-        # 🔥 해결: 최종 평가에도 슬라이싱 적용
         j_X = jnp.array(batch_X.numpy()[:, ::2, :, :])
         j_y = jnp.array(batch_y.numpy())
         
@@ -525,13 +523,21 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             )
             sstl_state = train_state.TrainState.create(apply_fn=model.apply, params=global_params_backup, tx=sstl_tx)
             
-            sub_train_loader = DataLoader(TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), batch_size=16, shuffle=True, drop_last=True)
-            sub_test_loader = DataLoader(TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), batch_size=16, shuffle=False, drop_last=True)
+            # 🔥 SSTL 데이터로더 가속화 완벽 적용
+            sub_train_loader = DataLoader(
+                TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), 
+                batch_size=16, shuffle=True, drop_last=True,
+                num_workers=8, pin_memory=True, persistent_workers=True
+            )
+            sub_test_loader = DataLoader(
+                TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), 
+                batch_size=16, shuffle=False, drop_last=True,
+                num_workers=8, pin_memory=True, persistent_workers=True
+            )
             
             for _ in range(5): 
                 for batch_L, batch_X, batch_y in sub_train_loader:
                     j_L = jnp.array(batch_L.numpy())
-                    # 🔥 해결: SSTL 학습에도 슬라이싱 적용
                     j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
                     j_y = jnp.array(batch_y.numpy())
                     
@@ -541,7 +547,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             corr, tot = 0, 0
             for batch_L, batch_X, batch_y in sub_test_loader:
                 j_L = jnp.array(batch_L.numpy())
-                # 🔥 해결: SSTL 평가에도 슬라이싱 적용
                 j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
                 j_y = jnp.array(batch_y.numpy())
                 

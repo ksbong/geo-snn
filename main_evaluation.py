@@ -8,16 +8,13 @@ from scipy.linalg import logm
 from sklearn.model_selection import KFold
 from tqdm import tqdm
 import warnings
-import functools
 
-# JAX & Flax 생태계 임포트
+# JAX & Flax
 import jax
 import jax.numpy as jnp
-import flax
 import flax.linen as nn
 from flax.training import train_state
 import optax
-import flax.traverse_util
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -51,9 +48,6 @@ def compute_spd_cov(signal):
     return cov + np.eye(cov.shape[0]) * epsilon
 
 DATA_DIR = './07_Data'
-if not os.path.exists(DATA_DIR):
-    DATA_DIR = './07_Data' 
-
 SAVE_DIR = './processed_graph_tensors_fixed_v20_Riemannian_Weighted_SNN'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -155,7 +149,7 @@ def process_and_save_subject_graph(subj):
     except Exception as e:
         return f"[Error] {subj} Preprocessing failed: {e}"
 
-print("Step 1: Checking cached preprocessing data (A5000 Single GPU)")
+print("Step 1: Checking cached preprocessing data")
 for subj in tqdm(all_subjects, desc="Preprocessing", leave=True):
     process_and_save_subject_graph(subj)
 
@@ -169,7 +163,6 @@ def load_graph_data(subject_list):
     if not L_list: return None, None, None
     return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
-
 # =====================================================================
 # 2. Surrogate Gradient & LIF 
 # =====================================================================
@@ -182,15 +175,15 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    # [수정] 기울기 완화 (5.0 -> 2.0)
-    alpha = 2.0  
+    alpha = 5.0  
     grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
     return (g * grad,)
 
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    beta: float = 0.8
+    # [수정] 0.9에서 0.85로 낮춰서 스파이크 난사 억제
+    beta: float = 0.85  
     threshold: float = 1.0
     
     @nn.compact
@@ -200,9 +193,8 @@ class LIF(nn.Module):
         mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
         return mem, spk
 
-
 # =====================================================================
-# 3. 모델 아키텍처 
+# 3. 모델 아키텍처
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -210,23 +202,19 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        # [수정] 채널 확장 (8 -> 32)
         enc_in = nn.Dense(32, use_bias=True, bias_init=nn.initializers.constant(0.5))(current_in)
         enc_in = nn.LayerNorm()(enc_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
         gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
-        # [수정] 공간 풀링 파라미터 확장 ((64, 4) -> (64, 16))
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
         
-        # [수정] 채널 확장 (32 -> 128)
         cur_s = nn.Dense(128, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_flat)
         cur_s = nn.LayerNorm()(cur_s) 
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        # [수정] 채널 확장 (16 -> 64)
         cur_out = nn.Dense(64, use_bias=True)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 
         
@@ -240,7 +228,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        # [수정] 채널 확장 (8 -> 32)
         ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
         ann_out = nn.relu(ann_out) 
         
@@ -250,7 +237,6 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
-        # [수정] 확장된 채널 크기에 맞춘 초기화
         mem_enc = jnp.zeros((B, 64, 32))
         mem_s = jnp.zeros((B, 128))
         mem_out = jnp.zeros((B, 64))
@@ -265,8 +251,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        # [수정] 시간축 정보 손실을 막기 위해 10개 청크 분할 대신 전체 타임스텝의 막전위를 누적(Sum)
-        flat_feat = jnp.sum(mem_out_seq, axis=1) 
+        flat_feat = jnp.mean(mem_out_seq, axis=1) 
         
         y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
@@ -275,9 +260,8 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         return logits, firing_rate
 
-
 # =====================================================================
-# 4. JAX Single-GPU (jit) 학습 스텝
+# 4. JAX 학습 스텝 
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -293,8 +277,9 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
+        # [수정] 난사와 기절의 타협점 0.2
         target_fr = 0.1 
-        fr_loss = jnp.square(firing_rate - target_fr) * 1.0
+        fr_loss = jnp.square(firing_rate - target_fr) * 0.2
         
         total_loss = ce_loss + fr_loss
         return total_loss, (logits, firing_rate)
@@ -326,8 +311,9 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
+        # [수정] SSTL도 동일하게 0.2
         target_fr = 0.1 
-        fr_loss = jnp.square(firing_rate - target_fr) * 1.0
+        fr_loss = jnp.square(firing_rate - target_fr) * 0.2
         
         total_loss = ce_loss + fr_loss
         return total_loss, logits 
@@ -338,7 +324,6 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
     state = state.apply_gradients(grads=grads)
     acc = jnp.mean(jnp.argmax(logits, -1) == targets)
     return state, loss, acc
-
 
 # =====================================================================
 # 5. 메인 실행 파이프라인
@@ -384,7 +369,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy_L = jnp.ones((1, 64, 64))
-    # [수정] 원본 타임스텝 길이를 반영하여 240이 아닌 480으로 변경
     dummy_X = jnp.ones((1, 480, 64, 4))
     
     model = Ultimate_STCN_GraphSNN()
@@ -411,7 +395,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False, bar_format='{l_bar}{bar:20}{r_bar}')
         for batch_L, batch_X, batch_y in pbar:
             j_L = jnp.array(batch_L.numpy())
-            # [수정] 시간축 슬라이싱([:, ::2, :, :]) 제거, 전체 프레임 입력
             j_X = jnp.array(batch_X.numpy()) 
             j_y = jnp.array(batch_y.numpy())
             
@@ -424,7 +407,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             unseen_corr, unseen_tot = 0, 0
             for batch_L, batch_X, batch_y in unseen_loader:
                 j_L = jnp.array(batch_L.numpy())
-                # [수정] 시간축 슬라이싱 제거
                 j_X = jnp.array(batch_X.numpy())
                 j_y = jnp.array(batch_y.numpy())
                 
@@ -434,11 +416,10 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
                 
             current_test_acc = 100 * unseen_corr / unseen_tot
             print(f"[Epoch {epoch+1:03d}] Global Test Acc: {current_test_acc:.2f}%")
-
+    
     unseen_corr, unseen_tot = 0, 0
     for batch_L, batch_X, batch_y in unseen_loader:
         j_L = jnp.array(batch_L.numpy())
-        # [수정] 시간축 슬라이싱 제거
         j_X = jnp.array(batch_X.numpy())
         j_y = jnp.array(batch_y.numpy())
         
@@ -482,7 +463,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             for _ in range(5): 
                 for batch_L, batch_X, batch_y in sub_train_loader:
                     j_L = jnp.array(batch_L.numpy())
-                    # [수정] 시간축 슬라이싱 제거
                     j_X = jnp.array(batch_X.numpy()) 
                     j_y = jnp.array(batch_y.numpy())
                     
@@ -492,7 +472,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             corr, tot = 0, 0
             for batch_L, batch_X, batch_y in sub_test_loader:
                 j_L = jnp.array(batch_L.numpy())
-                # [수정] 시간축 슬라이싱 제거
                 j_X = jnp.array(batch_X.numpy()) 
                 j_y = jnp.array(batch_y.numpy())
                 

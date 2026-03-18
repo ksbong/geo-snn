@@ -193,26 +193,22 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 (에너지 펌핑 & 마중물 추가)
+# 3. 모델 아키텍처 (신호 믹서기 제거 & 안정적인 Global Pooling)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
-    def __call__(self, carry, current_in):
-        mems, L_norm = carry
+    def __call__(self, mems, current_in):
         mem_enc, mem_s1, mem_s2, mem_s3, mem_out = mems
         
-        # [해결책 2] 가중치 초기화 스케일을 5배로 뻥튀기해서 확실한 마중물(전류) 제공
-        enc_in = nn.Dense(32, kernel_init=nn.initializers.variance_scaling(5.0, 'fan_in', 'normal'))(current_in)
-        # 임계값(1.0) 근처에서 쉽게 반응할 수 있도록 미세한 양수 편향 추가
-        enc_in = enc_in + 0.1 
+        enc_in = nn.Dense(32)(current_in)
         mem_enc, spk_enc = LIF(beta=0.8, threshold=1.0)(mem_enc, enc_in)
         
-        gx_lap = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
-        gx = spk_enc - 0.5 * gx_lap
-        
+        # 루프를 돌 때마다 신호를 갉아먹던 Laplacian 뺄셈 제거
+        # 오직 학습 가능한 공간 가중치(spatial_w)로만 64채널 -> 16노드로 융합
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
+        gx_pooled = jnp.einsum('bcf, cs -> bsf', spk_enc, spatial_w) 
         
+        # HR Module 유지 (다양한 시간 응답 학습)
         c1 = nn.Dense(32)(gx_pooled)
         mem_s1, spk1 = LIF(beta=0.8, threshold=0.6)(mem_s1, c1) 
         
@@ -228,7 +224,7 @@ class SNNStep(nn.Module):
         mem_out = mem_out * 0.8 + cur_out
         
         new_mems = (mem_enc, mem_s1, mem_s2, mem_s3, mem_out)
-        return (new_mems, L_norm), (mem_out, spk_enc, spk_cat)
+        return new_mems, (mem_out, spk_enc, spk_cat)
 
 class Ultimate_STCN_GraphSNN(nn.Module):
     num_classes: int = 4
@@ -237,17 +233,15 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=32, kernel_size=(32, 1), strides=(4, 1), padding='SAME', use_bias=False)(X_seq)
+        # 입력 데이터를 L_norm으로 한 번만 사전 필터링 (루프 안에서 반복 훼손 방지)
+        gx_lap = jnp.einsum('bnm, btmf -> btnf', L_norm, X_seq)
+        X_seq_filtered = X_seq - 0.5 * gx_lap
         
-        # [해결책 1] 0.08에 불과했던 연속형 피처 에너지를 SNN 진입 전에 1.0 스케일로 확 키워줌
-        ann_out = nn.LayerNorm()(ann_out)
+        ann_out = nn.Conv(features=32, kernel_size=(32, 1), strides=(4, 1), padding='SAME')(X_seq_filtered)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
             ann_out = nn.Dropout(rate=0.3, deterministic=deterministic)(ann_out)
-            rng = self.make_rng('dropout')
-            mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
-            L_norm = L_norm * mask / 0.7
 
         mem_enc = jnp.zeros((B, 64, 32))
         mem_s1 = jnp.zeros((B, 16, 32))
@@ -255,29 +249,19 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         mem_s3 = jnp.zeros((B, 16, 32))
         mem_out = jnp.zeros((B, 16, 32))
         
-        mems = (mem_enc, mem_s1, mem_s2, mem_s3, mem_out)
-        init_carry = (mems, L_norm)
+        init_mems = (mem_enc, mem_s1, mem_s2, mem_s3, mem_out)
         
         ScanSNN = nn.scan(
             SNNStep, variable_broadcast='params',
             split_rngs={'params': False}, in_axes=1, out_axes=1
         )
         
-        _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
+        _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_mems, ann_out)
         
-        L_DP = 12
-        N_DP = 6
-        num_chunks = 120 // L_DP 
+        # 전체 120스텝에 대해 Global Average Pooling으로 가장 안정적인 그래디언트 통로 확보
+        pooled_feat = jnp.mean(mem_out_seq, axis=1) # (B, 16, 32)
         
-        reshaped = mem_out_seq.reshape((B, num_chunks, L_DP, 16, 32))
-        
-        start_avg = jnp.mean(reshaped[:, :, :N_DP, :, :], axis=2)
-        end_avg = jnp.mean(reshaped[:, :, L_DP-N_DP:, :, :], axis=2)
-        dp_feat = end_avg - start_avg 
-        
-        dp_feat_pooled = jnp.mean(dp_feat, axis=2) 
-        
-        flat_feat = dp_feat_pooled.reshape((B, -1)) 
+        flat_feat = pooled_feat.reshape((B, -1)) # (B, 512)
         flat_feat = nn.LayerNorm()(flat_feat) 
         
         y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
@@ -288,7 +272,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         return logits, firing_rate
 
 # =====================================================================
-# 4. JAX 학습 스텝 
+# 4. JAX 학습 스텝 (FR Penalty 완전히 제거된 상태 유지)
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)

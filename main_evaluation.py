@@ -175,7 +175,6 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    # HR-SNN 논문의 Multi-Gaussian 파라미터 적용
     h = 0.15
     s = 6.0
     sigma = 0.5
@@ -193,9 +192,9 @@ def spike_bwd(res, g):
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    beta: float = 0.85  
-    # 스파이크 임계값을 논문 파라미터대로 정상화
-    threshold: float = 0.08 
+    # 안정적인 스파이크 생성과 기억 유지를 위한 표준 파라미터 복구
+    beta: float = 0.8  
+    threshold: float = 1.0 
     
     @nn.compact
     def __call__(self, mem, x):
@@ -205,7 +204,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 (ResNet Identity Shortcut 적용)
+# 3. 모델 아키텍처 ( Laplacian 저주 해결 및 Bias 복구 )
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -213,20 +212,24 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        # 편향 제거 (use_bias=False)
-        enc_in = nn.Dense(32, use_bias=False)(current_in)
+        # [수정] 편향(Bias) 부활. 뉴런이 자체적으로 기저 전류를 만들도록 허용
+        enc_in = nn.Dense(32, use_bias=True)(current_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
-        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
+        # [핵심 수정] Graph Laplacian의 저주 해결!
+        # Laplacian(L) 대신 인접행렬(I - L)을 사용하여 신호 소멸을 막고 공간 특징 융합
+        adj_matrix = jnp.eye(64) - L_norm
+        gx = jnp.einsum('bnm, bmf -> bnf', adj_matrix, spk_enc)
+        
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         
-        cur_s = nn.Dense(64, use_bias=False)(gx_pooled)
+        cur_s = nn.Dense(64, use_bias=True)(gx_pooled)
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        cur_out = nn.Dense(32, use_bias=False)(spk_s)
+        cur_out = nn.Dense(32, use_bias=True)(spk_s)
         
-        # ResNet 방식의 진짜 Identity Shortcut 추가
+        # ResNet Identity Shortcut
         mem_out = mem_out * 0.95 + cur_out + gx_pooled
         
         new_mems = (mem_enc, mem_s, mem_out)
@@ -239,7 +242,8 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=False)(X_seq)
+        # [수정] Conv 층에도 Bias 부활
+        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
@@ -279,7 +283,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         return logits, firing_rate
 
 # =====================================================================
-# 4. JAX 학습 스텝 
+# 4. JAX 학습 스텝 ( Range Penalty 도입 )
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -295,8 +299,9 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        target_fr = 0.1 
-        fr_loss = jnp.square(firing_rate - target_fr) * 0.2
+        # [핵심 수정] 안전지대(Range) 페널티: FR이 5% ~ 20% 사이면 관여하지 않음
+        fr_penalty = jnp.maximum(0.0, firing_rate - 0.20) + jnp.maximum(0.0, 0.05 - firing_rate)
+        fr_loss = fr_penalty * 0.5 
         
         total_loss = ce_loss + fr_loss
         return total_loss, (logits, firing_rate)
@@ -328,8 +333,8 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        target_fr = 0.1 
-        fr_loss = jnp.square(firing_rate - target_fr) * 0.2
+        fr_penalty = jnp.maximum(0.0, firing_rate - 0.20) + jnp.maximum(0.0, 0.05 - firing_rate)
+        fr_loss = fr_penalty * 0.5 
         
         total_loss = ce_loss + fr_loss
         return total_loss, logits 

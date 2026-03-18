@@ -396,11 +396,24 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     
     train_loader = DataLoader(
         TensorDataset(L_train, X_train, y_train), 
-        batch_size=32, shuffle=True, drop_last=True 
+        batch_size=128,        # 🔥 한 번에 4배 많은 일감 투척 (메모리 남으면 256도 추천)
+        shuffle=True, 
+        drop_last=True,
+        num_workers=8,         # 🔥 CPU 코어 8개 할당해서 데이터 준비 속도 가속
+        pin_memory=True,       # 🔥 RAM -> GPU 다이렉트 전송 고속도로 개통
+        persistent_workers=True # 워커 초기화 오버헤드 방지
     )
     
     L_unseen, X_unseen, y_unseen = load_graph_data(global_test_subjs)
-    unseen_loader = DataLoader(TensorDataset(L_unseen, X_unseen, y_unseen), batch_size=32, shuffle=False, drop_last=True)
+    unseen_loader = DataLoader(
+        TensorDataset(L_unseen, X_unseen, y_unseen), 
+        batch_size=128, 
+        shuffle=False, 
+        drop_last=True,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy_L = jnp.ones((1, 64, 64))

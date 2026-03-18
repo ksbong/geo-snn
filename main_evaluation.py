@@ -1,4 +1,9 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import mne
 import numpy as np
 import torch
@@ -124,7 +129,6 @@ def process_single_subject(args):
         }
     except Exception:
         return subj, None
-
 def load_all_graph_data():
     base_search_dir = '/workspace' if os.path.exists('/workspace') else '.'
     DATA_DIR = None
@@ -141,11 +145,12 @@ def load_all_graph_data():
     all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
     
     subject_data_dict = {}
-    num_cores = multiprocessing.cpu_count()
-    print(f"\n>>> RunPod vCPU {num_cores}코어 풀가동! {len(all_subjects)}명 진짜 멀티프로세싱 전처리 시작...")
     
-    # ProcessPoolExecutor로 여러 코어에 작업 찢어서 던지기
-    with ProcessPoolExecutor(max_workers=num_cores) as executor:
+    # 🚨 [수정] 96코어를 다 쓰면 램이 터지니까 안전하게 20개 워커로 제한 🚨
+    safe_workers = min(20, multiprocessing.cpu_count())
+    print(f"\n>>> RunPod vCPU 96코어 감지! 데드락 방지를 위해 {safe_workers}개 프로세스로 병렬 전처리 시작...")
+    
+    with ProcessPoolExecutor(max_workers=safe_workers) as executor:
         args_list = [(subj, DATA_DIR) for subj in all_subjects]
         futures = {executor.submit(process_single_subject, arg): arg for arg in args_list}
         

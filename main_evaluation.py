@@ -54,6 +54,11 @@ def compute_spd_cov(signal):
     epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
     return cov + np.eye(cov.shape[0]) * epsilon
 # =====================================================================
+# 2. 다수 피험자 데이터 로딩 (진짜 멀티프로세싱 CPU 풀가동)
+# =====================================================================
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+# =====================================================================
 # 2. 다수 피험자 데이터 로딩 (멀티프로세싱 + 🚨완벽한 1:1:1:1 클래스 밸런싱 추가🚨)
 # =====================================================================
 def process_single_subject(args):

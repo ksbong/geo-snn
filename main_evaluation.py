@@ -13,6 +13,7 @@ import functools
 # JAX & Flax 생태계 임포트
 import jax
 import jax.numpy as jnp
+import flax
 import flax.linen as nn
 from flax.training import train_state
 import optax
@@ -170,7 +171,7 @@ def load_graph_data(subject_list):
 
 
 # =====================================================================
-# 2. Surrogate Gradient & LIF (stop_gradient 적용)
+# 2. Surrogate Gradient & LIF 
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -181,7 +182,8 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    alpha = 5.0  
+    # [수정] 기울기 완화 (5.0 -> 2.0)
+    alpha = 2.0  
     grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
     return (g * grad,)
 
@@ -195,13 +197,12 @@ class LIF(nn.Module):
     def __call__(self, mem, x):
         mem = mem * self.beta + x
         spk = spike_fn(mem - self.threshold) 
-        # 역전파 차단을 위해 jax.lax.stop_gradient 적용
         mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
         return mem, spk
 
 
 # =====================================================================
-# 3. 모델 아키텍처 (LayerNorm 추가)
+# 3. 모델 아키텍처 
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -209,20 +210,24 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        enc_in = nn.Dense(8, use_bias=True, bias_init=nn.initializers.constant(0.5))(current_in)
-        enc_in = nn.LayerNorm()(enc_in) # 안정화용 LayerNorm 추가
+        # [수정] 채널 확장 (8 -> 32)
+        enc_in = nn.Dense(32, use_bias=True, bias_init=nn.initializers.constant(0.5))(current_in)
+        enc_in = nn.LayerNorm()(enc_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
         gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
-        spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 4))
+        # [수정] 공간 풀링 파라미터 확장 ((64, 4) -> (64, 16))
+        spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
         
-        cur_s = nn.Dense(32, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_flat)
-        cur_s = nn.LayerNorm()(cur_s) # 안정화용 LayerNorm 추가
+        # [수정] 채널 확장 (32 -> 128)
+        cur_s = nn.Dense(128, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_flat)
+        cur_s = nn.LayerNorm()(cur_s) 
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        cur_out = nn.Dense(16, use_bias=True)(spk_s)
+        # [수정] 채널 확장 (16 -> 64)
+        cur_out = nn.Dense(64, use_bias=True)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 
         
         new_mems = (mem_enc, mem_s, mem_out)
@@ -235,7 +240,8 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=8, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
+        # [수정] 채널 확장 (8 -> 32)
+        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
@@ -244,9 +250,10 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
-        mem_enc = jnp.zeros((B, 64, 8))
-        mem_s = jnp.zeros((B, 32))
-        mem_out = jnp.zeros((B, 16))
+        # [수정] 확장된 채널 크기에 맞춘 초기화
+        mem_enc = jnp.zeros((B, 64, 32))
+        mem_s = jnp.zeros((B, 128))
+        mem_out = jnp.zeros((B, 64))
         
         mems = (mem_enc, mem_s, mem_out)
         init_carry = (mems, L_norm)
@@ -258,12 +265,8 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        num_chunks = 10
-        chunk_size = T // num_chunks
-        chunks = mem_out_seq.reshape((B, num_chunks, chunk_size, 16))
-        pooled_feat = jnp.mean(chunks, axis=2) 
-        
-        flat_feat = pooled_feat.reshape((B, -1)) 
+        # [수정] 시간축 정보 손실을 막기 위해 10개 청크 분할 대신 전체 타임스텝의 막전위를 누적(Sum)
+        flat_feat = jnp.sum(mem_out_seq, axis=1) 
         
         y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
@@ -274,7 +277,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
 
 
 # =====================================================================
-# 4. JAX Single-GPU (jit) 학습 스텝 (Firing Rate 페널티 추가)
+# 4. JAX Single-GPU (jit) 학습 스텝
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -290,7 +293,6 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        # Firing Rate 페널티 (목표치 10%)
         target_fr = 0.1 
         fr_loss = jnp.square(firing_rate - target_fr) * 1.0
         
@@ -324,7 +326,6 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
-        # SSTL 단계에서도 Firing Rate 제어
         target_fr = 0.1 
         fr_loss = jnp.square(firing_rate - target_fr) * 1.0
         
@@ -383,7 +384,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy_L = jnp.ones((1, 64, 64))
-    dummy_X = jnp.ones((1, 240, 64, 4))
+    # [수정] 원본 타임스텝 길이를 반영하여 240이 아닌 480으로 변경
+    dummy_X = jnp.ones((1, 480, 64, 4))
     
     model = Ultimate_STCN_GraphSNN()
     variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
@@ -409,7 +411,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False, bar_format='{l_bar}{bar:20}{r_bar}')
         for batch_L, batch_X, batch_y in pbar:
             j_L = jnp.array(batch_L.numpy())
-            j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
+            # [수정] 시간축 슬라이싱([:, ::2, :, :]) 제거, 전체 프레임 입력
+            j_X = jnp.array(batch_X.numpy()) 
             j_y = jnp.array(batch_y.numpy())
             
             rng, dropout_key = jax.random.split(rng)
@@ -421,7 +424,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             unseen_corr, unseen_tot = 0, 0
             for batch_L, batch_X, batch_y in unseen_loader:
                 j_L = jnp.array(batch_L.numpy())
-                j_X = jnp.array(batch_X.numpy()[:, ::2, :, :])
+                # [수정] 시간축 슬라이싱 제거
+                j_X = jnp.array(batch_X.numpy())
                 j_y = jnp.array(batch_y.numpy())
                 
                 batch_acc = eval_step(state, j_L, j_X, j_y)
@@ -434,7 +438,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     unseen_corr, unseen_tot = 0, 0
     for batch_L, batch_X, batch_y in unseen_loader:
         j_L = jnp.array(batch_L.numpy())
-        j_X = jnp.array(batch_X.numpy()[:, ::2, :, :])
+        # [수정] 시간축 슬라이싱 제거
+        j_X = jnp.array(batch_X.numpy())
         j_y = jnp.array(batch_y.numpy())
         
         batch_acc = eval_step(state, j_L, j_X, j_y)
@@ -477,7 +482,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             for _ in range(5): 
                 for batch_L, batch_X, batch_y in sub_train_loader:
                     j_L = jnp.array(batch_L.numpy())
-                    j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
+                    # [수정] 시간축 슬라이싱 제거
+                    j_X = jnp.array(batch_X.numpy()) 
                     j_y = jnp.array(batch_y.numpy())
                     
                     rng, dropout_key = jax.random.split(rng)
@@ -486,7 +492,8 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             corr, tot = 0, 0
             for batch_L, batch_X, batch_y in sub_test_loader:
                 j_L = jnp.array(batch_L.numpy())
-                j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
+                # [수정] 시간축 슬라이싱 제거
+                j_X = jnp.array(batch_X.numpy()) 
                 j_y = jnp.array(batch_y.numpy())
                 
                 batch_acc = eval_step(sstl_state, j_L, j_X, j_y)

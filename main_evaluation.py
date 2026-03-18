@@ -175,9 +175,8 @@ class LIF(nn.Module):
         spk = spike_fn(mem - self.threshold) 
         mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
         return mem, spk
-
 # =====================================================================
-# 4. 네 오리지널 모델 아키텍처 (에러 수정 완료)
+# 4. 네 오리지널 모델 아키텍처 (다이렉트 인코딩 + 뉴런 질식사 방지 완벽 결합)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -185,10 +184,18 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        enc_in = nn.Dense(16)(current_in)
-        enc_in = nn.LayerNorm()(enc_in) 
-        mem_enc, spk_enc = LIF()(mem_enc, enc_in)
+        # 🚨 [내가 빼먹었던 다이렉트 인코딩] 아날로그 피처를 스파이크로 번역해주는 Learnable Gain & Bias 🚨
+        gain = self.param('enc_gain', nn.initializers.ones, current_in.shape[-2:])
+        bias = self.param('enc_bias', nn.initializers.zeros, current_in.shape[-2:])
+        enc_current = current_in * gain + bias
         
+        enc_in = nn.Dense(16)(enc_current)
+        # 뉴런 질식시키는 LayerNorm 제거 & 0.1 스케일에 반응하는 초민감 LIF 적용
+        mem_enc, spk_enc = LIF(beta=0.5, threshold=0.5)(mem_enc, enc_in)
+        
+        # =================================================================
+        # 여기서부터 네 오리지널 Graph Laplacian 아이디어 그대로 적용
+        # =================================================================
         adj = jnp.eye(64) - L_norm
         gx = jnp.einsum('bnm, bmf -> bnf', adj, spk_enc)
         
@@ -197,15 +204,15 @@ class SNNStep(nn.Module):
         gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
         
         cur_s = nn.Dense(64)(gx_flat)
-        cur_s = nn.LayerNorm()(cur_s)
+        # 여기도 루프 안에서 신호 갉아먹는 LayerNorm 제거
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
         cur_out = nn.Dense(32)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 
         
-        # [수정] 들어온 carry 구조(mems, L_norm)와 완벽하게 동일한 구조로 반환!
         new_mems = (mem_enc, mem_s, mem_out)
         return (new_mems, L_norm), (mem_out, spk_enc, spk_s)
+
 
 class Ultimate_STCN_GraphSNN(nn.Module):
     num_classes: int = 4

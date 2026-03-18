@@ -164,7 +164,7 @@ def load_graph_data(subject_list):
     return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
 
 # =====================================================================
-# 2. Surrogate Gradient (Fast Sigmoid) & LIF 
+# 2. Surrogate Gradient (Fast Sigmoid) & LIF 구조 수정
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -175,7 +175,6 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    # 무한대 꼬리를 가져 죽은 뉴런도 살려내는 Fast Sigmoid로 교체
     alpha = 2.0
     grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
     return (g * grad,)
@@ -183,8 +182,9 @@ def spike_bwd(res, g):
 spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    beta: float = 0.8  
-    threshold: float = 1.0 
+    # 각 뉴런 그룹이 다르게 반응할 수 있도록 파라미터화
+    beta: float 
+    threshold: float 
     
     @nn.compact
     def __call__(self, mem, x):
@@ -194,37 +194,48 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 (Graph Laplacian 치명적 오류 해결)
+# 3. 모델 아키텍처 (HR Module & DP-Pooling 적용)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
     def __call__(self, carry, current_in):
         mems, L_norm = carry
-        mem_enc, mem_s, mem_out = mems
+        mem_enc, mem_s1, mem_s2, mem_s3, mem_out = mems
         
-        # 순정 LayerNorm 사용. 스케일을 기가 막히게 맞춰서 자연스러운 스파이크 유도.
         enc_in = nn.Dense(32)(current_in)
         enc_in = nn.LayerNorm()(enc_in)
-        mem_enc, spk_enc = LIF()(mem_enc, enc_in)
+        mem_enc, spk_enc = LIF(beta=0.8, threshold=1.0)(mem_enc, enc_in)
         
-        # [핵심 수술] 자기 자신 데이터를 날려버리던 멍청한 코드 삭제
-        # 자기 신호는 보존하고 Laplacian에 의한 주변 노드 차이만 부드럽게 융합 (Residual Graph Filter)
         gx_lap = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
         gx = spk_enc - 0.5 * gx_lap
         
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         
-        cur_s = nn.Dense(64)(gx_pooled)
-        cur_s = nn.LayerNorm()(cur_s)
-        mem_s, spk_s = LIF()(mem_s, cur_s) 
+        # [핵심 수술 1] HR Module: 3개의 병렬 LIF 세트를 사용하여 다양한 시간 응답 특성 학습
+        # 1. 민감하고 빨리 잊음 (Low threshold, Fast decay)
+        c1 = nn.Dense(32)(gx_pooled)
+        c1 = nn.LayerNorm()(c1)
+        mem_s1, spk1 = LIF(beta=0.8, threshold=0.6)(mem_s1, c1) 
         
-        cur_out = nn.Dense(32)(spk_s)
-        # 안정적인 Leaky Readout 적용
+        # 2. 뉴트럴 (Neutral)
+        c2 = nn.Dense(32)(gx_pooled)
+        c2 = nn.LayerNorm()(c2)
+        mem_s2, spk2 = LIF(beta=0.9, threshold=1.0)(mem_s2, c2) 
+        
+        # 3. 둔감하지만 오래 기억함 (High threshold, Slow decay)
+        c3 = nn.Dense(32)(gx_pooled)
+        c3 = nn.LayerNorm()(c3)
+        mem_s3, spk3 = LIF(beta=0.95, threshold=1.4)(mem_s3, c3) 
+        
+        # 세 가지 다른 응답을 융합
+        spk_cat = jnp.concatenate([spk1, spk2, spk3], axis=-1)
+        
+        cur_out = nn.Dense(32)(spk_cat)
         mem_out = mem_out * 0.8 + cur_out
         
-        new_mems = (mem_enc, mem_s, mem_out)
-        return (new_mems, L_norm), (mem_out, spk_enc, spk_s)
+        new_mems = (mem_enc, mem_s1, mem_s2, mem_s3, mem_out)
+        return (new_mems, L_norm), (mem_out, spk_enc, spk_cat)
 
 class Ultimate_STCN_GraphSNN(nn.Module):
     num_classes: int = 4
@@ -242,11 +253,14 @@ class Ultimate_STCN_GraphSNN(nn.Module):
             mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
             L_norm = L_norm * mask / 0.7
 
+        # 3개의 병렬 메모리를 위한 초기화 추가
         mem_enc = jnp.zeros((B, 64, 32))
-        mem_s = jnp.zeros((B, 16, 64))
+        mem_s1 = jnp.zeros((B, 16, 32))
+        mem_s2 = jnp.zeros((B, 16, 32))
+        mem_s3 = jnp.zeros((B, 16, 32))
         mem_out = jnp.zeros((B, 16, 32))
         
-        mems = (mem_enc, mem_s, mem_out)
+        mems = (mem_enc, mem_s1, mem_s2, mem_s3, mem_out)
         init_carry = (mems, L_norm)
         
         ScanSNN = nn.scan(
@@ -256,16 +270,25 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        num_chunks = 6
-        chunk_size = T // num_chunks
+        # [핵심 수술 2] DP (Diff-Potential) Pooling
+        # 480 프레임을 길이 24 단위(L_DP)로 쪼갠 후, 첫 12 스텝(N_DP)과 마지막 12 스텝의 평균 차이 계산
+        L_DP = 24
+        N_DP = 12
+        num_chunks = T // L_DP # 20 chunks
         
-        chunks = mem_out_seq[:, :num_chunks*chunk_size, :, :]
-        chunks = chunks.reshape((B, num_chunks, chunk_size, 16, 32))
+        # 형태 변환: (B, 20, 24, 16, 32)
+        reshaped = mem_out_seq.reshape((B, num_chunks, L_DP, 16, 32))
         
-        chunked_feat = jnp.mean(chunks, axis=2) 
-        flat_feat = chunked_feat.reshape((B, -1)) 
+        # 앞부분 평균과 뒷부분 평균의 차이(Diff-Potential)로 ERD/ERS 시간적 변화량 추출
+        start_avg = jnp.mean(reshaped[:, :, :N_DP, :, :], axis=2)
+        end_avg = jnp.mean(reshaped[:, :, L_DP-N_DP:, :, :], axis=2)
+        dp_feat = end_avg - start_avg 
         
-        y = nn.Dropout(rate=0.4, deterministic=deterministic)(flat_feat)
+        flat_feat = dp_feat.reshape((B, -1)) 
+        flat_feat = nn.LayerNorm()(flat_feat) # 분류기 전 정규화로 안정성 추가
+        
+        # 과적합 억제를 위해 드롭아웃 강화
+        y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
         
         firing_rate = (jnp.mean(spk_enc) + jnp.mean(spk_s)) / 2.0 
@@ -273,7 +296,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         return logits, firing_rate
 
 # =====================================================================
-# 4. JAX 학습 스텝 (FR 페널티 싹 다 날림)
+# 4. JAX 학습 스텝 
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -287,8 +310,6 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
             deterministic=False, rngs={'dropout': dropout_key}
         )
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        
-        # 모델의 숨통을 끊어버리던 FR 페널티 완전히 삭제
         loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         return loss, (logits, firing_rate)
 

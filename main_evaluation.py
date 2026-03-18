@@ -13,6 +13,7 @@ import functools
 # JAX & Flax 생태계 임포트
 import jax
 import jax.numpy as jnp
+import flax
 import flax.linen as nn
 from flax.training import train_state
 import optax

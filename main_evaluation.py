@@ -170,7 +170,7 @@ def load_graph_data(subject_list):
 
 
 # =====================================================================
-# 2. Surrogate Gradient & LIF
+# 2. Surrogate Gradient & LIF (stop_gradient 적용)
 # =====================================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -195,12 +195,13 @@ class LIF(nn.Module):
     def __call__(self, mem, x):
         mem = mem * self.beta + x
         spk = spike_fn(mem - self.threshold) 
-        mem = mem - spk * self.threshold 
+        # 역전파 차단을 위해 jax.lax.stop_gradient 적용
+        mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
         return mem, spk
 
 
 # =====================================================================
-# 3. 모델 아키텍처: 시간의 흐름(ERD/ERS) 보존 완벽 수술
+# 3. 모델 아키텍처 (LayerNorm 추가)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -209,6 +210,7 @@ class SNNStep(nn.Module):
         mem_enc, mem_s, mem_out = mems
         
         enc_in = nn.Dense(8, use_bias=True, bias_init=nn.initializers.constant(0.5))(current_in)
+        enc_in = nn.LayerNorm()(enc_in) # 안정화용 LayerNorm 추가
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
         gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
@@ -217,6 +219,7 @@ class SNNStep(nn.Module):
         gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
         
         cur_s = nn.Dense(32, use_bias=True, bias_init=nn.initializers.constant(0.5))(gx_flat)
+        cur_s = nn.LayerNorm()(cur_s) # 안정화용 LayerNorm 추가
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
         cur_out = nn.Dense(16, use_bias=True)(spk_s)
@@ -255,13 +258,12 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         
         _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
         
-        # 시간 정보 뭉개기 버그 수정: 10개의 구간으로 나누어 시계열 흐름 보존
         num_chunks = 10
         chunk_size = T // num_chunks
         chunks = mem_out_seq.reshape((B, num_chunks, chunk_size, 16))
-        pooled_feat = jnp.mean(chunks, axis=2) # (B, 10, 16)
+        pooled_feat = jnp.mean(chunks, axis=2) 
         
-        flat_feat = pooled_feat.reshape((B, -1)) # (B, 160)
+        flat_feat = pooled_feat.reshape((B, -1)) 
         
         y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
         logits = nn.Dense(self.num_classes)(y)
@@ -272,7 +274,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
 
 
 # =====================================================================
-# 4. JAX Single-GPU (jit) 학습 스텝
+# 4. JAX Single-GPU (jit) 학습 스텝 (Firing Rate 페널티 추가)
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -286,8 +288,14 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
             deterministic=False, rngs={'dropout': dropout_key}
         )
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
-        return loss, (logits, firing_rate)
+        ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
+        
+        # Firing Rate 페널티 (목표치 10%)
+        target_fr = 0.1 
+        fr_loss = jnp.square(firing_rate - target_fr) * 1.0
+        
+        total_loss = ce_loss + fr_loss
+        return total_loss, (logits, firing_rate)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, (logits, firing_rate)), grads = grad_fn(state.params)
@@ -314,8 +322,14 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
             deterministic=False, rngs={'dropout': dropout_key}
         )
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
-        loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
-        return loss, logits 
+        ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
+        
+        # SSTL 단계에서도 Firing Rate 제어
+        target_fr = 0.1 
+        fr_loss = jnp.square(firing_rate - target_fr) * 1.0
+        
+        total_loss = ce_loss + fr_loss
+        return total_loss, logits 
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, logits), grads = grad_fn(state.params)
@@ -351,7 +365,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         batch_size=128,        
         shuffle=True, 
         drop_last=True,
-        num_workers=8,         
+        num_workers=8,        
         pin_memory=True,       
         persistent_workers=True 
     )

@@ -53,7 +53,7 @@ def compute_spd_cov(signal):
 # 2. 다수 피험자 데이터 로딩 (캐싱 작동 확인)
 # =====================================================================
 def load_all_graph_data():
-    base_search_dir = '/workspace' if os.path.exists('/workspace') else '.'
+    base_search_dir = './07_Data' if os.path.exists('/workspace') else '.'
     DATA_DIR = None
 
     print(f"\n>>> [{base_search_dir}] 뇌파 데이터 자동 탐색 중...")

@@ -201,7 +201,7 @@ class LIF(nn.Module):
         mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
         return mem, spk
 # =====================================================================
-# 4. 네 오리지널 모델 아키텍처 (다이렉트 인코딩 + 뉴런 질식사 방지 완벽 결합)
+# 4. 네 오리지널 모델 아키텍처 (LayerNorm 부활 - 뇌사 방지)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -209,18 +209,16 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        # 🚨 [내가 빼먹었던 다이렉트 인코딩] 아날로그 피처를 스파이크로 번역해주는 Learnable Gain & Bias 🚨
         gain = self.param('enc_gain', nn.initializers.ones, current_in.shape[-2:])
         bias = self.param('enc_bias', nn.initializers.zeros, current_in.shape[-2:])
         enc_current = current_in * gain + bias
         
+        # 🚨 [핵심 복구 1] 네 원래 아이디어였던 LayerNorm 부활!
+        # 입력 전류의 분산을 강제로 1로 맞춰서 뉴런이 무조건 스파이크를 쏘게 만듦
         enc_in = nn.Dense(16)(enc_current)
-        # 뉴런 질식시키는 LayerNorm 제거 & 0.1 스케일에 반응하는 초민감 LIF 적용
+        enc_in = nn.LayerNorm()(enc_in) 
         mem_enc, spk_enc = LIF(beta=0.5, threshold=0.5)(mem_enc, enc_in)
         
-        # =================================================================
-        # 여기서부터 네 오리지널 Graph Laplacian 아이디어 그대로 적용
-        # =================================================================
         adj = jnp.eye(64) - L_norm
         gx = jnp.einsum('bnm, bmf -> bnf', adj, spk_enc)
         
@@ -228,9 +226,10 @@ class SNNStep(nn.Module):
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
         
+        # 🚨 [핵심 복구 2] 두 번째 SNN 레이어 전류도 스케일 펌핑
         cur_s = nn.Dense(64)(gx_flat)
-        # 여기도 루프 안에서 신호 갉아먹는 LayerNorm 제거
-        mem_s, spk_s = LIF()(mem_s, cur_s) 
+        cur_s = nn.LayerNorm()(cur_s)
+        mem_s, spk_s = LIF(beta=0.8, threshold=1.0)(mem_s, cur_s) 
         
         cur_out = nn.Dense(32)(spk_s)
         mem_out = mem_out * 0.95 + cur_out 

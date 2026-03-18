@@ -54,11 +54,8 @@ def compute_spd_cov(signal):
     epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
     return cov + np.eye(cov.shape[0]) * epsilon
 # =====================================================================
-# 2. 다수 피험자 데이터 로딩 (진짜 멀티프로세싱 CPU 풀가동)
+# 2. 다수 피험자 데이터 로딩 (멀티프로세싱 + 🚨완벽한 1:1:1:1 클래스 밸런싱 추가🚨)
 # =====================================================================
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
-
 def process_single_subject(args):
     subj, DATA_DIR = args
     runs_hands = ['R04', 'R08', 'R12']
@@ -70,7 +67,6 @@ def process_single_subject(args):
             path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
             if not os.path.exists(path): continue
             
-            # 로그 끄고 조용히 로드
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
             evs, ev_dict = mne.events_from_annotations(raw, verbose=False)
             
@@ -97,6 +93,30 @@ def process_single_subject(args):
         data = epochs_all.get_data() * 1e6  
         sfreq = epochs_all.info['sfreq']
         
+        # 🚨 [여기서부터 추가됨] 가장 개수가 적은 클래스 기준으로 데이터 강제 커팅 (1:1:1:1 밸런싱)
+        idx_0 = np.where(labels == 0)[0]
+        idx_1 = np.where(labels == 1)[0]
+        idx_2 = np.where(labels == 2)[0]
+        idx_3 = np.where(labels == 3)[0]
+        min_count = min(len(idx_0), len(idx_1), len(idx_2), len(idx_3))
+        
+        # 유효한 클래스가 하나라도 없으면 이 피험자 데이터는 버림
+        if min_count == 0: return subj, None 
+        
+        np.random.seed(42) # 항상 동일한 샘플을 뽑도록 시드 고정
+        balanced_idx = np.concatenate([
+            np.random.choice(idx_0, min_count, replace=False),
+            np.random.choice(idx_1, min_count, replace=False),
+            np.random.choice(idx_2, min_count, replace=False),
+            np.random.choice(idx_3, min_count, replace=False)
+        ])
+        np.random.shuffle(balanced_idx)
+        
+        # 밸런싱된 데이터로 덮어쓰기
+        data = data[balanced_idx]
+        labels = labels[balanced_idx]
+        # 🚨 [추가 끝] 🚨
+
         mean_data = np.mean(data, axis=(0, 2), keepdims=True)
         std_data = np.std(data, axis=(0, 2), keepdims=True)
         data_norm = (data - mean_data) / (std_data + 1e-8)
@@ -108,7 +128,6 @@ def process_single_subject(args):
             seq = encoded_signals[ep_idx]
             sig_for_cov = seq.reshape(seq.shape[0], -1)
             
-            # 여기가 원래 제일 느렸던 CPU 병목 구간
             cov_full = compute_spd_cov(sig_for_cov)
             tangent = logm(cov_full).real
             tau = np.std(tangent) if np.std(tangent) > 0 else 1.0
@@ -129,6 +148,7 @@ def process_single_subject(args):
         }
     except Exception:
         return subj, None
+    
 def load_all_graph_data():
     base_search_dir = '/workspace' if os.path.exists('/workspace') else '.'
     DATA_DIR = None

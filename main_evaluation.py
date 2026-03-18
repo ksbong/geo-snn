@@ -175,7 +175,7 @@ def spike_fwd(x):
 
 def spike_bwd(res, g):
     x = res
-    # [핵심 수정] 무한대 꼬리를 가져 죽은 뉴런도 살려내는 Fast Sigmoid로 교체
+    # 무한대 꼬리를 가져 죽은 뉴런도 살려내는 Fast Sigmoid로 교체
     alpha = 2.0
     grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
     return (g * grad,)
@@ -184,7 +184,6 @@ spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
     beta: float = 0.8  
-    # [핵심 수정] 임계값은 정석대로 1.0 고정. 가중치와 LayerNorm이 스케일을 맞춤.
     threshold: float = 1.0 
     
     @nn.compact
@@ -195,7 +194,7 @@ class LIF(nn.Module):
         return mem, spk
 
 # =====================================================================
-# 3. 모델 아키텍처 
+# 3. 모델 아키텍처 (Graph Laplacian 치명적 오류 해결)
 # =====================================================================
 class SNNStep(nn.Module):
     @nn.compact
@@ -203,23 +202,26 @@ class SNNStep(nn.Module):
         mems, L_norm = carry
         mem_enc, mem_s, mem_out = mems
         
-        enc_in = nn.Dense(32, use_bias=True)(current_in)
-        # [핵심 수정] 평균이 0이 되어 막전위가 음수로 빠지는 걸 막기 위해 양수 편향(0.1) 추가
-        enc_in = nn.LayerNorm(bias_init=nn.initializers.constant(0.1))(enc_in)
+        # 순정 LayerNorm 사용. 스케일을 기가 막히게 맞춰서 자연스러운 스파이크 유도.
+        enc_in = nn.Dense(32)(current_in)
+        enc_in = nn.LayerNorm()(enc_in)
         mem_enc, spk_enc = LIF()(mem_enc, enc_in)
         
-        adj_matrix = jnp.eye(64) - L_norm
-        gx = jnp.einsum('bnm, bmf -> bnf', adj_matrix, spk_enc)
+        # [핵심 수술] 자기 자신 데이터를 날려버리던 멍청한 코드 삭제
+        # 자기 신호는 보존하고 Laplacian에 의한 주변 노드 차이만 부드럽게 융합 (Residual Graph Filter)
+        gx_lap = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
+        gx = spk_enc - 0.5 * gx_lap
         
         spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 16))
         gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
         
-        cur_s = nn.Dense(64, use_bias=True)(gx_pooled)
-        cur_s = nn.LayerNorm(bias_init=nn.initializers.constant(0.1))(cur_s)
+        cur_s = nn.Dense(64)(gx_pooled)
+        cur_s = nn.LayerNorm()(cur_s)
         mem_s, spk_s = LIF()(mem_s, cur_s) 
         
-        cur_out = nn.Dense(32, use_bias=True)(spk_s)
-        mem_out = mem_out * 0.95 + cur_out + gx_pooled
+        cur_out = nn.Dense(32)(spk_s)
+        # 안정적인 Leaky Readout 적용
+        mem_out = mem_out * 0.8 + cur_out
         
         new_mems = (mem_enc, mem_s, mem_out)
         return (new_mems, L_norm), (mem_out, spk_enc, spk_s)
@@ -231,7 +233,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
     def __call__(self, L_norm, X_seq, deterministic: bool):
         B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
+        ann_out = nn.Conv(features=32, kernel_size=(32, 1), padding='SAME')(X_seq)
         ann_out = nn.relu(ann_out) 
         
         if not deterministic:
@@ -271,7 +273,7 @@ class Ultimate_STCN_GraphSNN(nn.Module):
         return logits, firing_rate
 
 # =====================================================================
-# 4. JAX 학습 스텝 ( FR 페널티 완전 삭제 )
+# 4. JAX 학습 스텝 (FR 페널티 싹 다 날림)
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -286,9 +288,8 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
         )
         smoothed_targets = smooth_labels(targets, 4, smoothing=0.2)
         
-        # [핵심 수정] 식물인간을 유발하던 FR Penalty 완전 삭제. 오직 분류만 집중하게 만듦.
+        # 모델의 숨통을 끊어버리던 FR 페널티 완전히 삭제
         loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
-        
         return loss, (logits, firing_rate)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)

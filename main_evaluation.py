@@ -21,7 +21,7 @@ import flax.traverse_util
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # =====================================================================
-# 1. 생물학적 4채널 인코딩 & 전처리 (V20 캐시 재사용)
+# 1. 생물학적 4채널 인코딩 & 전처리 (캐시 유지)
 # =====================================================================
 def extract_snn_encoded_features(data, sfreq):
     n_times = data.shape[-1]
@@ -49,12 +49,10 @@ def compute_spd_cov(signal):
     epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
     return cov + np.eye(cov.shape[0]) * epsilon
 
-# RunPod 환경 경로
 DATA_DIR = './07_Data'
 if not os.path.exists(DATA_DIR):
     DATA_DIR = './07_Data' 
 
-# 캐시 저장 경로
 SAVE_DIR = './processed_graph_tensors_fixed_v20_Riemannian_Weighted_SNN'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -172,160 +170,117 @@ def load_graph_data(subject_list):
 
 
 # =====================================================================
-# 2. Surrogate Gradient & LIF 뉴런
+# 2. Surrogate Gradient (Fast Sigmoid) & LIF 뉴런
 # =====================================================================
 @jax.custom_vjp
-def multi_gaussian_spike(x):
+def spike_fn(x):
     return jnp.where(x > 0, 1.0, 0.0)
 
-def mg_fwd(x):
-    return multi_gaussian_spike(x), x
+def spike_fwd(x):
+    return spike_fn(x), x
 
-def mg_bwd(res, g):
+def spike_bwd(res, g):
     x = res
-    h, s, sigma = 0.2, 6.0, 0.6 
-    def gaussian(val, mu, std):
-        return (1.0 / (jnp.sqrt(2 * jnp.pi) * std)) * jnp.exp(-0.5 * jnp.square((val - mu) / std))
-    grad = (1 + h) * gaussian(x, 0.0, sigma) - h * gaussian(x, sigma, s * sigma) - h * gaussian(x, -sigma, s * sigma)
+    alpha = 2.0  # 🔥 절대 기울기가 0으로 죽지 않는 Fast Sigmoid 미분 적용
+    grad = 1.0 / jnp.square(1.0 + jnp.abs(alpha * x))
     return (g * grad,)
 
-multi_gaussian_spike.defvjp(mg_fwd, mg_bwd)
+spike_fn.defvjp(spike_fwd, spike_bwd)
 
 class LIF(nn.Module):
-    beta: float = 0.9
-    threshold: float = 0.3 
+    beta: float = 0.8
+    threshold: float = 0.5 
     @nn.compact
     def __call__(self, mem, x):
         mem = mem * self.beta + x
-        mem = jnp.maximum(mem, -2.0) 
-        spk = multi_gaussian_spike(mem - self.threshold) 
+        # SNN 내부 Dense 제거로 인해, 값을 0 이상으로 자연스럽게 유지
+        spk = spike_fn(mem - self.threshold) 
         mem = mem - spk * self.threshold 
         return mem, spk
 
+
 # =====================================================================
-# 3. 모델 아키텍처 V26 Final: 시냅스 복구 + LayerNorm + Concat 디코더
+# 3. 모델 아키텍처: 구조 단순화 및 공간-시간 철저한 분리 처리
 # =====================================================================
-class MultiBetaLIF(nn.Module):
+class SNN_Core(nn.Module):
+    """
+    내부에 Dense/LayerNorm이 전혀 없는 순수 시계열 동역학 엔진
+    """
     @nn.compact
-    def __call__(self, mems, x):
-        # 💡 초경량 '착한 Dense' (1024 파라미터) + LayerNorm으로 뇌사 방지
-        c1 = nn.LayerNorm()(nn.Dense(32, use_bias=False)(x))
-        mem1, spk1 = LIF(beta=0.8, threshold=0.3)(mems[0], c1)
-        
-        c2 = nn.LayerNorm()(nn.Dense(32, use_bias=False)(x))
-        mem2, spk2 = LIF(beta=0.9, threshold=0.3)(mems[1], c2)
-        
-        c3 = nn.LayerNorm()(nn.Dense(32, use_bias=False)(x))
-        mem3, spk3 = LIF(beta=0.95, threshold=0.2)(mems[2], c3)
-        
-        spk_out = jnp.concatenate([spk1, spk2, spk3], axis=-1) 
-        return [mem1, mem2, mem3], spk_out
+    def __call__(self, carry, x_t):
+        mem1, mem2, mem_out = carry
 
-class DPPoolingDecoder(nn.Module):
-    num_classes: int = 4
-    L_DP: int = 24
-    N_DP: int = 12
+        mem1, spk1 = LIF(beta=0.8, threshold=0.5)(mem1, x_t)
+        mem2, spk2 = LIF(beta=0.9, threshold=0.5)(mem2, spk1)
+        
+        # Leaky Integrator: 스파이크를 전위로 부드럽게 누적하여 디코더로 패스
+        mem_out = mem_out * 0.95 + spk2
+        
+        return (mem1, mem2, mem_out), (mem_out, spk1, spk2)
 
-    @nn.compact
-    def __call__(self, x_seq, deterministic: bool):
-        B, T, F = x_seq.shape 
-        num_chunks = T // self.L_DP
-        chunks = x_seq.reshape((B, num_chunks, self.L_DP, F))
-        
-        start_mean = jnp.mean(chunks[:, :, :self.N_DP, :], axis=2)
-        end_mean = jnp.mean(chunks[:, :, -self.N_DP:, :], axis=2)
-        
-        # 🔥 1.38 늪 탈출 치트키: 뺄셈 대신 Concat으로 ERD/ERS 정보량 100% 보존
-        dp_feat = jnp.concatenate([start_mean, end_mean], axis=-1) 
-        
-        x = dp_feat.reshape((B, -1)) # (B, 10청크 * 32피처 = 320차원)
-        
-        x = nn.Dropout(rate=0.5, deterministic=deterministic)(x)
-        x = nn.Dense(32)(x)
-        x = nn.LayerNorm(epsilon=1e-5)(x) 
-        x = nn.gelu(x)
-        x = nn.Dropout(rate=0.5, deterministic=deterministic)(x)
-        x = nn.Dense(self.num_classes)(x)
-        return x
-
-class SNNStep(nn.Module):
-    @nn.compact
-    def __call__(self, carry, current_in):
-        mems, L_norm = carry
-        mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out = mems
-        
-        mem_enc, spk_enc = LIF(beta=0.8, threshold=0.5)(mem_enc, current_in)
-        
-        # 리만 매니폴드 맵핑 (Graph Convolution)
-        gx = jnp.einsum('bnm, bmf -> bnf', L_norm, spk_enc)
-        
-        # CSP 스타일 공간 압축 (64채널의 지문을 지우고 4개 소스로 압축)
-        spatial_w = self.param('spatial_w', nn.initializers.glorot_uniform(), (64, 4))
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
-        gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) # (B, 32)
-        
-        cur_s = nn.LayerNorm()(nn.Dense(32, use_bias=False)(gx_flat))
-        mem_s, spk_s = LIF(beta=0.85, threshold=0.3)(mem_s, cur_s) 
-        
-        mems_hr_input = [mem_hr1, mem_hr2, mem_hr3]
-        mems_hr_output, spk_hr = MultiBetaLIF()(mems_hr_input, spk_s) # (B, 96)
-        mem_hr1, mem_hr2, mem_hr3 = mems_hr_output
-        
-        skip_gx = nn.LayerNorm()(nn.Dense(16, use_bias=False)(gx_flat))
-        skip_s  = nn.LayerNorm()(nn.Dense(16, use_bias=False)(spk_s))
-        cur_out = nn.LayerNorm()(nn.Dense(16, use_bias=False)(spk_hr))
-        
-        # 🔥 Leaky Integrator (스파이크 끄고 연속적인 전위 흐름 보장 -> 기울기 통과)
-        mem_out = mem_out * 0.95 + cur_out + skip_gx + skip_s 
-        
-        new_mems = (mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out)
-        return (new_mems, L_norm), (mem_out, spk_enc, spk_s, spk_hr, mem_out)
-        
 class Ultimate_STCN_GraphSNN(nn.Module):
-    num_steps: int = 240 
+    num_classes: int = 4
 
     @nn.compact
     def __call__(self, L_norm, X_seq, deterministic: bool):
-        B = X_seq.shape[0]
+        B, T, C, F = X_seq.shape
         
-        ann_out = nn.Conv(features=8, kernel_size=(32, 1), padding='SAME', use_bias=True)(X_seq)
-        ann_out = nn.LayerNorm(epsilon=1e-5)(ann_out)
-        ann_out = nn.relu(ann_out) 
-        
+        # 1. Temporal Conv (Float 연산)
+        ann_out = nn.Conv(features=8, kernel_size=(32, 1), padding='SAME', use_bias=False)(X_seq)
+        ann_out = nn.LayerNorm()(ann_out)
+        ann_out = nn.relu(ann_out)
         if not deterministic:
             ann_out = nn.Dropout(rate=0.3, deterministic=deterministic)(ann_out)
-            rng = self.make_rng('dropout')
-            mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
-            L_norm = L_norm * mask / 0.7
 
-        mem_enc = jnp.zeros((B, 64, 8))
-        mem_s = jnp.zeros((B, 32))
-        mem_hr1 = jnp.zeros((B, 32))
-        mem_hr2 = jnp.zeros((B, 32))
-        mem_hr3 = jnp.zeros((B, 32))
-        mem_out = jnp.zeros((B, 16))
+        # 🔥 2. SNN 루프 밖에서 Riemannian 공간 위상 반영 
+        # (시간 축을 포함한 전체 텐서에 한 번에 L_norm 곱셈 수행)
+        gx = jnp.einsum('bnm, btmf -> btnf', L_norm, ann_out) # (B, 240, 64, 8)
+
+        # 🔥 3. SNN 루프 밖에서 CSP 공간 압축 진행 
+        # 64채널을 4개의 보편적 소스로 강제 압축 (과적합 원천 차단)
+        spatial_w = self.param('spatial_w', nn.initializers.glorot_uniform(), (64, 4))
+        gx_csp = jnp.einsum('btcf, cs -> btsf', gx, spatial_w) # (B, 240, 4, 8)
         
-        mems = (mem_enc, mem_s, mem_hr1, mem_hr2, mem_hr3, mem_out)
-        init_carry = (mems, L_norm)
+        # SNN이 처리하기 좋게 채널과 피처를 납작하게 폄 (B, 240, 32)
+        snn_in = gx_csp.reshape((B, T, -1)) 
+
+        # 4. 순수 SNN 시계열 역학 
+        mem_init = jnp.zeros((B, 32))
+        init_carry = (mem_init, mem_init, mem_init)
         
         ScanSNN = nn.scan(
-            SNNStep, variable_broadcast='params',
+            SNN_Core, variable_broadcast='params',
             split_rngs={'params': False}, in_axes=1, out_axes=1
         )
         
-        _, (all_time_potentials, spk_enc, spk_s, spk_hr, mem_out_seq) = ScanSNN()(init_carry, ann_out)
+        _, (all_time_potentials, spk1, spk2) = ScanSNN()(init_carry, snn_in)
+
+        # 5. DP-Pooling 디코더 
+        L_DP = 24
+        N_DP = 12
+        num_chunks = T // L_DP
+        chunks = all_time_potentials.reshape((B, num_chunks, L_DP, 32))
         
-        out = DPPoolingDecoder()(all_time_potentials, deterministic=deterministic)
+        start_mean = jnp.mean(chunks[:, :, :N_DP, :], axis=2)
+        end_mean = jnp.mean(chunks[:, :, -N_DP:, :], axis=2)
         
-        fr_enc = jnp.mean(spk_enc)
-        fr_s = jnp.mean(spk_s)
-        fr_hr = jnp.mean(spk_hr)
-        mean_firing_rate = (fr_enc + fr_s + fr_hr) / 3.0 
+        # Concat으로 ERD/ERS 보존
+        dp_feat = jnp.concatenate([start_mean, end_mean], axis=-1) # (B, 10, 64)
+        flat_feat = dp_feat.reshape((B, -1)) # (B, 640)
         
-        return out, mean_firing_rate
+        # 6. Classifier
+        y = nn.Dropout(rate=0.5, deterministic=deterministic)(flat_feat)
+        y = nn.Dense(32)(y)
+        y = nn.gelu(y)
+        y = nn.Dropout(rate=0.5, deterministic=deterministic)(y)
+        logits = nn.Dense(self.num_classes)(y)
+        
+        firing_rate = (jnp.mean(spk1) + jnp.mean(spk2)) / 2.0
+        return logits, firing_rate
+
 
 # =====================================================================
-# 4. JAX Single-GPU (jit) 학습 스텝 최적화
+# 4. JAX Single-GPU (jit) 학습 스텝
 # =====================================================================
 def smooth_labels(labels, num_classes, smoothing=0.2): 
     one_hot = jax.nn.one_hot(labels, num_classes)
@@ -342,7 +297,8 @@ def train_step(state, L_batch, X_batch, targets, dropout_key):
         ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smoothed_targets).mean()
         
         target_rate = 0.15 
-        fr_lambda = 3.0   
+        # FR 페널티 비중을 낮춰서 CE Loss 학습에 집중하게 함
+        fr_lambda = 1.0   
         fr_loss = fr_lambda * jnp.square((firing_rate + 1e-8) - target_rate)
         
         loss = ce_loss + fr_loss
@@ -379,10 +335,6 @@ def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, logits), grads = grad_fn(state.params)
     
-    flat_grads = flax.traverse_util.flatten_dict(grads)
-    flat_grads = {k: (v if 'DPPoolingDecoder' in k[0] else jnp.zeros_like(v)) for k, v in flat_grads.items()}
-    grads = flax.traverse_util.unflatten_dict(flat_grads)
-    
     state = state.apply_gradients(grads=grads)
     acc = jnp.mean(jnp.argmax(logits, -1) == targets)
     return state, loss, acc
@@ -397,7 +349,7 @@ sstl_acc_list = []
 rng = jax.random.PRNGKey(42)
 
 print("\n" + "="*55)
-print(f"⚡ JAX Single-GPU (A5000 Optimized): The Final V26 SNN")
+print(f"⚡ JAX Single-GPU (A5000 Optimized): Real Riemannian SNN")
 print("="*55)
 
 for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
@@ -433,7 +385,7 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
     dummy_L = jnp.ones((1, 64, 64))
     dummy_X = jnp.ones((1, 240, 64, 4))
     
-    model = Ultimate_STCN_GraphSNN(num_steps=240)
+    model = Ultimate_STCN_GraphSNN()
     variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
     
     total_train_steps = len(train_loader) * 200
@@ -457,12 +409,11 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/200", leave=False)
         for batch_L, batch_X, batch_y in pbar:
             j_L = jnp.array(batch_L.numpy())
-            # 다운샘플링 유지
+            # 다운샘플링 
             j_X = jnp.array(batch_X.numpy()[:, ::2, :, :]) 
             j_y = jnp.array(batch_y.numpy())
             
             rng, dropout_key = jax.random.split(rng)
-            
             state, loss, acc, firing_rate, fr_loss = train_step(state, j_L, j_X, j_y, dropout_key)
                 
             pbar.set_postfix({
@@ -479,7 +430,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
                 j_y = jnp.array(batch_y.numpy())
                 
                 batch_acc = eval_step(state, j_L, j_X, j_y)
-                
                 unseen_corr += batch_acc.item() * j_L.shape[0]
                 unseen_tot += j_L.shape[0]
                 
@@ -493,7 +443,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
         j_y = jnp.array(batch_y.numpy())
         
         batch_acc = eval_step(state, j_L, j_X, j_y)
-        
         unseen_corr += batch_acc.item() * j_L.shape[0]
         unseen_tot += j_L.shape[0]
             
@@ -519,7 +468,6 @@ for fold, (train_idx, test_idx) in enumerate(kf_global.split(all_subjects)):
             )
             sstl_state = train_state.TrainState.create(apply_fn=model.apply, params=global_params_backup, tx=sstl_tx)
             
-            # 🔥 SSTL 가속 로더 적용
             sub_train_loader = DataLoader(
                 TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), 
                 batch_size=16, shuffle=True, drop_last=True,

@@ -43,7 +43,7 @@ def process_subject(subj):
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
             if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
             raw.rename_channels(lambda x: x.strip('.')) 
-            raw.filter(l_freq=8.0, h_freq=30.0, verbose=False) # Mu + Beta 대역
+            raw.filter(l_freq=8.0, h_freq=30.0, verbose=False) 
             
             evs, ed = mne.events_from_annotations(raw, verbose=False)
             t1, t2 = ed.get('T1'), ed.get('T2')
@@ -96,14 +96,12 @@ Xtr_scaled = scaler.fit_transform(Xtr.transpose(0, 2, 1).reshape(-1, C_tr)).resh
 B_te, C_te, T_te = Xte.shape
 Xte_scaled = scaler.transform(Xte.transpose(0, 2, 1).reshape(-1, C_te)).reshape(B_te, T_te, C_te).transpose(0, 2, 1)
 
-# Riemannian Backbone 계산 (Train 셋 전체에 대해 딱 한 번)
 mean_X_tr = np.mean(Xtr_scaled, axis=-1, keepdims=True)
 X_centered_tr = Xtr_scaled - mean_X_tr
 cov_tr = np.matmul(X_centered_tr, X_centered_tr.transpose(0, 2, 1)) / (T_tr - 1)
 mean_cov_tr = np.mean(cov_tr, axis=0)
 mean_cov_tr = mean_cov_tr + np.eye(C_tr) * 1e-4
 
-# 🔥 np.clip 에러 수정 완료 (np.maximum 사용)
 vals, vecs = np.linalg.eigh(mean_cov_tr)
 log_vals = np.log(np.maximum(vals, 1e-6))
 log_cov_tr = np.matmul(vecs * log_vals, vecs.T)
@@ -122,17 +120,18 @@ def fwd(x): return spike(x), x
 def bwd(res, g): return (g * 1.0 / (1.0 + jnp.abs(res)),)
 spike.defvjp(fwd, bwd)
 
-class NodeWiseTCNBlock(nn.Module):
+# 🔥 17GB 메모리 터지던 문제 완벽 해결: 순수 1D TCN 블록으로 교체
+class TCNBlock(nn.Module):
     features: int
     dilation: int
     @nn.compact
     def __call__(self, x):
         res = x
-        x = nn.Conv(self.features * x.shape[-1], kernel_size=(3,), kernel_dilation=(self.dilation,), padding='SAME', feature_group_count=x.shape[-1])(x)
+        x = nn.Conv(self.features, kernel_size=(3,), kernel_dilation=(self.dilation,), padding='SAME')(x)
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
         if res.shape[-1] != x.shape[-1]:
-            res = nn.Dense(x.shape[-1])(res)
+            res = nn.Dense(self.features)(res)
         return x + res
 
 class GeoTempDrivenLIF(nn.Module):
@@ -159,12 +158,16 @@ class Model(nn.Module):
         adj = nn.softmax(self.log_cov_backbone, axis=-1)
         adj = nn.Dropout(rate=0.3, deterministic=not train)(adj)
         
-        # Step 2: Node-wise TCN
-        X_t = jnp.transpose(X, (0, 2, 1))
-        tcn_out = NodeWiseTCNBlock(features=16, dilation=1)(X_t)
-        tcn_out = NodeWiseTCNBlock(features=16, dilation=2)(tcn_out)
-        tcn_out = NodeWiseTCNBlock(features=16, dilation=4)(tcn_out)
-        tcn_out = tcn_out.reshape(B, T, C, -1)
+        # Step 2: Node-wise TCN (메모리 폭발 방지 & 완벽한 채널 독립성 확보)
+        # (B, C, T) -> (B*C, T, 1) 로 펼쳐서 단일 필터가 모든 채널에 공평하게 적용되도록 함
+        X_t = X.reshape(B * C, T, 1)
+        
+        tcn_out = TCNBlock(features=16, dilation=1)(X_t)
+        tcn_out = TCNBlock(features=16, dilation=2)(tcn_out)
+        tcn_out = TCNBlock(features=16, dilation=4)(tcn_out) # (B*C, T, 16)
+        
+        # 다시 원래 형태로 복구: (B*C, T, 16) -> (B, C, T, 16) -> (B, T, C, 16)
+        tcn_out = tcn_out.reshape(B, C, T, 16).transpose(0, 2, 1, 3)
         
         # Step 3: Riemannian-Spatio-Temporal GNN 융합
         gnn_out = jnp.einsum('cc,btcf->btcf', adj, tcn_out) 

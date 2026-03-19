@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # =========================================================
-# 1. Data Loading (105명 전체, 4-Class)
+# 1. Data Loading & Riemannian Alignment (105명 전체)
 # =========================================================
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
@@ -55,7 +55,6 @@ def process_subject(subj):
                 
             event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
             
-            # 3초 제한
             ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, 
                             baseline=None, preload=True, verbose=False)
             if len(ep) > 0: 
@@ -67,62 +66,63 @@ def process_subject(subj):
     subj_epochs = mne.concatenate_epochs(epochs_list, verbose=False)
     X = subj_epochs.get_data() * 1e6
     y = subj_epochs.events[:, 2]
-    return X, y, info
+    
+    # 🔥 핵심 Novelty: Riemannian Alignment (개인차 제거) 🔥
+    covs = []
+    for x in X:
+        xc = x - np.mean(x, axis=1, keepdims=True)
+        covs.append(np.cov(xc))
+    
+    # 피험자의 기하학적 기준점(Reference Matrix R) 계산
+    R = np.mean(covs, axis=0) 
+    R = R + np.eye(R.shape[0]) * 1e-4
+    
+    # R^{-1/2} 계산 (다양체의 원점으로 끌어오는 변환 행렬)
+    vals, vecs = la.eigh(R)
+    r_inv_sqrt = vecs @ np.diag(1.0 / np.sqrt(np.clip(vals, a_min=1e-6, a_max=None))) @ vecs.T
+    
+    # 모든 트라이얼을 원점으로 정렬
+    X_aligned = np.zeros_like(X)
+    for i in range(len(X)):
+        X_aligned[i] = r_inv_sqrt @ X[i]
 
-print(f"⏳ 105명 글로벌 데이터 로딩 시작... (멀티프로세싱 가동 중)")
+    return X_aligned, y, info, X # (정렬된 X, 라벨, info, 원본 X)
+
+print(f"⏳ 105명 데이터 로딩 및 Riemannian Alignment 동시 진행 중...")
 results = Parallel(n_jobs=-1)(delayed(process_subject)(subj) for subj in subjects)
 
 valid_results = [res for res in results if res is not None]
-X_raw = np.concatenate([res[0] for res in valid_results])
+X_aligned = np.concatenate([res[0] for res in valid_results])
 y_raw = np.concatenate([res[1] for res in valid_results])
 info = valid_results[0][2] 
+X_raw_unaligned = np.concatenate([res[3] for res in valid_results]) # 비교를 위한 원본
 
-B, C, T = X_raw.shape
-print(f"✅ 글로벌 데이터 로드 완료: {B} Trials | {C} Channels | {T} Timesteps")
+B, C, T = X_aligned.shape
+print(f"✅ 글로벌 데이터 로드 및 정렬 완료: {B} Trials | {C} Channels")
 
 # =========================================================
-# 2. 🧠 Feature Extraction 
+# 2. 🧠 Feature Extraction (Aligned vs Unaligned)
 # =========================================================
 print("\n⚙️ 글로벌 피쳐 추출 및 계산 중...")
 
-# (A) Baseline: Raw Variance
-feat_raw = np.var(X_raw, axis=2) 
+# (A) Baseline: 정렬되지 않은 원본 데이터의 분산
+feat_raw = np.var(X_raw_unaligned, axis=2) 
 
-# (B) Proposed: Derivative-Free Riemannian Tangent Projection
-def extract_derivative_free_riemannian(X_batch, window_size=64, step_size=16):
+# (B) Proposed: 정렬된 데이터(Aligned EEG)에 대한 Riemannian Log-Cov
+def extract_riemannian_log_cov(X_batch):
     feats = []
-    num_windows = (X_batch.shape[2] - window_size) // step_size + 1
-    
     for x in X_batch: 
-        log_covs = []
-        for w in range(num_windows):
-            start = w * step_size
-            end = start + window_size
-            window_x = x[:, start:end]
-            
-            xc = window_x - np.mean(window_x, axis=1, keepdims=True)
-            cov = np.cov(xc) + np.eye(C) * 1e-4
-            
-            vals, vecs = la.eigh(cov)
-            log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
-            log_cov = vecs @ np.diag(log_vals) @ vecs.T
-            
-            log_covs.append(np.diag(log_cov))
-            
-        log_covs = np.array(log_covs) # (W, C)
+        x_centered = x - np.mean(x, axis=1, keepdims=True)
+        cov = np.cov(x_centered) + np.eye(C) * 1e-4
         
-        # 기하학적 평균(Barycenter) 계산
-        barycenter = np.mean(log_covs, axis=0, keepdims=True) 
+        vals, vecs = la.eigh(cov)
+        log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
+        log_cov = vecs @ np.diag(log_vals) @ vecs.T
         
-        # 평균 뇌 상태로부터의 절대적 이탈 궤적 투영
-        projected_trajectory = log_covs - barycenter 
-        
-        # 이탈 궤적의 분산을 피쳐로 사용
-        feats.append(np.var(projected_trajectory, axis=0)) 
-        
+        feats.append(np.diag(log_cov))
     return np.array(feats)
 
-feat_proposed = extract_derivative_free_riemannian(X_raw)
+feat_proposed = extract_riemannian_log_cov(X_aligned)
 
 # =========================================================
 # 3. 📊 통계적 검증 (F-value & LDA)
@@ -141,23 +141,23 @@ acc_proposed = cross_val_score(clf, feat_proposed, y_raw, cv=cv, n_jobs=-1).mean
 # 4. 📝 결과 터미널 출력
 # =========================================================
 ch_names = np.array(info.ch_names)
-top_k = 15 # 64채널 전체의 글로벌한 양상을 보기 위해 15개까지 출력
+top_k = 15 
 
 idx_raw = np.argsort(f_val_raw)[::-1][:top_k]
 idx_prop = np.argsort(f_val_proposed)[::-1][:top_k]
 
 print("\n" + "="*70)
-print("🚀 GLOBAL Feature Test: Derivative-Free Riemannian Projection")
+print("🚀 GLOBAL Feature Test: Riemannian Alignment + Log-Cov Mapping")
 print("="*70)
 print("[1] Global Linear Separability (LDA 5-Fold CV Accuracy)")
-print(f"  ▶ Raw Variance                 : {acc_raw:.2f}%")
-print(f"  ▶ Derivative-Free Riemannian   : {acc_proposed:.2f}%")
+print(f"  ▶ Raw Variance (Unaligned)     : {acc_raw:.2f}%")
+print(f"  ▶ Aligned Riemannian Log-Cov   : {acc_proposed:.2f}%")
 diff = acc_proposed - acc_raw
 print(f"    (글로벌 성능 차이: {'+' if diff > 0 else ''}{diff:.2f}%p)")
 
 print("\n" + "-"*70)
 print(f"[2] Global Discriminative Power (Top {top_k} Channels by F-value)")
-print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Derivative-Free Riemannian'}")
+print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Aligned Riemannian Log-Cov'}")
 print("-" * 70)
 
 for i in range(top_k):

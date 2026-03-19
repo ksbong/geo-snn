@@ -2,6 +2,7 @@ import os
 import mne
 mne.set_log_level('ERROR')
 import numpy as np
+import scipy.linalg as la
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.feature_selection import f_classif
@@ -39,19 +40,23 @@ def load_data():
                 raw.rename_channels(lambda x: x.strip('.'))
                 raw.filter(l_freq=8.0, h_freq=30.0, verbose=False)
                 
+                # 몽타주 매핑 (에러 방지용)
+                mne.datasets.eegbci.standardize(raw) 
+                montage = mne.channels.make_standard_montage('standard_1005')
+                raw.set_montage(montage, match_case=False, on_missing='ignore')
+                
                 evs, ed = mne.events_from_annotations(raw, verbose=False)
                 t1, t2 = ed.get('T1'), ed.get('T2')
                 if t1 is None: continue
                 
                 e = evs.copy()
                 if run in runs_h:
-                    e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 0, 1 # L: 0, R: 1
+                    e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 0, 1
                 else:
-                    e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3 # H: 2, F: 3
+                    e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3
                     
                 event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
                 
-                # HR-SNN 논문 세팅: 앞 3초만 사용
                 ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, 
                                 baseline=None, preload=True, verbose=False)
                 if len(ep) > 0: 
@@ -79,34 +84,36 @@ print("\n⚙️ 피쳐 추출 및 계산 중...")
 # (A) Baseline: Raw Variance
 feat_raw = np.var(X, axis=2) 
 
-# (B) Proposed: Graph Spectral Delta
-def extract_spectral_delta(X_batch):
+# (B) Proposed: Riemannian Tangent Space (Log-Euclidean)
+def extract_riemannian_log_cov(X_batch):
     feats = []
     for x in X_batch: 
+        # 1. Covariance Matrix 계산
         x_centered = x - np.mean(x, axis=1, keepdims=True)
         cov = np.cov(x_centered)
-        A = np.abs(cov) 
         
-        D = np.diag(np.sum(A, axis=1))
-        L = D - A + np.eye(len(A)) * 1e-4
+        # 수치적 안정성을 위해 대각선에 작은 값 추가 (Regularization)
+        cov = cov + np.eye(cov.shape[0]) * 1e-4
         
-        vals, U = np.linalg.eigh(L)
-        x_hat = U.T @ x
+        # 2. Matrix Logarithm (Tangent Space Mapping)
+        # 고유값 분해를 통해 logm 계산이 빠르고 정확함
+        vals, vecs = la.eigh(cov)
+        log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
+        log_cov = vecs @ np.diag(log_vals) @ vecs.T
         
-        delta_x = np.diff(x_hat, axis=1) 
-        feats.append(np.var(delta_x, axis=1))
+        # 3. 채널 본연의 기하학적 분산값 (대각성분) 추출
+        # 원래 공간의 물리적 특성을 유지하기 위해 대각선(Self-variance)만 사용
+        feats.append(np.diag(log_cov))
     return np.array(feats)
 
-feat_proposed = extract_spectral_delta(X)
+feat_proposed = extract_riemannian_log_cov(X)
 
 # =========================================================
 # 3. 📊 통계적 검증 (F-value & LDA)
 # =========================================================
-# 4-Class F-value (분별력)
 f_val_raw, _ = f_classif(feat_raw, y)
 f_val_proposed, _ = f_classif(feat_proposed, y)
 
-# Linear Classifier (LDA) 5-Fold CV
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 clf = LinearDiscriminantAnalysis()
 
@@ -114,27 +121,27 @@ acc_raw = cross_val_score(clf, feat_raw, y, cv=cv).mean() * 100
 acc_proposed = cross_val_score(clf, feat_proposed, y, cv=cv).mean() * 100
 
 # =========================================================
-# 4. 📝 결과 터미널 출력 (Text Visualization)
+# 4. 📝 결과 터미널 출력
 # =========================================================
 ch_names = np.array(info.ch_names)
-top_k = 7 # 상위 7개 채널 확인
+top_k = 10 
 
 idx_raw = np.argsort(f_val_raw)[::-1][:top_k]
 idx_prop = np.argsort(f_val_proposed)[::-1][:top_k]
 
-print("\n" + "="*55)
-print("🚀 Feature Test Results (4-Class Motor Imagery)")
-print("="*55)
+print("\n" + "="*60)
+print("🚀 Feature Test Results (Riemannian Tangent Mapping)")
+print("="*60)
 print("[1] Linear Separability (LDA 5-Fold CV Accuracy)")
 print(f"  ▶ Raw Variance           : {acc_raw:.2f}%")
-print(f"  ▶ Graph Spectral Delta   : {acc_proposed:.2f}%")
+print(f"  ▶ Riemannian Log-Cov     : {acc_proposed:.2f}%")
 diff = acc_proposed - acc_raw
 print(f"    (성능 차이: {'+' if diff > 0 else ''}{diff:.2f}%p)")
 
-print("\n" + "-"*55)
+print("\n" + "-"*60)
 print(f"[2] Discriminative Power (Top {top_k} Channels by F-value)")
-print(f"  {'Rank':<5} | {'Raw Variance':<18} | {'Graph Spectral Delta'}")
-print("-" * 55)
+print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Riemannian Log-Cov'}")
+print("-" * 60)
 
 for i in range(top_k):
     raw_ch = ch_names[idx_raw[i]]
@@ -143,10 +150,10 @@ for i in range(top_k):
     prop_ch = ch_names[idx_prop[i]]
     prop_f = f_val_proposed[idx_prop[i]]
     
-    print(f"  {i+1:<4} | {raw_ch:<5} (F:{raw_f:>5.1f})   | {prop_ch:<5} (F:{prop_f:>5.1f})")
+    # 주요 타겟 채널(C3, C4, Cz) 시각적 강조
+    rc = f"*{raw_ch}*" if raw_ch in ['C3', 'C4', 'Cz', 'Cp3', 'Cp4'] else raw_ch
+    pc = f"*{prop_ch}*" if prop_ch in ['C3', 'C4', 'Cz', 'Cp3', 'Cp4'] else prop_ch
+    
+    print(f"  {i+1:<4} | {rc:<7} (F:{raw_f:>5.1f})      | {pc:<7} (F:{prop_f:>5.1f})")
 
-print("="*55)
-print("💡 분석 포인트:")
-print("1. LDA Accuracy에서 제안한 Feature가 높게 나오는지 확인.")
-print("2. Top 채널에 C3, C4, Cz (운동상상 관련 채널)가")
-print("   제안한 Feature 쪽에서 더 선명하게(높은 순위/F값) 잡히는지 확인.")
+print("="*60)

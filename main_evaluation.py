@@ -3,7 +3,6 @@ import mne
 mne.set_log_level('ERROR')
 import numpy as np
 import scipy.linalg as la
-from scipy.signal import hilbert
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.feature_selection import f_classif
@@ -76,49 +75,48 @@ B, C, T = X.shape
 print(f"✅ 데이터 로드 완료: {B} Trials | {C} Channels | {T} Timesteps")
 
 # =========================================================
-# 2. 🧠 Feature Extraction (Novelty: Complex HPD Trajectory)
+# 2. 🧠 Feature Extraction (Derivative-Free)
 # =========================================================
 print("\n⚙️ 1단계: Raw Variance 추출 중...")
 feat_raw = np.var(X, axis=2) 
 
-print("⚙️ 2단계: Complex HPD Geodesic Delta 추출 중... (Hilbert Transform 적용)")
-def extract_hpd_dynamic_delta(X_batch, window_size=64, step_size=16):
+print("⚙️ 2단계: Derivative-Free Riemannian Tangent Projection 추출 중...")
+def extract_derivative_free_riemannian(X_batch, window_size=64, step_size=16):
     feats = []
     num_windows = (X_batch.shape[2] - window_size) // step_size + 1
     
     for x in X_batch: 
-        # 1. Analytic Signal (실수 진폭 + 허수 위상)
-        z = hilbert(x, axis=1) 
-        
         log_covs = []
         for w in range(num_windows):
             start = w * step_size
             end = start + window_size
-            window_z = z[:, start:end]
+            window_x = x[:, start:end]
             
-            # 2. HPD Covariance Matrix (켤레 전치 행렬 사용)
-            zc = window_z - np.mean(window_z, axis=1, keepdims=True)
-            cov = (zc @ zc.conj().T) / (window_size - 1)
-            cov = cov + np.eye(C) * 1e-4 
+            # Covariance Matrix
+            xc = window_x - np.mean(window_x, axis=1, keepdims=True)
+            cov = np.cov(xc) + np.eye(C) * 1e-4
             
-            # 3. Matrix Logarithm (Tangent Space Mapping on Complex Manifold)
-            vals, vecs = la.eigh(cov) # eigh는 Hermitian 행렬의 고유값 분해에 최적화
+            # Matrix Logarithm (Tangent Space Mapping)
+            vals, vecs = la.eigh(cov)
             log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
-            log_cov = vecs @ np.diag(log_vals) @ vecs.conj().T
+            log_cov = vecs @ np.diag(log_vals) @ vecs.T
             
             log_covs.append(np.diag(log_cov))
             
-        log_covs = np.array(log_covs) # (W, C), dtype=complex
+        log_covs = np.array(log_covs) # (W, C)
         
-        # 4. Geodesic Delta (시간에 따른 복소 공간에서의 궤적 변화량)
-        deltas = np.diff(log_covs, axis=0) 
+        # 🔥 핵심 Novelty: 미분(차분) 대신 기하학적 평균(Barycenter) 계산
+        barycenter = np.mean(log_covs, axis=0, keepdims=True) 
         
-        # 5. 복소 변화량의 크기(절댓값)의 분산을 피쳐로 사용
-        feats.append(np.var(np.abs(deltas), axis=0)) 
+        # 평균 뇌 상태로부터의 절대적 기하학적 이탈 궤적
+        projected_trajectory = log_covs - barycenter 
+        
+        # 이탈 궤적의 에너지(분산)를 피쳐로 사용
+        feats.append(np.var(projected_trajectory, axis=0)) 
         
     return np.array(feats)
 
-feat_proposed = extract_hpd_dynamic_delta(X)
+feat_proposed = extract_derivative_free_riemannian(X)
 
 # =========================================================
 # 3. 📊 통계적 검증 (F-value & LDA)
@@ -142,19 +140,19 @@ top_k = 10
 idx_raw = np.argsort(f_val_raw)[::-1][:top_k]
 idx_prop = np.argsort(f_val_proposed)[::-1][:top_k]
 
-print("\n" + "="*70)
-print("🚀 Feature Test: Complex HPD Geodesic Delta (Ultimate Novelty)")
-print("="*70)
+print("\n" + "="*75)
+print("🚀 Feature Test: Derivative-Free Riemannian Projection")
+print("="*75)
 print("[1] Linear Separability (LDA 5-Fold CV Accuracy)")
-print(f"  ▶ Raw Variance           : {acc_raw:.2f}%")
-print(f"  ▶ Complex HPD Delta      : {acc_proposed:.2f}%")
+print(f"  ▶ Raw Variance                 : {acc_raw:.2f}%")
+print(f"  ▶ Derivative-Free Riemannian   : {acc_proposed:.2f}%")
 diff = acc_proposed - acc_raw
 print(f"    (성능 차이: {'+' if diff > 0 else ''}{diff:.2f}%p)")
 
-print("\n" + "-"*70)
+print("\n" + "-"*75)
 print(f"[2] Discriminative Power (Top {top_k} Channels by F-value)")
-print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Complex HPD Delta'}")
-print("-" * 70)
+print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Derivative-Free Riemannian'}")
+print("-" * 75)
 
 for i in range(top_k):
     raw_ch = ch_names[idx_raw[i]]
@@ -163,9 +161,10 @@ for i in range(top_k):
     prop_ch = ch_names[idx_prop[i]]
     prop_f = f_val_proposed[idx_prop[i]]
     
+    # 핵심 운동 상상 채널 시각적 강조
     rc = f"*{raw_ch}*" if raw_ch in ['C3', 'C4', 'Cz', 'Cp3', 'Cp4'] else raw_ch
     pc = f"*{prop_ch}*" if prop_ch in ['C3', 'C4', 'Cz', 'Cp3', 'Cp4'] else prop_ch
     
     print(f"  {i+1:<4} | {rc:<7} (F:{raw_f:>5.1f})      | {pc:<7} (F:{prop_f:>5.1f})")
 
-print("="*70)
+print("="*75)

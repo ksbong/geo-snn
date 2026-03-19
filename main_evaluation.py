@@ -22,7 +22,6 @@ jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 # =========================================================
 # 1. Data Loading (Raw/Filtered 뇌파 보존)
 # =========================================================
-# 🚨 Riemannian 기하학을 위해 진폭/파워가 아닌 필터링된 Raw 신호 그 자체를 사용함
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
 
@@ -72,7 +71,6 @@ results = [res for res in results if res is not None]
 X_raw = np.concatenate([res[0] for res in results])
 y_raw = np.concatenate([res[1] for res in results])
 
-# 밸런싱 및 분할
 idx_L, idx_R, idx_H, idx_F = (np.where(y_raw == i)[0] for i in range(4))
 min_trials = min(len(idx_L), len(idx_R), len(idx_H), len(idx_F))
 
@@ -91,7 +89,6 @@ idx_tr, idx_te = train_test_split(np.arange(len(X_raw)), test_size=0.2, stratify
 Xtr, ytr = X_raw[idx_tr], y_raw[idx_tr]
 Xte, yte = X_raw[idx_te], y_raw[idx_te]
 
-# 피험자 전체를 아우르는 Global Scaling (형태 보존)
 B_tr, C_tr, T_tr = Xtr.shape
 scaler = StandardScaler()
 Xtr_scaled = scaler.fit_transform(Xtr.transpose(0, 2, 1).reshape(-1, C_tr)).reshape(B_tr, T_tr, C_tr).transpose(0, 2, 1)
@@ -118,7 +115,6 @@ class TCNBlock(nn.Module):
     dilation: int
     @nn.compact
     def __call__(self, x):
-        # x shape: (B, T, C)
         res = x
         x = nn.Conv(self.features, kernel_size=(3,), kernel_dilation=(self.dilation,), padding='SAME')(x)
         x = nn.LayerNorm()(x)
@@ -127,12 +123,13 @@ class TCNBlock(nn.Module):
             res = nn.Dense(self.features)(res)
         return x + res
 
+# 🔥 수정 완료: 튜플로 입력을 받아서 nn.scan의 상태 추적 에러 해결
 class GeoTempDrivenLIF(nn.Module):
     @nn.compact
-    def __call__(self, mem, x, geo_temp_feat):
-        # 🔥 Novelty: 시공간-기하학적 피처가 LIF 뉴런의 감쇠율(decay)을 실시간으로 결정
-        decay = nn.sigmoid(nn.Dense(x.shape[-1])(geo_temp_feat)) 
-        mem = mem * decay + x  
+    def __call__(self, mem, inputs):
+        x_t, geo_temp_t = inputs
+        decay = nn.sigmoid(nn.Dense(x_t.shape[-1])(geo_temp_t)) 
+        mem = mem * decay + x_t  
         spk = spike(mem - 0.5) 
         mem = mem - spk * 0.5
         return mem, spk
@@ -140,72 +137,55 @@ class GeoTempDrivenLIF(nn.Module):
 class Model(nn.Module):
     @nn.compact
     def __call__(self, X, train):
-        # X shape: (B, C, T)
         if train:
             X = X + jax.random.normal(self.make_rng('dropout'), X.shape) * 0.05
             
         B, C, T = X.shape
         
-        # ---------------------------------------------------------
-        # Step 1: Riemannian Manifold Mapping (Log-Euclidean)
-        # ---------------------------------------------------------
-        # 공분산 행렬 계산 및 안정성(Regularization) 확보
+        # Step 1: Riemannian Manifold Mapping
         mean_X = jnp.mean(X, axis=-1, keepdims=True)
         X_centered = X - mean_X
         cov = jnp.matmul(X_centered, jnp.transpose(X_centered, (0, 2, 1))) / (T - 1)
         cov = cov + jnp.eye(C) * 1e-4 
         
-        # Tangent Space 투영 (Eigen Decomposition)
         vals, vecs = jnp.linalg.eigh(cov)
         log_vals = jnp.log(jnp.clip(vals, a_min=1e-6))
-        # log_cov를 GNN의 기하학적 인접 행렬로 사용! (B, C, C)
         log_cov = jnp.matmul(vecs * jnp.expand_dims(log_vals, 1), jnp.transpose(vecs, (0, 2, 1)))
         
-        # ---------------------------------------------------------
-        # Step 2: TCN (Temporal Dynamics)
-        # ---------------------------------------------------------
-        X_t = jnp.transpose(X, (0, 2, 1)) # (B, T, C)
+        # Step 2: TCN
+        X_t = jnp.transpose(X, (0, 2, 1))
         tcn_out = TCNBlock(features=64, dilation=1)(X_t)
         tcn_out = TCNBlock(features=64, dilation=2)(tcn_out)
-        tcn_out = TCNBlock(features=64, dilation=4)(tcn_out) # (B, T, 64)
+        tcn_out = TCNBlock(features=64, dilation=4)(tcn_out)
         
-        # ---------------------------------------------------------
-        # Step 3: GNN 융합 (Geometric-Temporal Features)
-        # ---------------------------------------------------------
-        # TCN 피처를 노드(채널) 차원으로 변환: (B, C, T) * (B, T, 64) -> (B, C, 64)
+        # Step 3: GNN
         node_feats = jnp.matmul(X, tcn_out) 
-        
-        # 기하학적 인접 행렬(log_cov)을 이용한 GNN 연산
         adj = nn.softmax(log_cov, axis=-1)
         adj = nn.Dropout(rate=0.3, deterministic=not train)(adj)
-        geo_temp_feat = jnp.matmul(adj, node_feats) # (B, C, 64)
+        geo_temp_feat = jnp.matmul(adj, node_feats)
         geo_temp_feat = nn.LayerNorm()(geo_temp_feat)
         geo_temp_feat = nn.relu(geo_temp_feat)
         
-        # ---------------------------------------------------------
         # Step 4: Geometric-Temporal driven SNN
-        # ---------------------------------------------------------
-        X_mixed = nn.Dense(128)(geo_temp_feat.reshape(B, -1)) # (B, C*64) -> (B, 128)
-        X_mixed = nn.Dropout(rate=0.4, deterministic=not train)(X_mixed)
-        
-        # 시계열 스텝 설정 (TCN 출력을 순차적으로 SNN에 공급)
         seq_len = 10 
         init_mem = jnp.zeros((B, 128))
         
-        # LIF를 위해 TCN 피처를 활용하여 sequence 생성
-        seq_input = nn.Dense(128)(tcn_out) # (B, T, 128)
-        # 풀링하여 고정된 길이(seq_len)의 스텝으로 변환
-        seq_input = seq_input.reshape(B, seq_len, -1, 128).mean(axis=2) # (B, seq_len, 128)
+        seq_input = nn.Dense(128)(tcn_out) 
+        seq_input = seq_input.reshape(B, seq_len, -1, 128).mean(axis=2)
         
-        def scan_fn(mem, x_t):
-            # geo_temp_feat를 컨텍스트로 함께 전달
-            mem, spk = GeoTempDrivenLIF()(mem, x_t, geo_temp_feat.reshape(B, -1))
-            return mem, spk
+        # 🔥 수정 완료: geo_temp_feat를 시간축으로 확장해서 nn.scan에 던짐
+        geo_flat = geo_temp_feat.reshape(B, -1)
+        geo_seq = jnp.repeat(jnp.expand_dims(geo_flat, 1), seq_len, axis=1)
 
-        scan_layer = nn.scan(scan_fn, variable_broadcast='params', split_rngs={'params':False}, in_axes=(1), out_axes=1)
-        _, spk_seq = scan_layer(init_mem, seq_input)
+        ScanLIF = nn.scan(
+            GeoTempDrivenLIF,
+            variable_broadcast='params',
+            split_rngs={'params': False},
+            in_axes=1,
+            out_axes=1
+        )
+        _, spk_seq = ScanLIF()(init_mem, (seq_input, geo_seq))
 
-        # 시간축 어텐션
         temp_attn = nn.softmax(nn.Dense(1)(spk_seq), axis=1)
         feat = jnp.sum(spk_seq * temp_attn, axis=1)
         
@@ -217,7 +197,7 @@ class Model(nn.Module):
         return logits, jnp.mean(spk_seq)
 
 # =========================================================
-# 3. Training Loop (이전과 동일한 구조 적용)
+# 3. Training Loop
 # =========================================================
 def loss_fn(params, state, X, y, dropout_rng, fr_weight):
     logits, fr = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
@@ -246,8 +226,8 @@ rng = jax.random.PRNGKey(42)
 rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
 model = Model()
 
-# 더미 데이터로 초기화 (B, C, T)
-dummy_x = jnp.ones((1, 64, int(4.0 * TARGET_SFREQ)))
+# 🔥 수정 완료: 실제 데이터 차원(C_tr, T_tr)을 가져와서 더미 데이터 생성 (채널 수 하드코딩 방지)
+dummy_x = jnp.ones((1, C_tr, T_tr))
 params = model.init({'params': init_rng, 'dropout': dropout_init_rng}, dummy_x, train=False)['params']
 
 steps_per_epoch = len(train_loader)
@@ -267,15 +247,16 @@ for epoch in range(1, 301):
         t_losses.append(loss)
 
     if epoch % 10 == 0:
-        correct = 0
-        total = 0
+        all_preds = []
         all_frs = []
         
         for Xb, yb in test_loader:
             preds, vf = eval_step_preds(state, jnp.array(Xb.numpy()))
-            correct += np.sum(np.array(preds) == yb.numpy())
-            total += len(yb)
+            all_preds.extend(np.array(preds))
             all_frs.append(vf)
+            
+        correct = np.sum(np.array(all_preds) == yte)
+        total = len(yte)
                 
         avg_val_acc = (correct / total) * 100
         avg_train_acc = np.mean(t_accs) * 100

@@ -2,7 +2,6 @@ import os
 import mne
 mne.set_log_level('ERROR')
 import numpy as np
-import matplotlib.pyplot as plt
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.feature_selection import f_classif
@@ -17,7 +16,6 @@ base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
 subjects = [f'S{i:03d}' for i in range(1, 11)] 
 
-# 기존 코드의 L, R, H, F 세팅 유지
 runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
 TARGET_SFREQ = 160.0 
 
@@ -37,11 +35,8 @@ def load_data():
                 raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
                 if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
                 
-                # 🔥 에러 해결: 표준 10-05 몽타주(전극 위치) 씌우기
-                mne.datasets.eegbci.standardize(raw) 
-                montage = mne.channels.make_standard_montage('standard_1005')
-                raw.set_montage(montage, match_case=False, on_missing='ignore')
-                
+                # 채널 이름 정리 및 필터링
+                raw.rename_channels(lambda x: x.strip('.'))
                 raw.filter(l_freq=8.0, h_freq=30.0, verbose=False)
                 
                 evs, ed = mne.events_from_annotations(raw, verbose=False)
@@ -56,12 +51,12 @@ def load_data():
                     
                 event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
                 
-                # 🔥 HR-SNN 논문 반영: tmax를 3.0으로 설정하여 앞 3초만 사용
+                # HR-SNN 논문 세팅: 앞 3초만 사용
                 ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, 
                                 baseline=None, preload=True, verbose=False)
                 if len(ep) > 0: 
                     epochs_list.append(ep)
-                    if info is None: info = ep.info # Topomap용 info 저장
+                    if info is None: info = ep.info 
             except Exception: continue
                 
         if epochs_list:
@@ -74,15 +69,17 @@ def load_data():
 print("⏳ 10명 데이터 로딩 중 (4-Class)...")
 X, y, info = load_data()
 B, C, T = X.shape
-print(f"데이터 로드 완료: {B} Trials, {C} Channels, {T} Timesteps")
+print(f"✅ 데이터 로드 완료: {B} Trials | {C} Channels | {T} Timesteps")
 
 # =========================================================
-# 2. 🧠 Feature Extraction (Graph Spectral Delta)
+# 2. 🧠 Feature Extraction 
 # =========================================================
-# (A) Baseline
-feat_raw = np.var(X, axis=2) # (B, C)
+print("\n⚙️ 피쳐 추출 및 계산 중...")
 
-# (B) Proposed Feature
+# (A) Baseline: Raw Variance
+feat_raw = np.var(X, axis=2) 
+
+# (B) Proposed: Graph Spectral Delta
 def extract_spectral_delta(X_batch):
     feats = []
     for x in X_batch: 
@@ -91,7 +88,6 @@ def extract_spectral_delta(X_batch):
         A = np.abs(cov) 
         
         D = np.diag(np.sum(A, axis=1))
-        # 수치적 안정성을 위해 대각선에 작은 값 추가
         L = D - A + np.eye(len(A)) * 1e-4
         
         vals, U = np.linalg.eigh(L)
@@ -101,17 +97,16 @@ def extract_spectral_delta(X_batch):
         feats.append(np.var(delta_x, axis=1))
     return np.array(feats)
 
-print("⚙️ 제안된 Graph Spectral Delta Feature 추출 중...")
 feat_proposed = extract_spectral_delta(X)
 
 # =========================================================
-# 3. 📊 통계적 검증 (4-Class ANOVA F-value & LDA)
+# 3. 📊 통계적 검증 (F-value & LDA)
 # =========================================================
-# 4-Class 분별력을 확인하기 위해 F-value 계산
+# 4-Class F-value (분별력)
 f_val_raw, _ = f_classif(feat_raw, y)
 f_val_proposed, _ = f_classif(feat_proposed, y)
 
-# Linear Classifier Test (5-Fold CV)
+# Linear Classifier (LDA) 5-Fold CV
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 clf = LinearDiscriminantAnalysis()
 
@@ -119,27 +114,39 @@ acc_raw = cross_val_score(clf, feat_raw, y, cv=cv).mean() * 100
 acc_proposed = cross_val_score(clf, feat_proposed, y, cv=cv).mean() * 100
 
 # =========================================================
-# 4. 🎨 시각화
+# 4. 📝 결과 터미널 출력 (Text Visualization)
 # =========================================================
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+ch_names = np.array(info.ch_names)
+top_k = 7 # 상위 7개 채널 확인
 
-# Plot 1: LDA Accuracy
-axes[0].bar(['Raw Variance', 'Graph Spectral Delta'], 
-            [acc_raw, acc_proposed], color=['gray', 'blue'], alpha=0.7)
-axes[0].set_ylabel('LDA Accuracy (%)')
-axes[0].set_title('4-Class Linear Separability Test', fontsize=14)
-axes[0].set_ylim(min(acc_raw, acc_proposed) - 5, max(acc_raw, acc_proposed) + 10)
-for i, v in enumerate([acc_raw, acc_proposed]):
-    axes[0].text(i, v + 1, f"{v:.1f}%", ha='center', fontweight='bold')
+idx_raw = np.argsort(f_val_raw)[::-1][:top_k]
+idx_prop = np.argsort(f_val_proposed)[::-1][:top_k]
 
-# Plot 2: Discriminative Power Topomap (Raw)
-axes[1].set_title('Discriminative Power (F-value): Raw', fontsize=14)
-mne.viz.plot_topomap(f_val_raw, info, axes=axes[1], cmap='Reds', show=False, contours=0)
+print("\n" + "="*55)
+print("🚀 Feature Test Results (4-Class Motor Imagery)")
+print("="*55)
+print("[1] Linear Separability (LDA 5-Fold CV Accuracy)")
+print(f"  ▶ Raw Variance           : {acc_raw:.2f}%")
+print(f"  ▶ Graph Spectral Delta   : {acc_proposed:.2f}%")
+diff = acc_proposed - acc_raw
+print(f"    (성능 차이: {'+' if diff > 0 else ''}{diff:.2f}%p)")
 
-# Plot 3: Discriminative Power Topomap (Proposed)
-axes[2].set_title('Discriminative Power (F-value): Graph Spectral Delta', fontsize=14)
-mne.viz.plot_topomap(f_val_proposed, info, axes=axes[2], cmap='Reds', show=False, contours=0)
+print("\n" + "-"*55)
+print(f"[2] Discriminative Power (Top {top_k} Channels by F-value)")
+print(f"  {'Rank':<5} | {'Raw Variance':<18} | {'Graph Spectral Delta'}")
+print("-" * 55)
 
-plt.tight_layout()
-plt.show()
-print("✅ 검증 완료!")
+for i in range(top_k):
+    raw_ch = ch_names[idx_raw[i]]
+    raw_f = f_val_raw[idx_raw[i]]
+    
+    prop_ch = ch_names[idx_prop[i]]
+    prop_f = f_val_proposed[idx_prop[i]]
+    
+    print(f"  {i+1:<4} | {raw_ch:<5} (F:{raw_f:>5.1f})   | {prop_ch:<5} (F:{prop_f:>5.1f})")
+
+print("="*55)
+print("💡 분석 포인트:")
+print("1. LDA Accuracy에서 제안한 Feature가 높게 나오는지 확인.")
+print("2. Top 채널에 C3, C4, Cz (운동상상 관련 채널)가")
+print("   제안한 Feature 쪽에서 더 선명하게(높은 순위/F값) 잡히는지 확인.")

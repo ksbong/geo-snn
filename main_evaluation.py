@@ -4,7 +4,6 @@ mne.set_log_level('ERROR')
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-from scipy.fft import fft, ifft, fftfreq
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import warnings
@@ -21,39 +20,9 @@ warnings.filterwarnings("ignore")
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =========================================================
-# 1. Feature Extraction (🔥 윈도우 내부 스케일링 완전 제거)
+# 1. Data Loading (Raw/Filtered 뇌파 보존)
 # =========================================================
-def extract_envelope_window(slice_data, sfreq):
-    # 🚨 이전 코드의 윈도우별 정규화(slice_norm) 제거: ERD/ERS 진폭 정보 보존
-    n_times = slice_data.shape[-1]
-    freqs = fftfreq(n_times, 1 / sfreq)
-    X_fft = fft(slice_data, axis=-1)
-    
-    mu_mask = (np.abs(freqs) >= 8.0) & (np.abs(freqs) <= 12.0)
-    beta_mask = (np.abs(freqs) >= 13.0) & (np.abs(freqs) <= 30.0)
-    
-    env_mu = np.abs(ifft(X_fft * mu_mask, axis=-1))
-    env_beta = np.abs(ifft(X_fft * beta_mask, axis=-1))
-    
-    env_combined = np.stack([env_mu, env_beta], axis=-1).transpose(1, 0, 2)
-    return env_combined.astype(np.float32)
-
-def augment_trial(trial_data, sfreq, win_sec=2.0, step_sec=0.5):
-    win_size = int(win_sec * sfreq)
-    step_size = int(step_sec * sfreq)
-    n_times = trial_data.shape[-1]
-    
-    feats = []
-    for start in range(0, n_times - win_size + 1, step_size):
-        end = start + win_size
-        slice_data = trial_data[:, start:end]
-        feats.append(extract_envelope_window(slice_data, sfreq))
-        
-    return np.array(feats)
-
-# =========================================================
-# 2. Data Loading & 🔥 Global Scaling
-# =========================================================
+# 🚨 Riemannian 기하학을 위해 진폭/파워가 아닌 필터링된 Raw 신호 그 자체를 사용함
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
 
@@ -75,6 +44,7 @@ def process_subject(subj):
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
             if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
             raw.rename_channels(lambda x: x.strip('.')) 
+            raw.filter(l_freq=8.0, h_freq=30.0, verbose=False) # Mu + Beta 대역
             
             evs, ed = mne.events_from_annotations(raw, verbose=False)
             t1, t2 = ed.get('T1'), ed.get('T2')
@@ -101,8 +71,8 @@ results = [res for res in results if res is not None]
 
 X_raw = np.concatenate([res[0] for res in results])
 y_raw = np.concatenate([res[1] for res in results])
-sfreq = TARGET_SFREQ
 
+# 밸런싱 및 분할
 idx_L, idx_R, idx_H, idx_F = (np.where(y_raw == i)[0] for i in range(4))
 min_trials = min(len(idx_L), len(idx_R), len(idx_H), len(idx_F))
 
@@ -118,32 +88,23 @@ np.random.shuffle(balanced_idx)
 X_raw, y_raw = X_raw[balanced_idx], y_raw[balanced_idx]
 idx_tr, idx_te = train_test_split(np.arange(len(X_raw)), test_size=0.2, stratify=y_raw, random_state=42)
 
-def create_dataset_with_ids(indices):
-    X_list, y_list, trial_ids = [], [], []
-    for idx in indices:
-        fs = augment_trial(X_raw[idx], sfreq)
-        X_list.append(fs)
-        y_list.append(np.full(len(fs), y_raw[idx]))
-        trial_ids.append(np.full(len(fs), idx)) 
-    return np.concatenate(X_list), np.concatenate(y_list), np.concatenate(trial_ids)
+Xtr, ytr = X_raw[idx_tr], y_raw[idx_tr]
+Xte, yte = X_raw[idx_te], y_raw[idx_te]
 
-Xtr, ytr, _ = create_dataset_with_ids(idx_tr)
-Xte, yte, id_te = create_dataset_with_ids(idx_te)
-
-# 🔥 Global Scaling: Train 셋 기준으로 한 번만 피팅해서 Data Leakage와 진폭 파괴 동시 해결
-B_tr, T_tr, C_tr, F_tr = Xtr.shape
+# 피험자 전체를 아우르는 Global Scaling (형태 보존)
+B_tr, C_tr, T_tr = Xtr.shape
 scaler = StandardScaler()
-Xtr_scaled = scaler.fit_transform(Xtr.reshape(-1, C_tr * F_tr)).reshape(B_tr, T_tr, C_tr, F_tr)
+Xtr_scaled = scaler.fit_transform(Xtr.transpose(0, 2, 1).reshape(-1, C_tr)).reshape(B_tr, T_tr, C_tr).transpose(0, 2, 1)
 
-B_te, T_te, C_te, F_te = Xte.shape
-Xte_scaled = scaler.transform(Xte.reshape(-1, C_te * F_te)).reshape(B_te, T_te, C_te, F_te)
+B_te, C_te, T_te = Xte.shape
+Xte_scaled = scaler.transform(Xte.transpose(0, 2, 1).reshape(-1, C_te)).reshape(B_te, T_te, C_te).transpose(0, 2, 1)
 
 BATCH_SIZE = 128
 train_loader = DataLoader(TensorDataset(torch.tensor(Xtr_scaled), torch.tensor(ytr)), batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(Xte_scaled), torch.tensor(yte)), batch_size=BATCH_SIZE, shuffle=False)
 
 # =========================================================
-# 3. 🚀 SNN Model (Leakage Free Graph & Temporal Attention)
+# 2. 🚀 아키텍처: Riemannian TCN-GNN driven SNN
 # =========================================================
 @jax.custom_vjp
 def spike(x): return (x > 0).astype(jnp.float32)
@@ -152,89 +113,118 @@ def fwd(x): return spike(x), x
 def bwd(res, g): return (g * 1.0 / (1.0 + jnp.abs(res)),)
 spike.defvjp(fwd, bwd)
 
-class LIF(nn.Module):
+class TCNBlock(nn.Module):
+    features: int
+    dilation: int
     @nn.compact
-    def __call__(self, mem, x):
-        decay_logit = self.param('decay_logit', jax.nn.initializers.constant(2.0), (1, x.shape[-1]))
-        decay = nn.sigmoid(decay_logit)
+    def __call__(self, x):
+        # x shape: (B, T, C)
+        res = x
+        x = nn.Conv(self.features, kernel_size=(3,), kernel_dilation=(self.dilation,), padding='SAME')(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+        if res.shape[-1] != x.shape[-1]:
+            res = nn.Dense(self.features)(res)
+        return x + res
+
+class GeoTempDrivenLIF(nn.Module):
+    @nn.compact
+    def __call__(self, mem, x, geo_temp_feat):
+        # 🔥 Novelty: 시공간-기하학적 피처가 LIF 뉴런의 감쇠율(decay)을 실시간으로 결정
+        decay = nn.sigmoid(nn.Dense(x.shape[-1])(geo_temp_feat)) 
         mem = mem * decay + x  
         spk = spike(mem - 0.5) 
         mem = mem - spk * 0.5
         return mem, spk
 
-class SNNLayer(nn.Module):
-    @nn.compact
-    def __call__(self, mem, x):
-        mem, spk = LIF()(mem, x)
-        return mem, spk
-
 class Model(nn.Module):
     @nn.compact
     def __call__(self, X, train):
+        # X shape: (B, C, T)
         if train:
-            noise = jax.random.normal(self.make_rng('dropout'), X.shape) * 0.05
-            X = X + noise
+            X = X + jax.random.normal(self.make_rng('dropout'), X.shape) * 0.05
+            
+        B, C, T = X.shape
+        
+        # ---------------------------------------------------------
+        # Step 1: Riemannian Manifold Mapping (Log-Euclidean)
+        # ---------------------------------------------------------
+        # 공분산 행렬 계산 및 안정성(Regularization) 확보
+        mean_X = jnp.mean(X, axis=-1, keepdims=True)
+        X_centered = X - mean_X
+        cov = jnp.matmul(X_centered, jnp.transpose(X_centered, (0, 2, 1))) / (T - 1)
+        cov = cov + jnp.eye(C) * 1e-4 
+        
+        # Tangent Space 투영 (Eigen Decomposition)
+        vals, vecs = jnp.linalg.eigh(cov)
+        log_vals = jnp.log(jnp.clip(vals, a_min=1e-6))
+        # log_cov를 GNN의 기하학적 인접 행렬로 사용! (B, C, C)
+        log_cov = jnp.matmul(vecs * jnp.expand_dims(log_vals, 1), jnp.transpose(vecs, (0, 2, 1)))
+        
+        # ---------------------------------------------------------
+        # Step 2: TCN (Temporal Dynamics)
+        # ---------------------------------------------------------
+        X_t = jnp.transpose(X, (0, 2, 1)) # (B, T, C)
+        tcn_out = TCNBlock(features=64, dilation=1)(X_t)
+        tcn_out = TCNBlock(features=64, dilation=2)(tcn_out)
+        tcn_out = TCNBlock(features=64, dilation=4)(tcn_out) # (B, T, 64)
+        
+        # ---------------------------------------------------------
+        # Step 3: GNN 융합 (Geometric-Temporal Features)
+        # ---------------------------------------------------------
+        # TCN 피처를 노드(채널) 차원으로 변환: (B, C, T) * (B, T, 64) -> (B, C, 64)
+        node_feats = jnp.matmul(X, tcn_out) 
+        
+        # 기하학적 인접 행렬(log_cov)을 이용한 GNN 연산
+        adj = nn.softmax(log_cov, axis=-1)
+        adj = nn.Dropout(rate=0.3, deterministic=not train)(adj)
+        geo_temp_feat = jnp.matmul(adj, node_feats) # (B, C, 64)
+        geo_temp_feat = nn.LayerNorm()(geo_temp_feat)
+        geo_temp_feat = nn.relu(geo_temp_feat)
+        
+        # ---------------------------------------------------------
+        # Step 4: Geometric-Temporal driven SNN
+        # ---------------------------------------------------------
+        X_mixed = nn.Dense(128)(geo_temp_feat.reshape(B, -1)) # (B, C*64) -> (B, 128)
+        X_mixed = nn.Dropout(rate=0.4, deterministic=not train)(X_mixed)
+        
+        # 시계열 스텝 설정 (TCN 출력을 순차적으로 SNN에 공급)
+        seq_len = 10 
+        init_mem = jnp.zeros((B, 128))
+        
+        # LIF를 위해 TCN 피처를 활용하여 sequence 생성
+        seq_input = nn.Dense(128)(tcn_out) # (B, T, 128)
+        # 풀링하여 고정된 길이(seq_len)의 스텝으로 변환
+        seq_input = seq_input.reshape(B, seq_len, -1, 128).mean(axis=2) # (B, seq_len, 128)
+        
+        def scan_fn(mem, x_t):
+            # geo_temp_feat를 컨텍스트로 함께 전달
+            mem, spk = GeoTempDrivenLIF()(mem, x_t, geo_temp_feat.reshape(B, -1))
+            return mem, spk
 
-        X_conv = nn.Conv(features=32, kernel_size=(5, 1), strides=(2, 1), padding='SAME')(X)
-        X_conv = nn.relu(X_conv)
-        X_conv = nn.LayerNorm()(X_conv)
-        
-        # 🔥 Dynamic Graph 개선: 시간축을 평균내지 않고 전체 궤적(Trajectory)을 사용해 인과성 유지
-        B, T_new, C, F_conv = X_conv.shape
-        x_spat = X_conv.transpose((0, 2, 1, 3)).reshape((B, C, -1)) # (B, C, T_new * F_conv)
-        
-        query = nn.Dense(32)(x_spat)
-        key = nn.Dense(32)(x_spat)
-        
-        adj_dynamic = jnp.einsum('bcf,bdf->bcd', query, key) / jnp.sqrt(32.0)
-        adj_dynamic = nn.softmax(adj_dynamic, axis=-1)
-        adj_dynamic = nn.Dropout(rate=0.3, deterministic=not train)(adj_dynamic)
-        
-        X_graph = jnp.einsum('bcd,btdf->btcf', adj_dynamic, X_conv)
-        
-        channel_attn = nn.Dense(64)(jnp.mean(X_conv, axis=(1, 3))) 
-        channel_attn = nn.sigmoid(channel_attn)
-        channel_attn = jnp.expand_dims(channel_attn, axis=(1, 3)) 
-        
-        X_graph = X_graph * channel_attn 
-        X_res = X_graph + X_conv
-        
-        X_flat = X_res.reshape(B, T_new, -1)
-        
-        X_mixed = nn.Dense(128)(X_flat)
-        X_mixed = nn.relu(X_mixed)
-        X_mixed = nn.LayerNorm()(X_mixed)
-        X_mixed = nn.Dropout(rate=0.4, deterministic=not train)(X_mixed) 
-        
-        init_mem = jnp.zeros((B, 128)) 
-        scan_layer = nn.scan(SNNLayer, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
-        _, spk_seq = scan_layer()(init_mem, X_mixed)
+        scan_layer = nn.scan(scan_fn, variable_broadcast='params', split_rngs={'params':False}, in_axes=(1), out_axes=1)
+        _, spk_seq = scan_layer(init_mem, seq_input)
 
-        # 🔥 Temporal Attention: 단순 발화율(평균) 계산 대신, '언제' 스파이크가 터졌는지 가중치 부여
-        temp_attn = nn.Dense(1)(spk_seq) # (B, T_new, 1)
-        temp_attn = nn.softmax(temp_attn, axis=1) # 시간축에 대해 Softmax
-        feat = jnp.sum(spk_seq * temp_attn, axis=1) # (B, 128)
+        # 시간축 어텐션
+        temp_attn = nn.softmax(nn.Dense(1)(spk_seq), axis=1)
+        feat = jnp.sum(spk_seq * temp_attn, axis=1)
         
         feat = nn.Dropout(rate=0.3, deterministic=not train)(feat)
-        feat = nn.Dense(128)(feat)
+        feat = nn.Dense(64)(feat)
         feat = nn.relu(feat)
         logits = nn.Dense(4)(feat)
         
         return logits, jnp.mean(spk_seq)
 
 # =========================================================
-# 4. Training (🔥 FR Penalty Scheduling)
+# 3. Training Loop (이전과 동일한 구조 적용)
 # =========================================================
 def loss_fn(params, state, X, y, dropout_rng, fr_weight):
     logits, fr = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
-    
     one_hot_y = jax.nn.one_hot(y, 4)
     smooth_y = one_hot_y * 0.8 + (0.2 / 4.0)
     ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_y).mean()
-    
-    target_fr = 0.25
-    fr_loss = jnp.mean((fr - target_fr) ** 2) * fr_weight 
-    
+    fr_loss = jnp.mean((fr - 0.25) ** 2) * fr_weight 
     return ce_loss + fr_loss, (logits, fr)
 
 @jax.jit
@@ -255,22 +245,18 @@ def eval_step_preds(state, X):
 rng = jax.random.PRNGKey(42)
 rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
 model = Model()
-win_size = int(2.0 * TARGET_SFREQ) 
 
-params = model.init({'params': init_rng, 'dropout': dropout_init_rng}, 
-                    jnp.ones((1, win_size, 64, 2)), train=False)['params']
+# 더미 데이터로 초기화 (B, C, T)
+dummy_x = jnp.ones((1, 64, int(4.0 * TARGET_SFREQ)))
+params = model.init({'params': init_rng, 'dropout': dropout_init_rng}, dummy_x, train=False)['params']
 
 steps_per_epoch = len(train_loader)
 lr_sched = optax.exponential_decay(init_value=1e-3, transition_steps=steps_per_epoch * 10, decay_rate=0.95)
 state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adamw(learning_rate=lr_sched, weight_decay=1e-3))
 
-# =========================================================
-# 5. Training Loop
-# =========================================================
 best_acc = 0
 
 for epoch in range(1, 301): 
-    # 🔥 초반 50 에포크 동안 FR 페널티를 0.1에서 5.0으로 서서히 올림 (Warm-up)
     current_fr_weight = min(5.0, 0.1 + (epoch / 50.0) * 4.9) if epoch <= 50 else 5.0
     fr_weight_tensor = jnp.array(current_fr_weight, dtype=jnp.float32)
     
@@ -281,34 +267,21 @@ for epoch in range(1, 301):
         t_losses.append(loss)
 
     if epoch % 10 == 0:
-        all_preds = []
+        correct = 0
+        total = 0
         all_frs = []
         
         for Xb, yb in test_loader:
             preds, vf = eval_step_preds(state, jnp.array(Xb.numpy()))
-            all_preds.extend(np.array(preds))
+            correct += np.sum(np.array(preds) == yb.numpy())
+            total += len(yb)
             all_frs.append(vf)
-            
-        trial_preds = {}
-        trial_truths = {}
-        for i, tid in enumerate(id_te):
-            if tid not in trial_preds:
-                trial_preds[tid] = []
-                trial_truths[tid] = yte[i]
-            trial_preds[tid].append(all_preds[i])
-            
-        correct = 0
-        total = len(trial_preds)
-        for tid, preds in trial_preds.items():
-            most_common = Counter(preds).most_common(1)[0][0]
-            if most_common == trial_truths[tid]:
-                correct += 1
                 
         avg_val_acc = (correct / total) * 100
         avg_train_acc = np.mean(t_accs) * 100
         avg_loss = np.mean(t_losses)
         
-        print(f"[{epoch:3d}] Loss: {avg_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc(Voting): {avg_val_acc:.2f}% | FR: {np.mean(all_frs):.4f}")
+        print(f"[{epoch:3d}] Loss: {avg_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc: {avg_val_acc:.2f}% | FR: {np.mean(all_frs):.4f}")
         best_acc = max(best_acc, avg_val_acc)
 
-print(f"🔥 BEST TEST ACC: {best_acc:.2f}%")
+print(f"🔥 BEST TEST ACC (Riemannian-TCN-GNN-SNN): {best_acc:.2f}%")

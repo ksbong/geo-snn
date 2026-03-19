@@ -36,11 +36,9 @@ def load_data():
                 raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
                 if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
                 
-                # 채널 이름 정리 및 필터링
                 raw.rename_channels(lambda x: x.strip('.'))
                 raw.filter(l_freq=8.0, h_freq=30.0, verbose=False)
                 
-                # 몽타주 매핑 (에러 방지용)
                 mne.datasets.eegbci.standardize(raw) 
                 montage = mne.channels.make_standard_montage('standard_1005')
                 raw.set_montage(montage, match_case=False, on_missing='ignore')
@@ -57,6 +55,7 @@ def load_data():
                     
                 event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
                 
+                # 앞 3초 사용
                 ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, 
                                 baseline=None, preload=True, verbose=False)
                 if len(ep) > 0: 
@@ -79,38 +78,52 @@ print(f"✅ 데이터 로드 완료: {B} Trials | {C} Channels | {T} Timesteps")
 # =========================================================
 # 2. 🧠 Feature Extraction 
 # =========================================================
-print("\n⚙️ 피쳐 추출 및 계산 중...")
-
-# (A) Baseline: Raw Variance
+print("\n⚙️ 1단계: Raw Variance 추출 중...")
 feat_raw = np.var(X, axis=2) 
 
-# (B) Proposed: Riemannian Tangent Space (Log-Euclidean)
-def extract_riemannian_log_cov(X_batch):
+print("⚙️ 2단계: Dynamic Riemannian Trajectory Delta 추출 중... (시간이 조금 걸릴 수 있음)")
+def extract_dynamic_riemannian_delta(X_batch, window_size=64, step_size=32):
+    """
+    Sliding window를 적용하여 각 시점의 공분산 행렬을 구하고,
+    Tangent Space 상에서의 시간적 궤적 변화량(Delta)을 피쳐로 추출.
+    """
     feats = []
+    num_windows = (X_batch.shape[2] - window_size) // step_size + 1
+    
     for x in X_batch: 
-        # 1. Covariance Matrix 계산
-        x_centered = x - np.mean(x, axis=1, keepdims=True)
-        cov = np.cov(x_centered)
+        log_covs = []
+        for w in range(num_windows):
+            start = w * step_size
+            end = start + window_size
+            window_x = x[:, start:end]
+            
+            # Covariance Matrix
+            xc = window_x - np.mean(window_x, axis=1, keepdims=True)
+            cov = np.cov(xc) + np.eye(C) * 1e-4
+            
+            # Matrix Logarithm (Tangent Space Mapping)
+            vals, vecs = la.eigh(cov)
+            log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
+            log_cov = vecs @ np.diag(log_vals) @ vecs.T
+            
+            # Extract channel-wise scale in tangent space
+            log_covs.append(np.diag(log_cov))
+            
+        log_covs = np.array(log_covs) # (W, C)
         
-        # 수치적 안정성을 위해 대각선에 작은 값 추가 (Regularization)
-        cov = cov + np.eye(cov.shape[0]) * 1e-4
+        # 기하학적 궤적의 시간적 변화량 (Geodesic step size in Log-Euclidean)
+        deltas = np.diff(log_covs, axis=0) # (W-1, C)
         
-        # 2. Matrix Logarithm (Tangent Space Mapping)
-        # 고유값 분해를 통해 logm 계산이 빠르고 정확함
-        vals, vecs = la.eigh(cov)
-        log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
-        log_cov = vecs @ np.diag(log_vals) @ vecs.T
-        
-        # 3. 채널 본연의 기하학적 분산값 (대각성분) 추출
-        # 원래 공간의 물리적 특성을 유지하기 위해 대각선(Self-variance)만 사용
-        feats.append(np.diag(log_cov))
+        # SNN이 발화할 '요동침(Fluctuation)'의 강도를 분산으로 측정
+        feats.append(np.var(deltas, axis=0)) 
     return np.array(feats)
 
-feat_proposed = extract_riemannian_log_cov(X)
+feat_proposed = extract_dynamic_riemannian_delta(X)
 
 # =========================================================
 # 3. 📊 통계적 검증 (F-value & LDA)
 # =========================================================
+print("\n⚙️ 3단계: 통계적 분별력 계산 중...")
 f_val_raw, _ = f_classif(feat_raw, y)
 f_val_proposed, _ = f_classif(feat_proposed, y)
 
@@ -129,19 +142,19 @@ top_k = 10
 idx_raw = np.argsort(f_val_raw)[::-1][:top_k]
 idx_prop = np.argsort(f_val_proposed)[::-1][:top_k]
 
-print("\n" + "="*60)
-print("🚀 Feature Test Results (Riemannian Tangent Mapping)")
-print("="*60)
+print("\n" + "="*65)
+print("🚀 Feature Test Results: Dynamic Riemannian Delta (Novelty!)")
+print("="*65)
 print("[1] Linear Separability (LDA 5-Fold CV Accuracy)")
 print(f"  ▶ Raw Variance           : {acc_raw:.2f}%")
-print(f"  ▶ Riemannian Log-Cov     : {acc_proposed:.2f}%")
+print(f"  ▶ Dynamic Riemannian     : {acc_proposed:.2f}%")
 diff = acc_proposed - acc_raw
 print(f"    (성능 차이: {'+' if diff > 0 else ''}{diff:.2f}%p)")
 
-print("\n" + "-"*60)
+print("\n" + "-"*65)
 print(f"[2] Discriminative Power (Top {top_k} Channels by F-value)")
-print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Riemannian Log-Cov'}")
-print("-" * 60)
+print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Dynamic Riemannian Delta'}")
+print("-" * 65)
 
 for i in range(top_k):
     raw_ch = ch_names[idx_raw[i]]
@@ -150,10 +163,10 @@ for i in range(top_k):
     prop_ch = ch_names[idx_prop[i]]
     prop_f = f_val_proposed[idx_prop[i]]
     
-    # 주요 타겟 채널(C3, C4, Cz) 시각적 강조
+    # 주요 타겟 채널 시각적 강조
     rc = f"*{raw_ch}*" if raw_ch in ['C3', 'C4', 'Cz', 'Cp3', 'Cp4'] else raw_ch
     pc = f"*{prop_ch}*" if prop_ch in ['C3', 'C4', 'Cz', 'Cp3', 'Cp4'] else prop_ch
     
     print(f"  {i+1:<4} | {rc:<7} (F:{raw_f:>5.1f})      | {pc:<7} (F:{prop_f:>5.1f})")
 
-print("="*60)
+print("="*65)

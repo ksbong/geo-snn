@@ -7,7 +7,7 @@ from scipy.fft import fft, ifft, fftfreq
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 import warnings
-import gc 
+from joblib import Parallel, delayed  # 🔥 멀티프로세싱 코어 풀가동용
 
 import jax
 import jax.numpy as jnp
@@ -57,30 +57,31 @@ def augment_trial(trial_data, sfreq, win_sec=2.0, step_sec=0.5):
     return np.array(feats)
 
 # =========================================================
-# 2. Multi-Subject Data Loading (🔥 Resampling 안전장치 추가)
+# 2. 🚀 스케일 업: 105 Subjects 멀티프로세싱 전처리
 # =========================================================
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
 
-subjects = [f'S{i:03d}' for i in range(1, 110)]
-runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
-epochs_list = []
-TARGET_SFREQ = 160.0 # 🔥 통일할 타겟 주파수
+# 🔥 국룰에 맞게 오염된 4명(088, 089, 092, 100) 깔끔하게 제외하고 105명 리스트업
+bad_subjects = ['S088', 'S089', 'S092', 'S100']
+subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in bad_subjects]
 
-print("⏳ 109명 전체 데이터 로딩 시작... (Resampling 및 지뢰 패스 진행 중)")
-for subj in subjects:
+runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
+TARGET_SFREQ = 160.0 
+
+def process_subject(subj):
+    """한 피험자의 데이터를 로드하고 X, y 배열로 반환하는 일꾼 함수"""
     subj_dir = os.path.join(DATA_DIR, subj)
     if not os.path.exists(subj_dir): 
-        continue
+        return None
         
+    epochs_list = []
     for run in runs_h + runs_f:
         path = os.path.join(subj_dir, f'{subj}{run}.edf')
         if not os.path.exists(path): continue
         
         try:
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
-            
-            # 🔥 주파수 불일치 에러 방지용 강제 리샘플링
             if raw.info['sfreq'] != TARGET_SFREQ:
                 raw.resample(TARGET_SFREQ)
                 
@@ -99,24 +100,29 @@ for subj in subjects:
             ep = mne.Epochs(raw, e, {'L':1,'R':2} if run in runs_h else {'H':3,'F':4},
                             tmin=0.0, tmax=4.0, baseline=None, preload=True, verbose=False)
             if len(ep) > 0: epochs_list.append(ep)
-            
-            del raw, evs, e
-            gc.collect()
-            
-        except Exception as err:
-            print(f"⚠️ {subj}{run} 로드 실패 (패스): {err}")
+        except Exception:
             continue
+            
+    if not epochs_list: return None
+    
+    # 이 피험자의 에포크를 합쳐서 넘파이 배열로 변환 후 리턴 (메모리 절약)
+    subj_epochs = mne.concatenate_epochs(epochs_list, verbose=False)
+    X = subj_epochs.get_data() * 1e6
+    y = subj_epochs.events[:, 2] - 1
+    return X, y
 
-if not epochs_list:
-    raise ValueError("🚨 데이터를 못 불러왔어! 경로를 다시 확인해.")
+print(f"⏳ 105명 데이터 멀티프로세싱 로딩 시작... (CPU 풀가동 🚀)")
+# 🔥 n_jobs=-1 로 설정해서 쓸 수 있는 CPU 코어 전부 다 때려 박음
+results = Parallel(n_jobs=-1)(delayed(process_subject)(subj) for subj in subjects)
 
-epochs = mne.concatenate_epochs(epochs_list)
-X_raw = epochs.get_data() * 1e6 
-y_raw = epochs.events[:, 2] - 1
-sfreq = epochs.info['sfreq']
+# None 값(에러난 피험자) 필터링하고 배열 합치기
+results = [res for res in results if res is not None]
+if not results:
+    raise ValueError("🚨 데이터를 한 개도 못 불러왔어! 경로 확인해봐.")
 
-del epochs_list, epochs
-gc.collect()
+X_raw = np.concatenate([res[0] for res in results])
+y_raw = np.concatenate([res[1] for res in results])
+sfreq = TARGET_SFREQ
 
 # 4-Class 완벽 밸런싱
 idx_L, idx_R, idx_H, idx_F = (np.where(y_raw == i)[0] for i in range(4))
@@ -133,7 +139,7 @@ np.random.shuffle(balanced_idx)
 
 X_raw = X_raw[balanced_idx]
 y_raw = y_raw[balanced_idx]
-print(f"📊 100명대 통합 밸런싱 완료: 각 클래스당 {min_trials}개 (총 {len(y_raw)}개 트라이얼)")
+print(f"📊 105명 통합 밸런싱 완료: 각 클래스당 {min_trials}개 (총 {len(y_raw)}개 트라이얼)")
 
 BATCH_SIZE = 128
 idx_tr, idx_te = train_test_split(np.arange(len(X_raw)), test_size=0.2, stratify=y_raw, random_state=42)
@@ -147,6 +153,7 @@ def create_dataset_with_ids(indices):
         trial_ids.append(np.full(len(fs), idx)) 
     return np.concatenate(X_list), np.concatenate(y_list), np.concatenate(trial_ids)
 
+print("⏳ 증강 파트 진행 중...")
 Xtr, ytr, _ = create_dataset_with_ids(idx_tr)
 Xte, yte, id_te = create_dataset_with_ids(idx_te)
 
@@ -156,7 +163,7 @@ train_loader = DataLoader(TensorDataset(torch.tensor(Xtr), torch.tensor(ytr)), b
 test_loader = DataLoader(TensorDataset(torch.tensor(Xte), torch.tensor(yte)), batch_size=BATCH_SIZE, shuffle=False)
 
 # =========================================================
-# 3. SNN Model 
+# 3. SNN Model (과적합 철통 방어 구조)
 # =========================================================
 @jax.custom_vjp
 def spike(x): return (x > 0).astype(jnp.float32)
@@ -226,7 +233,7 @@ class Model(nn.Module):
         return logits, jnp.mean(spk_seq)
 
 # =========================================================
-# 4. Training (FR 페널티 유지)
+# 4. Training (FR 페널티 & Label Smoothing)
 # =========================================================
 def loss_fn(params, state, X, y, dropout_rng):
     logits, fr = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
@@ -310,4 +317,4 @@ for epoch in range(1, 301):
         print(f"[{epoch:3d}] Loss: {avg_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc(Voting): {avg_val_acc:.2f}% | FR: {np.mean(all_frs):.4f}")
         best_acc = max(best_acc, avg_val_acc)
 
-print(f"🔥 BEST TEST ACC (109 Subjects + Resampled): {best_acc:.2f}%")
+print(f"🔥 BEST TEST ACC (105 Subjects + 병렬 전처리): {best_acc:.2f}%")

@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =========================================================
-# 1. Data Loading (Raw/Filtered 뇌파 보존)
+# 1. Data Loading (Raw/Filtered 뇌파 보존) - 원본 유지
 # =========================================================
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
@@ -43,7 +43,7 @@ def process_subject(subj):
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
             if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
             raw.rename_channels(lambda x: x.strip('.')) 
-            raw.filter(l_freq=8.0, h_freq=30.0, verbose=False) 
+            raw.filter(l_freq=8.0, h_freq=30.0, verbose=False) # Mu + Beta 대역
             
             evs, ed = mne.events_from_annotations(raw, verbose=False)
             t1, t2 = ed.get('T1'), ed.get('T2')
@@ -96,57 +96,48 @@ Xtr_scaled = scaler.fit_transform(Xtr.transpose(0, 2, 1).reshape(-1, C_tr)).resh
 B_te, C_te, T_te = Xte.shape
 Xte_scaled = scaler.transform(Xte.transpose(0, 2, 1).reshape(-1, C_te)).reshape(B_te, T_te, C_te).transpose(0, 2, 1)
 
-mean_X_tr = np.mean(Xtr_scaled, axis=-1, keepdims=True)
-X_centered_tr = Xtr_scaled - mean_X_tr
-cov_tr = np.matmul(X_centered_tr, X_centered_tr.transpose(0, 2, 1)) / (T_tr - 1)
-mean_cov_tr = np.mean(cov_tr, axis=0)
-mean_cov_tr = mean_cov_tr + np.eye(C_tr) * 1e-4
-
-vals, vecs = np.linalg.eigh(mean_cov_tr)
-log_vals = np.log(np.maximum(vals, 1e-6))
-log_cov_tr = np.matmul(vecs * log_vals, vecs.T)
-
 BATCH_SIZE = 128
 train_loader = DataLoader(TensorDataset(torch.tensor(Xtr_scaled), torch.tensor(ytr)), batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(Xte_scaled), torch.tensor(yte)), batch_size=BATCH_SIZE, shuffle=False)
 
 # =========================================================
-# 2. 🚀 아키텍처: Decoupled Riemannian TCN-GNN driven SNN
+# 2. 🚀 아키텍처: Graph Spectral Neuromorphic Model (Option B)
 # =========================================================
-@jax.custom_vjp
-def spike(x): return (x > 0).astype(jnp.float32)
 
-def fwd(x): return spike(x), x
-def bwd(res, g): return (g * 1.0 / (1.0 + jnp.abs(res)),)
+# 🔥 ATan (Arctangent) Surrogate Gradient 적용
+@jax.custom_vjp
+def spike(x): 
+    return (x > 0).astype(jnp.float32)
+
+def fwd(x): 
+    return spike(x), x
+
+def bwd(res, g): 
+    alpha = 2.0
+    # Arctangent 기반의 부드러운 그래디언트
+    return (g * (alpha / 2.0) / (1.0 + (alpha * res)**2),)
+
 spike.defvjp(fwd, bwd)
 
-# 🔥 17GB 메모리 터지던 문제 완벽 해결: 순수 1D TCN 블록으로 교체
-class TCNBlock(nn.Module):
-    features: int
-    dilation: int
-    @nn.compact
-    def __call__(self, x):
-        res = x
-        x = nn.Conv(self.features, kernel_size=(3,), kernel_dilation=(self.dilation,), padding='SAME')(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        if res.shape[-1] != x.shape[-1]:
-            res = nn.Dense(self.features)(res)
-        return x + res
+# LIF 뉴런 셀 (상태를 독립적으로 관리하도록 깔끔하게 분리)
+class LIFCell(nn.Module):
+    hidden_dim: int
+    v_thresh: float = 1.0
 
-class GeoTempDrivenLIF(nn.Module):
     @nn.compact
-    def __call__(self, mem, inputs):
-        x_t, geo_temp_t = inputs
-        decay = nn.sigmoid(nn.Dense(x_t.shape[-1])(geo_temp_t)) 
-        mem = mem * decay + x_t  
-        spk = spike(mem - 0.5) 
-        mem = mem - spk * 0.5
-        return mem, spk
+    def __call__(self, state, x_t):
+        v, z = state
+        # Learnable decay parameter
+        decay = nn.sigmoid(self.param('decay', nn.initializers.constant(0.0), (self.hidden_dim,)))
+        
+        # Leaky Integrate
+        v = v * decay * (1.0 - z) + x_t
+        
+        # Fire
+        z_out = spike(v - self.v_thresh)
+        return (v, z_out), z_out
 
 class Model(nn.Module):
-    log_cov_backbone: jnp.ndarray
-
     @nn.compact
     def __call__(self, X, train):
         if train:
@@ -154,63 +145,79 @@ class Model(nn.Module):
             
         B, C, T = X.shape
         
-        # Step 1: Riemannian Backbone 
-        adj = nn.softmax(self.log_cov_backbone, axis=-1)
-        adj = nn.Dropout(rate=0.3, deterministic=not train)(adj)
+        # Step 1: Dynamic Spatial Graphing (Self-Attention 기반 Adjacency)
+        # 시간축 차원을 압축해서 채널 간의 관계를 학습 (T -> d_model)
+        d_model = 16
+        W_q = self.param('W_q', nn.initializers.glorot_normal(), (T, d_model))
+        W_k = self.param('W_k', nn.initializers.glorot_normal(), (T, d_model))
         
-        # Step 2: Node-wise TCN (메모리 폭발 방지 & 완벽한 채널 독립성 확보)
-        # (B, C, T) -> (B*C, T, 1) 로 펼쳐서 단일 필터가 모든 채널에 공평하게 적용되도록 함
-        X_t = X.reshape(B * C, T, 1)
+        Q = jnp.matmul(X, W_q) # (B, C, d_model)
+        K = jnp.matmul(X, W_k) # (B, C, d_model)
         
-        tcn_out = TCNBlock(features=16, dilation=1)(X_t)
-        tcn_out = TCNBlock(features=16, dilation=2)(tcn_out)
-        tcn_out = TCNBlock(features=16, dilation=4)(tcn_out) # (B*C, T, 16)
+        attn = jnp.matmul(Q, jnp.transpose(K, (0, 2, 1))) / jnp.sqrt(d_model)
+        A = nn.softmax(attn, axis=-1)
         
-        # 다시 원래 형태로 복구: (B*C, T, 16) -> (B, C, T, 16) -> (B, T, C, 16)
-        tcn_out = tcn_out.reshape(B, C, T, 16).transpose(0, 2, 1, 3)
+        # 대칭 행렬로 변환 (고유값 분해의 안정성을 위해 필수)
+        A = (A + jnp.transpose(A, (0, 2, 1))) / 2.0
         
-        # Step 3: Riemannian-Spatio-Temporal GNN 융합
-        gnn_out = jnp.einsum('cc,btcf->btcf', adj, tcn_out) 
-        gnn_out = nn.LayerNorm()(gnn_out)
-        gnn_out = nn.relu(gnn_out)
+        # Graph Laplacian (L = D - A)
+        D = jnp.eye(C) * jnp.sum(A, axis=-1, keepdims=True)
+        L = D - A
+        # 수치적 안정성을 위해 대각선에 작은 값 추가
+        L = L + jnp.eye(C) * 1e-4
         
-        # Step 4: Geometric-Temporal driven SNN 
-        seq_len = 10 
-        init_mem = jnp.zeros((B, 128))
+        # Eigendecomposition (배치 단위로 처리하기 위해 vmap 사용)
+        vals, U = jax.vmap(jnp.linalg.eigh)(L) # U: (B, C, C) 고유벡터 행렬
         
-        seq_input = gnn_out.reshape(B, T, -1)
-        seq_input = nn.Dense(128)(seq_input)
+        # Step 2: Graph Fourier Transform (GFT)
+        # 기하학적 맵핑: X_hat = U^T * X
+        U_T = jnp.transpose(U, (0, 2, 1))
+        X_hat = jnp.matmul(U_T, X) # (B, C, T) -> 스펙트럼 도메인!
         
-        valid_T = (T // seq_len) * seq_len
-        seq_input = seq_input[:, :valid_T, :]
-        seq_input = seq_input.reshape(B, seq_len, -1, 128).mean(axis=2)
+        # Sequence 처리를 위해 Transpose: (B, T, C)
+        X_hat_seq = jnp.transpose(X_hat, (0, 2, 1))
         
-        geo_temp_feat = gnn_out.reshape(B, T, -1)
-        geo_temp_feat = geo_temp_feat[:, :valid_T, :]
-        geo_temp_feat = geo_temp_feat.reshape(B, seq_len, -1, geo_temp_feat.shape[-1]).mean(axis=2)
-        geo_temp_feat = nn.Dense(128)(geo_temp_feat) 
-
-        ScanLIF = nn.scan(
-            GeoTempDrivenLIF,
-            variable_broadcast='params',
-            split_rngs={'params': False},
-            in_axes=1,
-            out_axes=1
-        )
-        _, spk_seq = ScanLIF()(init_mem, (seq_input, geo_temp_feat))
-
-        temp_attn = nn.softmax(nn.Dense(1)(spk_seq), axis=1)
-        feat = jnp.sum(spk_seq * temp_attn, axis=1)
+        # Step 3: Spectral Delta Encoding (변화량 추출)
+        # x_t - x_{t-1} 을 구해서 변화가 있을 때만 Spike 유도
+        delta_X = jnp.concatenate([
+            jnp.zeros((B, 1, C)), 
+            X_hat_seq[:, 1:, :] - X_hat_seq[:, :-1, :]
+        ], axis=1) # (B, T, C)
         
+        # Step 4: Deep LIF SNN
+        # SNN Layer 1 (C -> 128)
+        seq_in_1 = nn.Dense(128)(delta_X)
+        init_v1 = jnp.zeros((B, 128))
+        init_z1 = jnp.zeros((B, 128))
+        
+        ScanLIF1 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
+        _, spk_seq1 = ScanLIF1(hidden_dim=128)((init_v1, init_z1), seq_in_1)
+        
+        # SNN Layer 2 (128 -> 64)
+        seq_in_2 = nn.Dense(64)(spk_seq1)
+        init_v2 = jnp.zeros((B, 64))
+        init_z2 = jnp.zeros((B, 64))
+        
+        ScanLIF2 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
+        _, spk_seq2 = ScanLIF2(hidden_dim=64)((init_v2, init_z2), seq_in_2)
+        
+        # Step 5: Attention Readout over Spikes
+        # 시간축의 Spike 패턴을 바탕으로 가중치 계산
+        temp_attn = nn.Dense(1)(spk_seq2) # (B, T, 1)
+        temp_attn = nn.softmax(temp_attn, axis=1)
+        
+        feat = jnp.sum(spk_seq2 * temp_attn, axis=1) # (B, 64)
         feat = nn.Dropout(rate=0.3, deterministic=not train)(feat)
-        feat = nn.Dense(64)(feat)
-        feat = nn.relu(feat)
+        
         logits = nn.Dense(4)(feat)
         
-        return logits, jnp.mean(spk_seq)
-
+        # Firing Rate 모니터링 및 정규화를 위한 평균
+        mean_fr = (jnp.mean(spk_seq1) + jnp.mean(spk_seq2)) / 2.0
+        
+        return logits, mean_fr
+    
 # =========================================================
-# 3. Training Loop
+# 3. Training Loop - 원본 유지 (호환성 맞춤)
 # =========================================================
 def loss_fn(params, state, X, y, dropout_rng, fr_weight):
     logits, fr = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
@@ -237,7 +244,7 @@ def eval_step_preds(state, X):
 
 rng = jax.random.PRNGKey(42)
 rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
-model = Model(log_cov_backbone=jnp.array(log_cov_tr))
+model = Model()
 
 dummy_x = jnp.ones((1, C_tr, T_tr))
 params = model.init({'params': init_rng, 'dropout': dropout_init_rng}, dummy_x, train=False)['params']
@@ -277,4 +284,4 @@ for epoch in range(1, 301):
         print(f"[{epoch:3d}] Loss: {avg_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc: {avg_val_acc:.2f}% | FR: {np.mean(all_frs):.4f}")
         best_acc = max(best_acc, avg_val_acc)
 
-print(f"🔥 BEST TEST ACC (Riemannian-TCN-GNN-SNN): {best_acc:.2f}%")
+print(f"🔥 BEST TEST ACC (Graph-Spectral-SNN): {best_acc:.2f}%")

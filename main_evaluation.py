@@ -1,5 +1,6 @@
 import os
 import mne
+mne.set_log_level('ERROR')
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset

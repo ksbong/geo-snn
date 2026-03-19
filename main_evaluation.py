@@ -171,9 +171,12 @@ class Model(nn.Module):
         init_mem = jnp.zeros((B, 128))
         
         seq_input = nn.Dense(128)(tcn_out) 
+        
+        # 🔥 에러 수정 완료: T(641)가 seq_len(10)으로 딱 나눠떨어지도록 자투리 절삭
+        valid_T = (T // seq_len) * seq_len
+        seq_input = seq_input[:, :valid_T, :]
         seq_input = seq_input.reshape(B, seq_len, -1, 128).mean(axis=2)
         
-        # 🔥 수정 완료: geo_temp_feat를 시간축으로 확장해서 nn.scan에 던짐
         geo_flat = geo_temp_feat.reshape(B, -1)
         geo_seq = jnp.repeat(jnp.expand_dims(geo_flat, 1), seq_len, axis=1)
 
@@ -195,7 +198,7 @@ class Model(nn.Module):
         logits = nn.Dense(4)(feat)
         
         return logits, jnp.mean(spk_seq)
-
+    
 # =========================================================
 # 3. Training Loop
 # =========================================================

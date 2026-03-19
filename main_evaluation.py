@@ -6,6 +6,9 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import seaborn as sns
 import warnings
 from joblib import Parallel, delayed
 
@@ -20,7 +23,7 @@ warnings.filterwarnings("ignore")
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =========================================================
-# 1. Data Loading (Raw/Filtered 뇌파 보존) - 원본 유지
+# 1. Data Loading (Raw/Filtered 뇌파 보존)
 # =========================================================
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
@@ -101,10 +104,8 @@ train_loader = DataLoader(TensorDataset(torch.tensor(Xtr_scaled), torch.tensor(y
 test_loader = DataLoader(TensorDataset(torch.tensor(Xte_scaled), torch.tensor(yte)), batch_size=BATCH_SIZE, shuffle=False)
 
 # =========================================================
-# 2. 🚀 아키텍처: Graph Spectral Neuromorphic Model (Option B)
+# 2. 🚀 아키텍처: Graph Spectral Neuromorphic Model 
 # =========================================================
-
-# 🔥 ATan (Arctangent) Surrogate Gradient 적용
 @jax.custom_vjp
 def spike(x): 
     return (x > 0).astype(jnp.float32)
@@ -114,26 +115,19 @@ def fwd(x):
 
 def bwd(res, g): 
     alpha = 2.0
-    # Arctangent 기반의 부드러운 그래디언트
     return (g * (alpha / 2.0) / (1.0 + (alpha * res)**2),)
 
 spike.defvjp(fwd, bwd)
 
-# LIF 뉴런 셀 (상태를 독립적으로 관리하도록 깔끔하게 분리)
 class LIFCell(nn.Module):
     hidden_dim: int
-    v_thresh: float = 1.0
+    v_thresh: float = 0.3 # 🔥 임계값 완화로 데드 뉴런 방지
 
     @nn.compact
     def __call__(self, state, x_t):
         v, z = state
-        # Learnable decay parameter
         decay = nn.sigmoid(self.param('decay', nn.initializers.constant(0.0), (self.hidden_dim,)))
-        
-        # Leaky Integrate
         v = v * decay * (1.0 - z) + x_t
-        
-        # Fire
         z_out = spike(v - self.v_thresh)
         return (v, z_out), z_out
 
@@ -145,56 +139,47 @@ class Model(nn.Module):
             
         B, C, T = X.shape
         
-        # Step 1: Dynamic Spatial Graphing (Self-Attention 기반 Adjacency)
-        # 시간축 차원을 압축해서 채널 간의 관계를 학습 (T -> d_model)
-        d_model = 16
+        # Step 1: Dynamic Spatial Graphing
+        d_model = 32
         W_q = self.param('W_q', nn.initializers.glorot_normal(), (T, d_model))
         W_k = self.param('W_k', nn.initializers.glorot_normal(), (T, d_model))
         
-        Q = jnp.matmul(X, W_q) # (B, C, d_model)
-        K = jnp.matmul(X, W_k) # (B, C, d_model)
+        Q = jnp.matmul(X, W_q)
+        K = jnp.matmul(X, W_k)
         
-        attn = jnp.matmul(Q, jnp.transpose(K, (0, 2, 1))) / jnp.sqrt(d_model)
+        attn = jnp.matmul(Q, jnp.transpose(K, (0, 2, 1))) / (jnp.sqrt(d_model) * 2.0)
         A = nn.softmax(attn, axis=-1)
-        
-        # 대칭 행렬로 변환 (고유값 분해의 안정성을 위해 필수)
         A = (A + jnp.transpose(A, (0, 2, 1))) / 2.0
         
-        # Graph Laplacian (L = D - A)
         D = jnp.eye(C) * jnp.sum(A, axis=-1, keepdims=True)
-        L = D - A
-        # 수치적 안정성을 위해 대각선에 작은 값 추가
-        L = L + jnp.eye(C) * 1e-4
-        
-        # Eigendecomposition (배치 단위로 처리하기 위해 vmap 사용)
-        vals, U = jax.vmap(jnp.linalg.eigh)(L) # U: (B, C, C) 고유벡터 행렬
+        L = D - A + jnp.eye(C) * 1e-4
+        vals, U = jax.vmap(jnp.linalg.eigh)(L)
         
         # Step 2: Graph Fourier Transform (GFT)
-        # 기하학적 맵핑: X_hat = U^T * X
         U_T = jnp.transpose(U, (0, 2, 1))
-        X_hat = jnp.matmul(U_T, X) # (B, C, T) -> 스펙트럼 도메인!
-        
-        # Sequence 처리를 위해 Transpose: (B, T, C)
+        X_hat = jnp.matmul(U_T, X)
         X_hat_seq = jnp.transpose(X_hat, (0, 2, 1))
         
-        # Step 3: Spectral Delta Encoding (변화량 추출)
-        # x_t - x_{t-1} 을 구해서 변화가 있을 때만 Spike 유도
+        # Step 3: Spectral Delta Encoding & Normalization
         delta_X = jnp.concatenate([
             jnp.zeros((B, 1, C)), 
             X_hat_seq[:, 1:, :] - X_hat_seq[:, :-1, :]
-        ], axis=1) # (B, T, C)
+        ], axis=1)
+        delta_X = nn.LayerNorm()(delta_X) 
         
         # Step 4: Deep LIF SNN
-        # SNN Layer 1 (C -> 128)
         seq_in_1 = nn.Dense(128)(delta_X)
+        seq_in_1 = nn.LayerNorm()(seq_in_1)
+        
         init_v1 = jnp.zeros((B, 128))
         init_z1 = jnp.zeros((B, 128))
         
         ScanLIF1 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
         _, spk_seq1 = ScanLIF1(hidden_dim=128)((init_v1, init_z1), seq_in_1)
         
-        # SNN Layer 2 (128 -> 64)
         seq_in_2 = nn.Dense(64)(spk_seq1)
+        seq_in_2 = nn.LayerNorm()(seq_in_2) * 0.5 
+        
         init_v2 = jnp.zeros((B, 64))
         init_z2 = jnp.zeros((B, 64))
         
@@ -202,25 +187,30 @@ class Model(nn.Module):
         _, spk_seq2 = ScanLIF2(hidden_dim=64)((init_v2, init_z2), seq_in_2)
         
         # Step 5: Attention Readout over Spikes
-        # 시간축의 Spike 패턴을 바탕으로 가중치 계산
-        temp_attn = nn.Dense(1)(spk_seq2) # (B, T, 1)
+        temp_attn = nn.Dense(1)(spk_seq2)
         temp_attn = nn.softmax(temp_attn, axis=1)
         
-        feat = jnp.sum(spk_seq2 * temp_attn, axis=1) # (B, 64)
-        feat = nn.Dropout(rate=0.3, deterministic=not train)(feat)
+        feat = jnp.sum(spk_seq2 * temp_attn, axis=1)
+        feat_drop = nn.Dropout(rate=0.4, deterministic=not train)(feat)
         
-        logits = nn.Dense(4)(feat)
-        
-        # Firing Rate 모니터링 및 정규화를 위한 평균
+        logits = nn.Dense(4)(feat_drop)
         mean_fr = (jnp.mean(spk_seq1) + jnp.mean(spk_seq2)) / 2.0
         
-        return logits, mean_fr
-    
+        # 🔥 Feature 시각화를 위해 딕셔너리로 추출할 변수들 같이 리턴
+        intermediates = {
+            'A': A,
+            'spk_seq2': spk_seq2,
+            'temp_attn': temp_attn,
+            'feat': feat 
+        }
+        
+        return logits, mean_fr, intermediates
+
 # =========================================================
-# 3. Training Loop - 원본 유지 (호환성 맞춤)
+# 3. Training Loop
 # =========================================================
 def loss_fn(params, state, X, y, dropout_rng, fr_weight):
-    logits, fr = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
+    logits, fr, _ = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
     one_hot_y = jax.nn.one_hot(y, 4)
     smooth_y = one_hot_y * 0.8 + (0.2 / 4.0)
     ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_y).mean()
@@ -238,9 +228,9 @@ def train_step(state, X, y, rng, fr_weight):
 
 @jax.jit
 def eval_step_preds(state, X):
-    logits, fr = state.apply_fn({'params': state.params}, X, train=False)
+    logits, fr, intermediates = state.apply_fn({'params': state.params}, X, train=False)
     preds = jnp.argmax(logits, -1)
-    return preds, fr
+    return preds, fr, intermediates
 
 rng = jax.random.PRNGKey(42)
 rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
@@ -255,7 +245,8 @@ state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=op
 
 best_acc = 0
 
-for epoch in range(1, 301): 
+print("🚀 본격적인 학습 시작...")
+for epoch in range(1, 101): # 빠른 확인을 위해 100 epoch로 세팅
     current_fr_weight = min(5.0, 0.1 + (epoch / 50.0) * 4.9) if epoch <= 50 else 5.0
     fr_weight_tensor = jnp.array(current_fr_weight, dtype=jnp.float32)
     
@@ -266,11 +257,10 @@ for epoch in range(1, 301):
         t_losses.append(loss)
 
     if epoch % 10 == 0:
-        all_preds = []
-        all_frs = []
+        all_preds, all_frs = [], []
         
         for Xb, yb in test_loader:
-            preds, vf = eval_step_preds(state, jnp.array(Xb.numpy()))
+            preds, vf, _ = eval_step_preds(state, jnp.array(Xb.numpy()))
             all_preds.extend(np.array(preds))
             all_frs.append(vf)
             
@@ -284,4 +274,69 @@ for epoch in range(1, 301):
         print(f"[{epoch:3d}] Loss: {avg_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc: {avg_val_acc:.2f}% | FR: {np.mean(all_frs):.4f}")
         best_acc = max(best_acc, avg_val_acc)
 
-print(f"🔥 BEST TEST ACC (Graph-Spectral-SNN): {best_acc:.2f}%")
+print(f"🔥 BEST TEST ACC: {best_acc:.2f}%")
+
+# =========================================================
+# 4. 📊 시각화: 논문용 피겨(Figure) 생성 (학습 종료 후)
+# =========================================================
+print("🎨 데이터 시각화 추출 중...")
+
+# 테스트 셋 전체에 대해 피쳐 추출
+all_feats, all_labels = [], []
+sample_A, sample_spk, sample_attn = None, None, None
+
+for Xb, yb in test_loader:
+    _, _, inter = eval_step_preds(state, jnp.array(Xb.numpy()))
+    all_feats.append(np.array(inter['feat']))
+    all_labels.append(yb.numpy())
+    
+    # 시각화용 샘플 하나만 저장 (첫 번째 배치 기준)
+    if sample_A is None:
+        sample_A = np.array(inter['A'][0])           # (C, C)
+        sample_spk = np.array(inter['spk_seq2'][0])  # (T, 64)
+        sample_attn = np.array(inter['temp_attn'][0])# (T, 1)
+
+all_feats = np.concatenate(all_feats, axis=0)
+all_labels = np.concatenate(all_labels, axis=0)
+class_names = ['Left', 'Right', 'Hands', 'Feet']
+
+fig = plt.figure(figsize=(20, 10))
+
+# 1. t-SNE (Latent Space)
+ax1 = plt.subplot(2, 2, 1)
+tsne = TSNE(n_components=2, random_state=42)
+feats_2d = tsne.fit_transform(all_feats)
+scatter = ax1.scatter(feats_2d[:, 0], feats_2d[:, 1], c=all_labels, cmap='viridis', alpha=0.7)
+ax1.set_title("t-SNE of Latent Space (Feature Separation)", fontsize=14)
+legend1 = ax1.legend(*scatter.legend_elements(), title="Classes")
+for i, text in enumerate(legend1.get_texts()):
+    text.set_text(class_names[i])
+
+# 2. Learned Adjacency Matrix (Heatmap)
+ax2 = plt.subplot(2, 2, 2)
+sns.heatmap(sample_A, cmap='magma', ax=ax2)
+ax2.set_title("Dynamic Learned Adjacency Matrix (A)", fontsize=14)
+ax2.set_xlabel("Channels")
+ax2.set_ylabel("Channels")
+
+# 3. SNN Raster Plot
+ax3 = plt.subplot(2, 2, 3)
+time_steps, neuron_idx = np.where(sample_spk > 0)
+ax3.scatter(time_steps, neuron_idx, s=5, c='black', marker='|')
+ax3.set_title("SNN Spike Raster Plot (Layer 2)", fontsize=14)
+ax3.set_xlim(0, sample_spk.shape[0])
+ax3.set_ylim(0, 64)
+ax3.set_xlabel("Time Step")
+ax3.set_ylabel("Neuron Index")
+
+# 4. Temporal Attention Weights
+ax4 = plt.subplot(2, 2, 4)
+ax4.plot(sample_attn, color='blue', linewidth=2)
+ax4.set_title("Temporal Attention Weights over Time", fontsize=14)
+ax4.set_xlim(0, len(sample_attn))
+ax4.set_xlabel("Time Step")
+ax4.set_ylabel("Attention Score")
+
+plt.tight_layout()
+plt.show()
+print("✅ 완료! 창을 확인해봐.")

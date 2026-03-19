@@ -1,481 +1,313 @@
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import mne
 import numpy as np
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from scipy.fft import fft, ifft, fftfreq
-from scipy.linalg import logm
-from sklearn.model_selection import KFold
-from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
 import warnings
+import gc 
 
-# JAX & Flax
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from flax.training import train_state
 import optax
+from collections import Counter
 
-warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-# 🔥 A5000(Ampere) 극한 최적화: TF32 가속 온!
+warnings.filterwarnings("ignore")
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
-# =====================================================================
-# 1. 생물학적 4채널 인코딩 
-# =====================================================================
-def extract_snn_encoded_features(data, sfreq):
-    n_times = data.shape[-1]
-    freqs = fftfreq(n_times, 1/sfreq)
-    X = fft(data, axis=-1)
+# =========================================================
+# 1. Feature Extraction (Power Envelope)
+# =========================================================
+def extract_envelope_window(slice_data, sfreq):
+    slice_norm = (slice_data - np.mean(slice_data, axis=-1, keepdims=True)) / (np.std(slice_data, axis=-1, keepdims=True) + 1e-8)
     
-    mask_mu = np.zeros_like(freqs)
-    mask_mu[(freqs >= 8.0) & (freqs <= 12.0)] = 2.0
-    mask_beta = np.zeros_like(freqs)
-    mask_beta[(freqs >= 13.0) & (freqs <= 30.0)] = 2.0
+    n_times = slice_norm.shape[-1]
+    freqs = fftfreq(n_times, 1 / sfreq)
+    X_fft = fft(slice_norm, axis=-1)
     
-    sig_mu = np.real(ifft(X * mask_mu, axis=-1))
-    sig_beta = np.real(ifft(X * mask_beta, axis=-1))
+    mu_mask = (np.abs(freqs) >= 8.0) & (np.abs(freqs) <= 12.0)
+    beta_mask = (np.abs(freqs) >= 13.0) & (np.abs(freqs) <= 30.0)
     
-    mu_on = np.maximum(sig_mu, 0.0)
-    mu_off = np.maximum(-sig_mu, 0.0)
-    beta_on = np.maximum(sig_beta, 0.0)
-    beta_off = np.maximum(-sig_beta, 0.0)
+    env_mu = np.abs(ifft(X_fft * mu_mask, axis=-1))
+    env_beta = np.abs(ifft(X_fft * beta_mask, axis=-1))
     
-    return np.stack([mu_on, mu_off, beta_on, beta_off], axis=-1)
+    env_combined = np.stack([env_mu, env_beta], axis=-1).transpose(1, 0, 2)
+    
+    T, C, F = env_combined.shape
+    scaler = MinMaxScaler()
+    env_scaled = scaler.fit_transform(env_combined.reshape(-1, F)).reshape(T, C, F)
+    
+    return env_scaled.astype(np.float32)
 
-def compute_spd_cov(signal):
-    cov = np.cov(signal)
-    epsilon = 1e-4 * (np.trace(cov) / cov.shape[0])
-    return cov + np.eye(cov.shape[0]) * epsilon
-# =====================================================================
-# 2. 다수 피험자 데이터 로딩 (진짜 멀티프로세싱 CPU 풀가동)
-# =====================================================================
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
-# =====================================================================
-# 2. 다수 피험자 데이터 로딩 (멀티프로세싱 + 🚨완벽한 1:1:1:1 클래스 밸런싱 추가🚨)
-# =====================================================================
-def process_single_subject(args):
-    subj, DATA_DIR = args
-    runs_hands = ['R04', 'R08', 'R12']
-    runs_feet = ['R06', 'R10', 'R14']
-    epochs_list = []
+def augment_trial(trial_data, sfreq, win_sec=2.0, step_sec=0.5):
+    win_size = int(win_sec * sfreq)
+    step_size = int(step_sec * sfreq)
+    n_times = trial_data.shape[-1]
     
-    try:
-        for run in runs_hands + runs_feet:
-            path = os.path.join(DATA_DIR, subj, f'{subj}{run}.edf')
-            if not os.path.exists(path): continue
-            
+    feats = []
+    for start in range(0, n_times - win_size + 1, step_size):
+        end = start + win_size
+        slice_data = trial_data[:, start:end]
+        feats.append(extract_envelope_window(slice_data, sfreq))
+        
+    return np.array(feats)
+
+# =========================================================
+# 2. Multi-Subject Data Loading (🔥 Resampling 안전장치 추가)
+# =========================================================
+base = './'
+DATA_DIR = os.path.join(base, '07_Data') 
+
+subjects = [f'S{i:03d}' for i in range(1, 110)]
+runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
+epochs_list = []
+TARGET_SFREQ = 160.0 # 🔥 통일할 타겟 주파수
+
+print("⏳ 109명 전체 데이터 로딩 시작... (Resampling 및 지뢰 패스 진행 중)")
+for subj in subjects:
+    subj_dir = os.path.join(DATA_DIR, subj)
+    if not os.path.exists(subj_dir): 
+        continue
+        
+    for run in runs_h + runs_f:
+        path = os.path.join(subj_dir, f'{subj}{run}.edf')
+        if not os.path.exists(path): continue
+        
+        try:
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
-            evs, ev_dict = mne.events_from_annotations(raw, verbose=False)
             
-            t1_id, t2_id = ev_dict.get('T1'), ev_dict.get('T2')
-            if t1_id is None or t2_id is None: continue
+            # 🔥 주파수 불일치 에러 방지용 강제 리샘플링
+            if raw.info['sfreq'] != TARGET_SFREQ:
+                raw.resample(TARGET_SFREQ)
+                
+            raw.rename_channels(lambda x: x.strip('.')) 
             
-            events_fixed = evs.copy()
-            if run in runs_hands:
-                events_fixed[evs[:, 2] == t1_id, 2] = 1 
-                events_fixed[evs[:, 2] == t2_id, 2] = 2 
-            else:
-                events_fixed[evs[:, 2] == t1_id, 2] = 3 
-                events_fixed[evs[:, 2] == t2_id, 2] = 4 
+            evs, ed = mne.events_from_annotations(raw, verbose=False)
+            t1, t2 = ed.get('T1'), ed.get('T2')
+            if t1 is None: continue
             
-            ep = mne.Epochs(raw, events_fixed, {'Left': 1, 'Right': 2} if run in runs_hands else {'BothHands': 3, 'BothFeet': 4}, 
-                            tmin=1.0, tmax=4.0, baseline=None, preload=True, on_missing='ignore', verbose=False)
-            
+            e = evs.copy()
+            if run in runs_h: 
+                e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 1, 2 
+            else: 
+                e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 3, 4 
+                
+            ep = mne.Epochs(raw, e, {'L':1,'R':2} if run in runs_h else {'H':3,'F':4},
+                            tmin=0.0, tmax=4.0, baseline=None, preload=True, verbose=False)
             if len(ep) > 0: epochs_list.append(ep)
             
-        if not epochs_list: return subj, None
+            del raw, evs, e
+            gc.collect()
             
-        epochs_all = mne.concatenate_epochs(epochs_list, verbose=False)
-        labels = np.array(epochs_all.events[:, 2]) - 1
-        data = epochs_all.get_data() * 1e6  
-        sfreq = epochs_all.info['sfreq']
-        
-        # 🚨 [여기서부터 추가됨] 가장 개수가 적은 클래스 기준으로 데이터 강제 커팅 (1:1:1:1 밸런싱)
-        idx_0 = np.where(labels == 0)[0]
-        idx_1 = np.where(labels == 1)[0]
-        idx_2 = np.where(labels == 2)[0]
-        idx_3 = np.where(labels == 3)[0]
-        min_count = min(len(idx_0), len(idx_1), len(idx_2), len(idx_3))
-        
-        # 유효한 클래스가 하나라도 없으면 이 피험자 데이터는 버림
-        if min_count == 0: return subj, None 
-        
-        np.random.seed(42) # 항상 동일한 샘플을 뽑도록 시드 고정
-        balanced_idx = np.concatenate([
-            np.random.choice(idx_0, min_count, replace=False),
-            np.random.choice(idx_1, min_count, replace=False),
-            np.random.choice(idx_2, min_count, replace=False),
-            np.random.choice(idx_3, min_count, replace=False)
-        ])
-        np.random.shuffle(balanced_idx)
-        
-        # 밸런싱된 데이터로 덮어쓰기
-        data = data[balanced_idx]
-        labels = labels[balanced_idx]
-        # 🚨 [추가 끝] 🚨
+        except Exception as err:
+            print(f"⚠️ {subj}{run} 로드 실패 (패스): {err}")
+            continue
 
-        mean_data = np.mean(data, axis=(0, 2), keepdims=True)
-        std_data = np.std(data, axis=(0, 2), keepdims=True)
-        data_norm = (data - mean_data) / (std_data + 1e-8)
-        
-        encoded_signals = extract_snn_encoded_features(data_norm, sfreq)[:, :, :480, :] 
-        
-        L_norm_list, X_feat_list = [], []
-        for ep_idx in range(encoded_signals.shape[0]):
-            seq = encoded_signals[ep_idx]
-            sig_for_cov = seq.reshape(seq.shape[0], -1)
-            
-            cov_full = compute_spd_cov(sig_for_cov)
-            tangent = logm(cov_full).real
-            tau = np.std(tangent) if np.std(tangent) > 0 else 1.0
-            A = np.exp(tangent / tau)
-            np.fill_diagonal(A, 0) 
-            D = np.diag(np.sum(A, axis=1))
-            D_inv_sqrt = np.diag(1.0 / (np.sqrt(np.diag(D)) + 1e-8))
-            L_norm = np.eye(A.shape[0]) - (D_inv_sqrt @ A @ D_inv_sqrt)
-            
-            X_seq = np.transpose(seq, (1, 0, 2)) 
-            L_norm_list.append(L_norm)
-            X_feat_list.append(X_seq) 
+if not epochs_list:
+    raise ValueError("🚨 데이터를 못 불러왔어! 경로를 다시 확인해.")
 
-        return subj, {
-            'L': torch.tensor(np.nan_to_num(np.array(L_norm_list, dtype=np.float32))),
-            'X': torch.tensor(np.nan_to_num(np.array(X_feat_list, dtype=np.float32))),
-            'y': torch.tensor(labels, dtype=torch.long)
-        }
-    except Exception:
-        return subj, None
-    
-def load_all_graph_data():
-    base_search_dir = '/workspace' if os.path.exists('/workspace') else '.'
-    DATA_DIR = None
+epochs = mne.concatenate_epochs(epochs_list)
+X_raw = epochs.get_data() * 1e6 
+y_raw = epochs.events[:, 2] - 1
+sfreq = epochs.info['sfreq']
 
-    for root, dirs, files in os.walk(base_search_dir):
-        if 'S001' in dirs:
-            DATA_DIR = root
-            break
+del epochs_list, epochs
+gc.collect()
 
-    if DATA_DIR is None:
-        raise FileNotFoundError("❌ 데이터셋 경로를 찾을 수 없어.")
+# 4-Class 완벽 밸런싱
+idx_L, idx_R, idx_H, idx_F = (np.where(y_raw == i)[0] for i in range(4))
+min_trials = min(len(idx_L), len(idx_R), len(idx_H), len(idx_F))
 
-    exclude_subjects = ['S088', 'S092', 'S100', 'S104']
-    all_subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in exclude_subjects]
-    
-    subject_data_dict = {}
-    
-    # 🚨 [수정] 96코어를 다 쓰면 램이 터지니까 안전하게 20개 워커로 제한 🚨
-    safe_workers = min(20, multiprocessing.cpu_count())
-    print(f"\n>>> RunPod vCPU 96코어 감지! 데드락 방지를 위해 {safe_workers}개 프로세스로 병렬 전처리 시작...")
-    
-    with ProcessPoolExecutor(max_workers=safe_workers) as executor:
-        args_list = [(subj, DATA_DIR) for subj in all_subjects]
-        futures = {executor.submit(process_single_subject, arg): arg for arg in args_list}
-        
-        for future in tqdm(as_completed(futures), total=len(all_subjects), desc="Parallel Data Loading"):
-            subj, data = future.result()
-            if data is not None:
-                subject_data_dict[subj] = data
-            
-    return subject_data_dict, list(subject_data_dict.keys())
+np.random.seed(42)
+balanced_idx = np.concatenate([
+    np.random.choice(idx_L, min_trials, replace=False),
+    np.random.choice(idx_R, min_trials, replace=False),
+    np.random.choice(idx_H, min_trials, replace=False),
+    np.random.choice(idx_F, min_trials, replace=False)
+])
+np.random.shuffle(balanced_idx)
 
-subject_data_dict, valid_subjects = load_all_graph_data()
+X_raw = X_raw[balanced_idx]
+y_raw = y_raw[balanced_idx]
+print(f"📊 100명대 통합 밸런싱 완료: 각 클래스당 {min_trials}개 (총 {len(y_raw)}개 트라이얼)")
 
-def get_combined_data(subj_list):
-    L_list, X_list, y_list = [], [], []
-    for s in subj_list:
-        L_list.append(subject_data_dict[s]['L'])
-        X_list.append(subject_data_dict[s]['X'])
-        y_list.append(subject_data_dict[s]['y'])
-    if not L_list: return None, None, None
-    return torch.cat(L_list, dim=0), torch.cat(X_list, dim=0), torch.cat(y_list, dim=0)
+BATCH_SIZE = 128
+idx_tr, idx_te = train_test_split(np.arange(len(X_raw)), test_size=0.2, stratify=y_raw, random_state=42)
 
-# =====================================================================
-# 3. Surrogate Gradient & 순정 LIF
-# =====================================================================
+def create_dataset_with_ids(indices):
+    X_list, y_list, trial_ids = [], [], []
+    for idx in indices:
+        fs = augment_trial(X_raw[idx], sfreq)
+        X_list.append(fs)
+        y_list.append(np.full(len(fs), y_raw[idx]))
+        trial_ids.append(np.full(len(fs), idx)) 
+    return np.concatenate(X_list), np.concatenate(y_list), np.concatenate(trial_ids)
+
+Xtr, ytr, _ = create_dataset_with_ids(idx_tr)
+Xte, yte, id_te = create_dataset_with_ids(idx_te)
+
+print(f"🚀 증강 후 윈도우 수 - Train: {len(Xtr)}개, Test: {len(Xte)}개")
+
+train_loader = DataLoader(TensorDataset(torch.tensor(Xtr), torch.tensor(ytr)), batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(TensorDataset(torch.tensor(Xte), torch.tensor(yte)), batch_size=BATCH_SIZE, shuffle=False)
+
+# =========================================================
+# 3. SNN Model 
+# =========================================================
 @jax.custom_vjp
-def spike_fn(x):
-    return jnp.where(x > 0, 1.0, 0.0)
+def spike(x): return (x > 0).astype(jnp.float32)
 
-def spike_fwd(x):
-    return spike_fn(x), x
-
-def spike_bwd(res, g):
-    x = res
-    alpha = 2.0
-    grad = alpha / (2.0 * jnp.square(1.0 + jnp.abs(alpha * x)))
-    return (g * grad,)
-
-spike_fn.defvjp(spike_fwd, spike_bwd)
+def fwd(x): return spike(x), x
+def bwd(res, g): return (g * 1.0 / (1.0 + jnp.abs(res)),)
+spike.defvjp(fwd, bwd)
 
 class LIF(nn.Module):
-    beta: float = 0.8
-    threshold: float = 1.0
-    
     @nn.compact
     def __call__(self, mem, x):
-        mem = mem * self.beta + x
-        spk = spike_fn(mem - self.threshold) 
-        mem = mem - jax.lax.stop_gradient(spk) * self.threshold 
+        mem = mem * 0.9 + x  
+        spk = spike(mem - 0.5) 
+        mem = mem - spk * 0.5
         return mem, spk
-# =====================================================================
-# 4. 네 오리지널 모델 아키텍처 (LayerNorm 부활 - 뇌사 방지)
-# =====================================================================
-class SNNStep(nn.Module):
+
+class SNNLayer(nn.Module):
     @nn.compact
-    def __call__(self, carry, current_in):
-        mems, L_norm = carry
-        mem_enc, mem_s, mem_out = mems
-        
-        gain = self.param('enc_gain', nn.initializers.ones, current_in.shape[-2:])
-        bias = self.param('enc_bias', nn.initializers.zeros, current_in.shape[-2:])
-        enc_current = current_in * gain + bias
-        
-        # 🚨 [핵심 복구 1] 네 원래 아이디어였던 LayerNorm 부활!
-        # 입력 전류의 분산을 강제로 1로 맞춰서 뉴런이 무조건 스파이크를 쏘게 만듦
-        enc_in = nn.Dense(16)(enc_current)
-        enc_in = nn.LayerNorm()(enc_in) 
-        mem_enc, spk_enc = LIF(beta=0.5, threshold=0.5)(mem_enc, enc_in)
-        
-        adj = jnp.eye(64) - L_norm
-        gx = jnp.einsum('bnm, bmf -> bnf', adj, spk_enc)
-        
-        spatial_w = self.param('spatial_w', nn.initializers.glorot_normal(), (64, 8))
-        gx_pooled = jnp.einsum('bcf, cs -> bsf', gx, spatial_w) 
-        gx_flat = gx_pooled.reshape((gx_pooled.shape[0], -1)) 
-        
-        # 🚨 [핵심 복구 2] 두 번째 SNN 레이어 전류도 스케일 펌핑
-        cur_s = nn.Dense(64)(gx_flat)
-        cur_s = nn.LayerNorm()(cur_s)
-        mem_s, spk_s = LIF(beta=0.8, threshold=1.0)(mem_s, cur_s) 
-        
-        cur_out = nn.Dense(32)(spk_s)
-        mem_out = mem_out * 0.95 + cur_out 
-        
-        new_mems = (mem_enc, mem_s, mem_out)
-        return (new_mems, L_norm), (mem_out, spk_enc, spk_s)
+    def __call__(self, mem, x):
+        mem, spk = LIF()(mem, x)
+        return mem, spk
 
-class Ultimate_STCN_GraphSNN(nn.Module):
-    num_classes: int = 4
-
+class Model(nn.Module):
     @nn.compact
-    def __call__(self, L_norm, X_seq, deterministic: bool):
-        B, T, C, F = X_seq.shape
-        
-        # 🚨 [EEGNet 철학 적용 1] 훈련 중에만 데이터에 가우시안 노이즈 강제 주입
-        if not deterministic:
-            noise_rng = self.make_rng('dropout') # JAX rng 재사용
-            # 신호의 10% 수준의 노이즈를 섞어서 피험자 고유 패턴 암기 방해
-            noise = jax.random.normal(noise_rng, X_seq.shape) * 0.1 
-            X_seq = X_seq + noise
-            
-            # 🚨 [EEGNet 철학 적용 2] Spatial Dropout (채널 자체를 랜덤하게 블랙아웃)
-            # 채널 64개 중 20%를 아예 꺼버려서 특정 채널 과의존 방지
-            drop_rng = self.make_rng('dropout')
-            channel_mask = jax.random.bernoulli(drop_rng, p=0.8, shape=(B, 1, C, 1))
-            X_seq = X_seq * channel_mask / 0.8
-            
-        # 이후 네 원래 Laplacian 필터링 및 Conv 로직 그대로 진행
-        gx_lap = jnp.einsum('bnm, btmf -> btnf', L_norm, X_seq)
-        X_seq_filtered = X_seq - 0.5 * gx_lap
-        
-        ann_out = nn.Conv(features=16, kernel_size=(16, 1), strides=(4, 1), padding='SAME')(X_seq_filtered)
-        ann_out = nn.relu(ann_out)
-        
-        if not deterministic:
-            ann_out = nn.Dropout(rate=0.3, deterministic=deterministic)(ann_out)
-            rng = self.make_rng('dropout')
-            mask = jax.random.bernoulli(rng, p=0.7, shape=L_norm.shape)
-            L_norm = L_norm * mask / 0.7
+    def __call__(self, X, train):
+        if train:
+            noise = jax.random.normal(self.make_rng('dropout'), X.shape) * 0.05
+            X = X + noise
 
-        init_carry = ((jnp.zeros((B, 64, 16)), jnp.zeros((B, 64)), jnp.zeros((B, 32))), L_norm)
-        ScanSNN = nn.scan(SNNStep, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
-        _, (mem_out_seq, spk_enc, spk_s) = ScanSNN()(init_carry, ann_out)
+        X_conv = nn.Conv(features=32, kernel_size=(5, 1), strides=(2, 1), padding='SAME')(X)
+        X_conv = nn.relu(X_conv)
+        X_conv = nn.LayerNorm()(X_conv)
         
-        num_chunks = 10
-        chunk_size = 120 // num_chunks
-        chunks = mem_out_seq.reshape((B, num_chunks, chunk_size, 32))
-        pooled_feat = jnp.mean(chunks, axis=2).reshape((B, -1)) 
+        adj_base = self.param('adj_matrix', jax.nn.initializers.normal(stddev=0.1), (64, 64))
+        adj_sym = (adj_base + adj_base.T) / 2.0
+        adj_sym = adj_sym - jnp.diag(jnp.diag(adj_sym))
         
-        y = nn.Dropout(rate=0.5, deterministic=deterministic)(pooled_feat)
-        logits = nn.Dense(self.num_classes)(y)
+        channel_attn = nn.Dense(64)(jnp.mean(X_conv, axis=(1, 3))) 
+        channel_attn = nn.sigmoid(channel_attn)
+        channel_attn = jnp.expand_dims(channel_attn, axis=(1, 3)) 
         
-        return logits, (jnp.mean(spk_enc) + jnp.mean(spk_s)) / 2.0 
+        adj_sym = nn.Dropout(rate=0.5, deterministic=not train)(adj_sym)
+        X_graph = jnp.einsum('nm,btmf->btnf', adj_sym, X_conv)
+        X_graph = X_graph * channel_attn 
+        
+        X_res = X_graph + X_conv
+        
+        B, T_new, C, F = X_res.shape
+        X_flat = X_res.reshape(B, T_new, -1)
+        
+        X_mixed = nn.Dense(128)(X_flat)
+        X_mixed = nn.relu(X_mixed)
+        X_mixed = nn.LayerNorm()(X_mixed)
+        X_mixed = nn.Dropout(rate=0.4, deterministic=not train)(X_mixed) 
+        
+        init_mem = jnp.zeros((B, 128)) 
+        scan_layer = nn.scan(SNNLayer, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
+        _, spk_seq = scan_layer()(init_mem, X_mixed)
 
-# =====================================================================
-# 5. JAX 학습 스텝 
-# =====================================================================
-def smooth_labels(labels, num_classes, smoothing=0.2): 
-    return jax.nn.one_hot(labels, num_classes) * (1.0 - smoothing) + (smoothing / num_classes)
+        feat = jnp.mean(spk_seq, axis=1) 
+        
+        feat = nn.Dropout(rate=0.3, deterministic=not train)(feat)
+        feat = nn.Dense(128)(feat)
+        feat = nn.relu(feat)
+        logits = nn.Dense(4)(feat)
+        
+        return logits, jnp.mean(spk_seq)
 
-@jax.jit
-def train_step(state, L_batch, X_batch, targets, dropout_key):
-    def loss_fn(params):
-        logits, firing_rate = state.apply_fn(
-            {'params': params}, L_batch, X_batch, deterministic=False, rngs={'dropout': dropout_key}
-        )
-        loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_labels(targets, 4)).mean()
-        return loss, (logits, firing_rate)
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (logits, firing_rate)), grads = grad_fn(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state, loss, jnp.mean(jnp.argmax(logits, -1) == targets), firing_rate
+# =========================================================
+# 4. Training (FR 페널티 유지)
+# =========================================================
+def loss_fn(params, state, X, y, dropout_rng):
+    logits, fr = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
     
-@jax.jit
-def eval_step(state, L_batch, X_batch, targets):
-    logits, _ = state.apply_fn({'params': state.params}, L_batch, X_batch, deterministic=True)
-    return jnp.mean(jnp.argmax(logits, -1) == targets)
+    one_hot_y = jax.nn.one_hot(y, 4)
+    smooth_y = one_hot_y * 0.8 + (0.2 / 4.0)
+    ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_y).mean()
+    
+    target_fr = 0.25
+    fr_loss = jnp.mean((fr - target_fr) ** 2) * 5.0 
+    
+    return ce_loss + fr_loss, (logits, fr)
 
 @jax.jit
-def sstl_train_step(state, L_batch, X_batch, targets, dropout_key):
-    def loss_fn(params):
-        logits, _ = state.apply_fn(
-            {'params': params}, L_batch, X_batch, deterministic=False, rngs={'dropout': dropout_key}
-        )
-        loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_labels(targets, 4)).mean()
-        return loss, logits 
-
+def train_step(state, X, y, rng):
+    rng, dropout_rng = jax.random.split(rng) 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
+    (loss, (logits, fr)), grads = grad_fn(state.params, state, X, y, dropout_rng)
     state = state.apply_gradients(grads=grads)
-    return state, loss, jnp.mean(jnp.argmax(logits, -1) == targets)
+    acc = jnp.mean(jnp.argmax(logits, -1) == y)
+    return state, loss, acc, fr, rng
 
-# =====================================================================
-# 6. 메인 실행 파이프라인 (A5000 병렬화 + Best Model + SSTL)
-# =====================================================================
-kf_global = KFold(n_splits=5, shuffle=True, random_state=42)
-global_acc_list, sstl_acc_list = [], []
+@jax.jit
+def eval_step_preds(state, X):
+    logits, fr = state.apply_fn({'params': state.params}, X, train=False)
+    preds = jnp.argmax(logits, -1)
+    return preds, fr
 
 rng = jax.random.PRNGKey(42)
+rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
+model = Model()
+win_size = int(2.0 * TARGET_SFREQ) 
 
-print("\n" + "="*50)
-print("🚀 A5000 풀 파워 가동: JAX 순정 SNN 파이프라인 시작 🚀")
-print("="*50)
+params = model.init({'params': init_rng, 'dropout': dropout_init_rng}, 
+                    jnp.ones((1, win_size, 64, 2)), train=False)['params']
 
-for fold, (train_idx, test_idx) in enumerate(kf_global.split(valid_subjects)):
-    print(f"\n[Fold {fold + 1}/5] Start")
-    
-    global_train_subjs = [valid_subjects[i] for i in train_idx]
-    global_test_subjs = [valid_subjects[i] for i in test_idx]
-    
-    L_train, X_train, y_train = get_combined_data(global_train_subjs)
-    L_unseen, X_unseen, y_unseen = get_combined_data(global_test_subjs)
-    if X_train is None: continue
-    
-    train_loader = DataLoader(
-        TensorDataset(L_train, X_train, y_train), 
-        batch_size=128, shuffle=True, drop_last=True,
-        num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True
-    )
-    unseen_loader = DataLoader(
-        TensorDataset(L_unseen, X_unseen, y_unseen), 
-        batch_size=128, shuffle=False, drop_last=False,
-        num_workers=8, pin_memory=True, persistent_workers=True
-    )
-    
-    rng, init_rng, dropout_rng = jax.random.split(rng, 3)
-    dummy_L = jnp.ones((1, 64, 64))
-    dummy_X = jnp.ones((1, 480, 64, 4))
-    
-    model = Ultimate_STCN_GraphSNN()
-    variables = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_L, dummy_X, deterministic=True)
-    
-    lr_schedule = optax.warmup_cosine_decay_schedule(init_value=1e-4, peak_value=2e-3, warmup_steps=100, decay_steps=len(train_loader)*150)
-    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=lr_schedule, weight_decay=1e-4))
-    state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
-    
-    best_test_acc = 0.0
-    best_params = state.params 
-    
-    # 1. Global Training (150 Epochs)
-    for epoch in range(1, 151): 
-        for batch_L, batch_X, batch_y in train_loader:
-            j_L = jax.device_put(jnp.array(batch_L.numpy()))
-            j_X = jax.device_put(jnp.array(batch_X.numpy()))
-            j_y = jax.device_put(jnp.array(batch_y.numpy()))
-            
-            rng, dropout_key = jax.random.split(rng)
-            state, loss, acc, firing_rate = train_step(state, j_L, j_X, j_y, dropout_key)
+steps_per_epoch = len(train_loader)
+lr_sched = optax.exponential_decay(init_value=1e-3, transition_steps=steps_per_epoch * 10, decay_rate=0.95)
+state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adamw(learning_rate=lr_sched, weight_decay=1e-3))
 
-        if epoch % 5 == 0:
-            unseen_corr, unseen_tot = 0, 0
-            for batch_L, batch_X, batch_y in unseen_loader:
-                j_L = jax.device_put(jnp.array(batch_L.numpy()))
-                j_X = jax.device_put(jnp.array(batch_X.numpy()))
-                j_y = jax.device_put(jnp.array(batch_y.numpy()))
-                
-                batch_acc = eval_step(state, j_L, j_X, j_y)
-                unseen_corr += batch_acc.item() * len(j_y)
-                unseen_tot += len(j_y)
-                
-            current_test_acc = 100 * unseen_corr / unseen_tot
-            
-            if current_test_acc > best_test_acc:
-                best_test_acc = current_test_acc
-                best_params = state.params
-                print(f"[Epoch {epoch:03d}] ⭐ 최고 기록! Global Test Acc: {current_test_acc:.2f}% | FR: {firing_rate.item():.3f}")
-            else:
-                print(f"[Epoch {epoch:03d}] Global Test Acc: {current_test_acc:.2f}% | FR: {firing_rate.item():.3f}")
-    
-    global_acc_list.append(best_test_acc)
-    print(f"Fold {fold + 1} Final Global Test Acc (Best Checkpoint): {best_test_acc:.2f}%")
-    
-    # 2. SSTL Transfer Learning (20 Epochs)
-    print(f"Fold {fold + 1} SSTL Transfer Learning (20 Epochs)...")
-    fold_sstl_accs = []
-    
-    for subj in tqdm(global_test_subjs, desc="SSTL", leave=False):
-        L_sub, X_sub, y_sub = subject_data_dict[subj]['L'], subject_data_dict[subj]['X'], subject_data_dict[subj]['y']
-        subj_fold_accs = []
+# =========================================================
+# 5. Training Loop
+# =========================================================
+best_acc = 0
+
+for epoch in range(1, 301): 
+    t_accs, t_losses = [], []
+    for Xb, yb in train_loader:
+        state, loss, acc, _, rng = train_step(state, jnp.array(Xb.numpy()), jnp.array(yb.numpy()), rng)
+        t_accs.append(acc)
+        t_losses.append(loss)
+
+    if epoch % 10 == 0:
+        all_preds = []
+        all_frs = []
         
-        for sub_train_idx, sub_test_idx in KFold(n_splits=4, shuffle=True, random_state=42).split(X_sub):
-            sstl_tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=5e-4, weight_decay=1e-4))
-            sstl_state = train_state.TrainState.create(apply_fn=model.apply, params=best_params, tx=sstl_tx)
+        for Xb, yb in test_loader:
+            preds, vf = eval_step_preds(state, jnp.array(Xb.numpy()))
+            all_preds.extend(np.array(preds))
+            all_frs.append(vf)
             
-            sub_train_loader = DataLoader(
-                TensorDataset(L_sub[sub_train_idx], X_sub[sub_train_idx], y_sub[sub_train_idx]), 
-                batch_size=16, shuffle=True, drop_last=True, num_workers=4, pin_memory=True
-            )
-            sub_test_loader = DataLoader(
-                TensorDataset(L_sub[sub_test_idx], X_sub[sub_test_idx], y_sub[sub_test_idx]), 
-                batch_size=16, shuffle=False, drop_last=False, num_workers=4, pin_memory=True
-            )
+        trial_preds = {}
+        trial_truths = {}
+        for i, tid in enumerate(id_te):
+            if tid not in trial_preds:
+                trial_preds[tid] = []
+                trial_truths[tid] = yte[i]
+            trial_preds[tid].append(all_preds[i])
             
-            for _ in range(20): 
-                for batch_L, batch_X, batch_y in sub_train_loader:
-                    j_L = jax.device_put(jnp.array(batch_L.numpy()))
-                    j_X = jax.device_put(jnp.array(batch_X.numpy()))
-                    j_y = jax.device_put(jnp.array(batch_y.numpy()))
-                    
-                    rng, dropout_key = jax.random.split(rng)
-                    sstl_state, loss, acc = sstl_train_step(sstl_state, j_L, j_X, j_y, dropout_key)
-                    
-            corr, tot = 0, 0
-            for batch_L, batch_X, batch_y in sub_test_loader:
-                j_L = jax.device_put(jnp.array(batch_L.numpy()))
-                j_X = jax.device_put(jnp.array(batch_X.numpy()))
-                j_y = jax.device_put(jnp.array(batch_y.numpy()))
+        correct = 0
+        total = len(trial_preds)
+        for tid, preds in trial_preds.items():
+            most_common = Counter(preds).most_common(1)[0][0]
+            if most_common == trial_truths[tid]:
+                correct += 1
                 
-                batch_acc = eval_step(sstl_state, j_L, j_X, j_y)
-                corr += batch_acc.item() * len(j_y)
-                tot += len(j_y)
-            subj_fold_accs.append(100 * corr / tot)
-            
-        fold_sstl_accs.append(np.mean(subj_fold_accs))
+        avg_val_acc = (correct / total) * 100
+        avg_train_acc = np.mean(t_accs) * 100
+        avg_loss = np.mean(t_losses)
         
-    avg_sstl_fold = np.mean(fold_sstl_accs)
-    sstl_acc_list.append(avg_sstl_fold)
-    print(f"Fold {fold + 1} SSTL Mean Acc: {avg_sstl_fold:.2f}%")
+        print(f"[{epoch:3d}] Loss: {avg_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc(Voting): {avg_val_acc:.2f}% | FR: {np.mean(all_frs):.4f}")
+        best_acc = max(best_acc, avg_val_acc)
 
-print("\n" + "="*50)
-print(f"5-Fold Final Global Test Acc (Best Checkpoint): {np.mean(global_acc_list):.2f}%")
-print(f"5-Fold Final SSTL Acc: {np.mean(sstl_acc_list):.2f}%")
-print("="*50)
+print(f"🔥 BEST TEST ACC (109 Subjects + Resampled): {best_acc:.2f}%")

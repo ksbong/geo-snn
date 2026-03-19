@@ -8,7 +8,7 @@ from scipy.fft import fft, ifft, fftfreq
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 import warnings
-from joblib import Parallel, delayed  # 🔥 멀티프로세싱 코어 풀가동용
+from joblib import Parallel, delayed
 
 import jax
 import jax.numpy as jnp
@@ -21,11 +21,10 @@ warnings.filterwarnings("ignore")
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =========================================================
-# 1. Feature Extraction (Power Envelope)
+# 1. Feature Extraction & 2. Data Loading (기존과 동일, 완벽함)
 # =========================================================
 def extract_envelope_window(slice_data, sfreq):
     slice_norm = (slice_data - np.mean(slice_data, axis=-1, keepdims=True)) / (np.std(slice_data, axis=-1, keepdims=True) + 1e-8)
-    
     n_times = slice_norm.shape[-1]
     freqs = fftfreq(n_times, 1 / sfreq)
     X_fft = fft(slice_norm, axis=-1)
@@ -35,13 +34,11 @@ def extract_envelope_window(slice_data, sfreq):
     
     env_mu = np.abs(ifft(X_fft * mu_mask, axis=-1))
     env_beta = np.abs(ifft(X_fft * beta_mask, axis=-1))
-    
     env_combined = np.stack([env_mu, env_beta], axis=-1).transpose(1, 0, 2)
     
     T, C, F = env_combined.shape
     scaler = MinMaxScaler()
     env_scaled = scaler.fit_transform(env_combined.reshape(-1, F)).reshape(T, C, F)
-    
     return env_scaled.astype(np.float32)
 
 def augment_trial(trial_data, sfreq, win_sec=2.0, step_sec=0.5):
@@ -57,21 +54,15 @@ def augment_trial(trial_data, sfreq, win_sec=2.0, step_sec=0.5):
         
     return np.array(feats)
 
-# =========================================================
-# 2. 🚀 스케일 업: 105 Subjects 멀티프로세싱 전처리
-# =========================================================
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
 
-# 🔥 국룰에 맞게 오염된 4명(088, 089, 092, 100) 깔끔하게 제외하고 105명 리스트업
 bad_subjects = ['S088', 'S089', 'S092', 'S100']
 subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in bad_subjects]
-
 runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
 TARGET_SFREQ = 160.0 
 
 def process_subject(subj):
-    """한 피험자의 데이터를 로드하고 X, y 배열로 반환하는 일꾼 함수"""
     subj_dir = os.path.join(DATA_DIR, subj)
     if not os.path.exists(subj_dir): 
         return None
@@ -105,27 +96,19 @@ def process_subject(subj):
             continue
             
     if not epochs_list: return None
-    
-    # 이 피험자의 에포크를 합쳐서 넘파이 배열로 변환 후 리턴 (메모리 절약)
     subj_epochs = mne.concatenate_epochs(epochs_list, verbose=False)
     X = subj_epochs.get_data() * 1e6
     y = subj_epochs.events[:, 2] - 1
     return X, y
 
 print(f"⏳ 105명 데이터 멀티프로세싱 로딩 시작... (CPU 풀가동 🚀)")
-# 🔥 n_jobs=-1 로 설정해서 쓸 수 있는 CPU 코어 전부 다 때려 박음
 results = Parallel(n_jobs=-1)(delayed(process_subject)(subj) for subj in subjects)
-
-# None 값(에러난 피험자) 필터링하고 배열 합치기
 results = [res for res in results if res is not None]
-if not results:
-    raise ValueError("🚨 데이터를 한 개도 못 불러왔어! 경로 확인해봐.")
 
 X_raw = np.concatenate([res[0] for res in results])
 y_raw = np.concatenate([res[1] for res in results])
 sfreq = TARGET_SFREQ
 
-# 4-Class 완벽 밸런싱
 idx_L, idx_R, idx_H, idx_F = (np.where(y_raw == i)[0] for i in range(4))
 min_trials = min(len(idx_L), len(idx_R), len(idx_H), len(idx_F))
 
@@ -154,17 +137,14 @@ def create_dataset_with_ids(indices):
         trial_ids.append(np.full(len(fs), idx)) 
     return np.concatenate(X_list), np.concatenate(y_list), np.concatenate(trial_ids)
 
-print("⏳ 증강 파트 진행 중...")
 Xtr, ytr, _ = create_dataset_with_ids(idx_tr)
 Xte, yte, id_te = create_dataset_with_ids(idx_te)
-
-print(f"🚀 증강 후 윈도우 수 - Train: {len(Xtr)}개, Test: {len(Xte)}개")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(Xtr), torch.tensor(ytr)), batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(Xte), torch.tensor(yte)), batch_size=BATCH_SIZE, shuffle=False)
 
 # =========================================================
-# 3. SNN Model (과적합 철통 방어 구조)
+# 3. 🚀 SNN Model (Dynamic Graph & Learnable Leakage 적용)
 # =========================================================
 @jax.custom_vjp
 def spike(x): return (x > 0).astype(jnp.float32)
@@ -176,7 +156,11 @@ spike.defvjp(fwd, bwd)
 class LIF(nn.Module):
     @nn.compact
     def __call__(self, mem, x):
-        mem = mem * 0.9 + x  
+        # 🔥 Learnable Decay: 초기값을 2.0으로 주면 sigmoid(2.0) ≈ 0.88로 기존 0.9와 비슷하게 시작함
+        decay_logit = self.param('decay_logit', jax.nn.initializers.constant(2.0), (1, x.shape[-1]))
+        decay = nn.sigmoid(decay_logit)
+        
+        mem = mem * decay + x  
         spk = spike(mem - 0.5) 
         mem = mem - spk * 0.5
         return mem, spk
@@ -194,25 +178,36 @@ class Model(nn.Module):
             noise = jax.random.normal(self.make_rng('dropout'), X.shape) * 0.05
             X = X + noise
 
+        # Spatial-Temporal Features
         X_conv = nn.Conv(features=32, kernel_size=(5, 1), strides=(2, 1), padding='SAME')(X)
         X_conv = nn.relu(X_conv)
         X_conv = nn.LayerNorm()(X_conv)
         
-        adj_base = self.param('adj_matrix', jax.nn.initializers.normal(stddev=0.1), (64, 64))
-        adj_sym = (adj_base + adj_base.T) / 2.0
-        adj_sym = adj_sym - jnp.diag(jnp.diag(adj_sym))
+        # 🔥 Dynamic Graph (Self-Attention 기반)
+        # 시간축을 잠시 평균내어 공간적(Spatial) 맥락만 뽑아냄 -> (B, 채널, 피처)
+        x_spat = jnp.mean(X_conv, axis=1) 
         
+        query = nn.Dense(32)(x_spat) # (B, 64, 32)
+        key = nn.Dense(32)(x_spat)   # (B, 64, 32)
+        
+        # 피험자/트라이얼마다 동적으로 변하는 인접 행렬 생성
+        adj_dynamic = jnp.einsum('bcf,bdf->bcd', query, key) / jnp.sqrt(32.0)
+        adj_dynamic = nn.softmax(adj_dynamic, axis=-1) # (B, 64, 64)
+        adj_dynamic = nn.Dropout(rate=0.3, deterministic=not train)(adj_dynamic)
+        
+        # 동적 그래프를 원래의 시공간 데이터에 곱해줌
+        X_graph = jnp.einsum('bcd,btdf->btcf', adj_dynamic, X_conv)
+        
+        # 채널 어텐션 (기존 코드 유지)
         channel_attn = nn.Dense(64)(jnp.mean(X_conv, axis=(1, 3))) 
         channel_attn = nn.sigmoid(channel_attn)
         channel_attn = jnp.expand_dims(channel_attn, axis=(1, 3)) 
         
-        adj_sym = nn.Dropout(rate=0.5, deterministic=not train)(adj_sym)
-        X_graph = jnp.einsum('nm,btmf->btnf', adj_sym, X_conv)
         X_graph = X_graph * channel_attn 
-        
         X_res = X_graph + X_conv
         
         B, T_new, C, F = X_res.shape
+        # 시계열 차원(T_new)은 살리고 공간과 피처 차원만 Flatten
         X_flat = X_res.reshape(B, T_new, -1)
         
         X_mixed = nn.Dense(128)(X_flat)
@@ -220,10 +215,12 @@ class Model(nn.Module):
         X_mixed = nn.LayerNorm()(X_mixed)
         X_mixed = nn.Dropout(rate=0.4, deterministic=not train)(X_mixed) 
         
+        # SNN Layer
         init_mem = jnp.zeros((B, 128)) 
         scan_layer = nn.scan(SNNLayer, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
         _, spk_seq = scan_layer()(init_mem, X_mixed)
 
+        # 시간축으로 발화율(Rate Coding) 평균 계산
         feat = jnp.mean(spk_seq, axis=1) 
         
         feat = nn.Dropout(rate=0.3, deterministic=not train)(feat)
@@ -234,7 +231,7 @@ class Model(nn.Module):
         return logits, jnp.mean(spk_seq)
 
 # =========================================================
-# 4. Training (FR 페널티 & Label Smoothing)
+# 4. Training (FR 페널티 & Label Smoothing 유지)
 # =========================================================
 def loss_fn(params, state, X, y, dropout_rng):
     logits, fr = state.apply_fn({'params': params}, X, train=True, rngs={'dropout': dropout_rng})
@@ -318,4 +315,4 @@ for epoch in range(1, 301):
         print(f"[{epoch:3d}] Loss: {avg_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc(Voting): {avg_val_acc:.2f}% | FR: {np.mean(all_frs):.4f}")
         best_acc = max(best_acc, avg_val_acc)
 
-print(f"🔥 BEST TEST ACC (105 Subjects + 병렬 전처리): {best_acc:.2f}%")
+print(f"🔥 BEST TEST ACC (105 Subjects + Dynamic Graph): {best_acc:.2f}%")

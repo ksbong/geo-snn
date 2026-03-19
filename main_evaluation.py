@@ -3,20 +3,26 @@ import mne
 mne.set_log_level('ERROR')
 import numpy as np
 import scipy.linalg as la
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.feature_selection import f_classif
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
 from joblib import Parallel, delayed
 import warnings
 
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from flax.training import train_state
+import optax
+
 warnings.filterwarnings("ignore")
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =========================================================
-# 1. Data Loading & Riemannian Alignment (105명 전체)
+# 1. Data Loading & Riemannian Alignment
 # =========================================================
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
-
 bad_subjects = ['S088', 'S089', 'S092', 'S100']
 subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in bad_subjects]
 runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
@@ -27,15 +33,12 @@ def process_subject(subj):
     if not os.path.exists(subj_dir): return None
         
     epochs_list = []
-    info = None
     for run in runs_h + runs_f:
         path = os.path.join(subj_dir, f'{subj}{run}.edf')
         if not os.path.exists(path): continue
-        
         try:
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
             if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
-            
             raw.rename_channels(lambda x: x.strip('.'))
             raw.filter(l_freq=8.0, h_freq=30.0, verbose=False)
             
@@ -48,18 +51,12 @@ def process_subject(subj):
             if t1 is None: continue
             
             e = evs.copy()
-            if run in runs_h:
-                e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 0, 1
-            else:
-                e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3
+            if run in runs_h: e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 0, 1
+            else: e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3
                 
             event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
-            
-            ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, 
-                            baseline=None, preload=True, verbose=False)
-            if len(ep) > 0: 
-                epochs_list.append(ep)
-                if info is None: info = ep.info 
+            ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, baseline=None, preload=True, verbose=False)
+            if len(ep) > 0: epochs_list.append(ep)
         except Exception: continue
             
     if not epochs_list: return None
@@ -67,106 +64,172 @@ def process_subject(subj):
     X = subj_epochs.get_data() * 1e6
     y = subj_epochs.events[:, 2]
     
-    # 🔥 핵심 Novelty: Riemannian Alignment (개인차 제거) 🔥
-    covs = []
-    for x in X:
-        xc = x - np.mean(x, axis=1, keepdims=True)
-        covs.append(np.cov(xc))
-    
-    # 피험자의 기하학적 기준점(Reference Matrix R) 계산
-    R = np.mean(covs, axis=0) 
-    R = R + np.eye(R.shape[0]) * 1e-4
-    
-    # R^{-1/2} 계산 (다양체의 원점으로 끌어오는 변환 행렬)
+    # 🌟 Riemannian Alignment
+    covs = [np.cov(x - np.mean(x, axis=1, keepdims=True)) for x in X]
+    R = np.mean(covs, axis=0) + np.eye(X.shape[1]) * 1e-4
     vals, vecs = la.eigh(R)
     r_inv_sqrt = vecs @ np.diag(1.0 / np.sqrt(np.clip(vals, a_min=1e-6, a_max=None))) @ vecs.T
     
-    # 모든 트라이얼을 원점으로 정렬
-    X_aligned = np.zeros_like(X)
-    for i in range(len(X)):
-        X_aligned[i] = r_inv_sqrt @ X[i]
+    X_aligned = np.array([r_inv_sqrt @ x for x in X])
+    return X_aligned, y
 
-    return X_aligned, y, info, X # (정렬된 X, 라벨, info, 원본 X)
-
-print(f"⏳ 105명 데이터 로딩 및 Riemannian Alignment 동시 진행 중...")
+print(f"⏳ 데이터 로딩 및 기하학적 정렬 진행 중...")
 results = Parallel(n_jobs=-1)(delayed(process_subject)(subj) for subj in subjects)
-
 valid_results = [res for res in results if res is not None]
+
 X_aligned = np.concatenate([res[0] for res in valid_results])
-y_raw = np.concatenate([res[1] for res in valid_results])
-info = valid_results[0][2] 
-X_raw_unaligned = np.concatenate([res[3] for res in valid_results]) # 비교를 위한 원본
-
+y_all = np.concatenate([res[1] for res in valid_results])
 B, C, T = X_aligned.shape
-print(f"✅ 글로벌 데이터 로드 및 정렬 완료: {B} Trials | {C} Channels")
 
 # =========================================================
-# 2. 🧠 Feature Extraction (Aligned vs Unaligned)
+# 2. 🌟 Novelty: Sequential Riemannian Trajectory Extraction
 # =========================================================
-print("\n⚙️ 글로벌 피쳐 추출 및 계산 중...")
-
-# (A) Baseline: 정렬되지 않은 원본 데이터의 분산
-feat_raw = np.var(X_raw_unaligned, axis=2) 
-
-# (B) Proposed: 정렬된 데이터(Aligned EEG)에 대한 Riemannian Log-Cov
-def extract_riemannian_log_cov(X_batch):
-    feats = []
-    for x in X_batch: 
-        x_centered = x - np.mean(x, axis=1, keepdims=True)
-        cov = np.cov(x_centered) + np.eye(C) * 1e-4
-        
-        vals, vecs = la.eigh(cov)
-        log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
-        log_cov = vecs @ np.diag(log_vals) @ vecs.T
-        
-        feats.append(np.diag(log_cov))
-    return np.array(feats)
-
-feat_proposed = extract_riemannian_log_cov(X_aligned)
-
-# =========================================================
-# 3. 📊 통계적 검증 (F-value & LDA)
-# =========================================================
-print("⚙️ 글로벌 분별력 계산 및 5-Fold 교차 검증 중...")
-f_val_raw, _ = f_classif(feat_raw, y_raw)
-f_val_proposed, _ = f_classif(feat_proposed, y_raw)
-
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-clf = LinearDiscriminantAnalysis()
-
-acc_raw = cross_val_score(clf, feat_raw, y_raw, cv=cv, n_jobs=-1).mean() * 100
-acc_proposed = cross_val_score(clf, feat_proposed, y_raw, cv=cv, n_jobs=-1).mean() * 100
-
-# =========================================================
-# 4. 📝 결과 터미널 출력
-# =========================================================
-ch_names = np.array(info.ch_names)
-top_k = 15 
-
-idx_raw = np.argsort(f_val_raw)[::-1][:top_k]
-idx_prop = np.argsort(f_val_proposed)[::-1][:top_k]
-
-print("\n" + "="*70)
-print("🚀 GLOBAL Feature Test: Riemannian Alignment + Log-Cov Mapping")
-print("="*70)
-print("[1] Global Linear Separability (LDA 5-Fold CV Accuracy)")
-print(f"  ▶ Raw Variance (Unaligned)     : {acc_raw:.2f}%")
-print(f"  ▶ Aligned Riemannian Log-Cov   : {acc_proposed:.2f}%")
-diff = acc_proposed - acc_raw
-print(f"    (글로벌 성능 차이: {'+' if diff > 0 else ''}{diff:.2f}%p)")
-
-print("\n" + "-"*70)
-print(f"[2] Global Discriminative Power (Top {top_k} Channels by F-value)")
-print(f"  {'Rank':<5} | {'Raw Variance':<20} | {'Aligned Riemannian Log-Cov'}")
-print("-" * 70)
-
-for i in range(top_k):
-    raw_ch = ch_names[idx_raw[i]]
-    raw_f = f_val_raw[idx_raw[i]]
+print("⚙️ SNN 인코딩을 위한 Dynamic Trajectory Sequence 추출 중...")
+def extract_trajectory_sequence(X_batch, window_size=64, step_size=16):
+    """SNN의 시간 스텝(Seq_len)마다 들어갈 기하학적 궤적 벡터 추출"""
+    num_windows = (X_batch.shape[2] - window_size) // step_size + 1
+    trajectory_seqs = []
     
-    prop_ch = ch_names[idx_prop[i]]
-    prop_f = f_val_proposed[idx_prop[i]]
-    
-    print(f"  {i+1:<4} | {raw_ch:<7} (F:{raw_f:>5.1f})      | {prop_ch:<7} (F:{prop_f:>5.1f})")
+    for x in X_batch:
+        log_covs = []
+        for w in range(num_windows):
+            start = w * step_size
+            window_x = x[:, start:start+window_size]
+            xc = window_x - np.mean(window_x, axis=1, keepdims=True)
+            cov = np.cov(xc) + np.eye(C) * 1e-4
+            
+            vals, vecs = la.eigh(cov)
+            log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
+            log_cov = vecs @ np.diag(log_vals) @ vecs.T
+            log_covs.append(np.diag(log_cov)) # (W, C)
+            
+        log_covs = np.array(log_covs)
+        barycenter = np.mean(log_covs, axis=0, keepdims=True)
+        
+        # 시간에 따른 '기하학적 일탈 정도' 자체를 시퀀스로 반환!
+        trajectory = np.abs(log_covs - barycenter) # Shape: (Seq_len, C)
+        trajectory_seqs.append(trajectory)
+        
+    return np.array(trajectory_seqs)
 
-print("="*70)
+X_seq = extract_trajectory_sequence(X_aligned)
+_, Seq_len, C_feat = X_seq.shape
+
+# Train/Test Split & Dataloader
+idx_tr, idx_te = train_test_split(np.arange(len(X_seq)), test_size=0.2, stratify=y_all, random_state=42)
+train_loader = DataLoader(TensorDataset(torch.tensor(X_seq[idx_tr], dtype=torch.float32), torch.tensor(y_all[idx_tr])), batch_size=128, shuffle=True)
+test_loader = DataLoader(TensorDataset(torch.tensor(X_seq[idx_te], dtype=torch.float32), torch.tensor(y_all[idx_te])), batch_size=128, shuffle=False)
+
+# =========================================================
+# 3. 🚀 SNN Architecture (Riemannian Geodesic SNN)
+# =========================================================
+@jax.custom_vjp
+def spike(x): return (x > 0).astype(jnp.float32)
+
+def fwd(x): return spike(x), x
+def bwd(res, g): 
+    alpha = 2.0
+    return (g * (alpha / 2.0) / (1.0 + (alpha * res)**2),)
+spike.defvjp(fwd, bwd)
+
+class LIFCell(nn.Module):
+    hidden_dim: int
+    v_thresh: float = 0.5 
+
+    @nn.compact
+    def __call__(self, state, x_t):
+        v, z = state
+        decay = nn.sigmoid(self.param('decay', nn.initializers.constant(0.0), (self.hidden_dim,)))
+        # 기하학적 일탈 전류(x_t)가 들어오며 막전위 축적
+        v = v * decay * (1.0 - z) + x_t
+        z_out = spike(v - self.v_thresh)
+        return (v, z_out), z_out
+
+class RG_SNN(nn.Module):
+    @nn.compact
+    def __call__(self, x_seq, train=True):
+        B, T_seq, C = x_seq.shape
+        
+        if train:
+            x_seq = x_seq + jax.random.normal(self.make_rng('dropout'), x_seq.shape) * 0.05
+            
+        # SNN Layer 1
+        seq_in_1 = nn.Dense(128)(x_seq)
+        seq_in_1 = nn.LayerNorm()(seq_in_1)
+        
+        init_state1 = (jnp.zeros((B, 128)), jnp.zeros((B, 128)))
+        ScanLIF1 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
+        _, spk_seq1 = ScanLIF1(hidden_dim=128)(init_state1, seq_in_1)
+        
+        # SNN Layer 2
+        seq_in_2 = nn.Dense(64)(spk_seq1)
+        seq_in_2 = nn.LayerNorm()(seq_in_2) * 0.5
+        
+        init_state2 = (jnp.zeros((B, 64)), jnp.zeros((B, 64)))
+        ScanLIF2 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
+        _, spk_seq2 = ScanLIF2(hidden_dim=64)(init_state2, seq_in_2)
+        
+        # Temporal Attention (시간축에 걸친 궤적 요동의 핵심 스텝 찾기)
+        temp_attn = nn.softmax(nn.Dense(1)(spk_seq2), axis=1)
+        feat = jnp.sum(spk_seq2 * temp_attn, axis=1)
+        feat = nn.Dropout(rate=0.4, deterministic=not train)(feat)
+        
+        logits = nn.Dense(4)(feat)
+        mean_fr = (jnp.mean(spk_seq1) + jnp.mean(spk_seq2)) / 2.0
+        return logits, mean_fr
+
+# =========================================================
+# 4. Training Loop
+# =========================================================
+def loss_fn(params, state, x_seq, y, dropout_rng, fr_weight):
+    logits, fr = state.apply_fn({'params': params}, x_seq, train=True, rngs={'dropout': dropout_rng})
+    smooth_y = jax.nn.one_hot(y, 4) * 0.9 + (0.1 / 4.0)
+    ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_y).mean()
+    fr_loss = jnp.mean((fr - 0.2) ** 2) * fr_weight 
+    return ce_loss + fr_loss, (logits, fr)
+
+@jax.jit
+def train_step(state, x_seq, y, rng, fr_weight):
+    rng, dropout_rng = jax.random.split(rng) 
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, (logits, fr)), grads = grad_fn(state.params, state, x_seq, y, dropout_rng, fr_weight)
+    state = state.apply_gradients(grads=grads)
+    acc = jnp.mean(jnp.argmax(logits, -1) == y)
+    return state, loss, acc, fr, rng
+
+@jax.jit
+def eval_step(state, x_seq):
+    logits, fr = state.apply_fn({'params': state.params}, x_seq, train=False)
+    preds = jnp.argmax(logits, -1)
+    return preds, fr
+
+rng = jax.random.PRNGKey(42)
+rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
+model = RG_SNN()
+dummy_x = jnp.ones((1, Seq_len, C_feat))
+params = model.init({'params': init_rng, 'dropout': dropout_init_rng}, dummy_x, train=False)['params']
+
+lr_sched = optax.exponential_decay(init_value=1e-3, transition_steps=len(train_loader)*10, decay_rate=0.95)
+state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adamw(learning_rate=lr_sched, weight_decay=1e-3))
+
+print("\n🚀 본격적인 SNN 학습 시작...")
+best_acc = 0
+for epoch in range(1, 101):
+    fr_weight_tensor = jnp.array(min(2.0, 0.1 + (epoch / 30.0) * 1.9), dtype=jnp.float32)
+    t_accs, t_losses = [], []
+    for Xb, yb in train_loader:
+        state, loss, acc, _, rng = train_step(state, jnp.array(Xb.numpy()), jnp.array(yb.numpy()), rng, fr_weight_tensor)
+        t_accs.append(acc)
+        t_losses.append(loss)
+
+    if epoch % 5 == 0:
+        all_preds = []
+        for Xb, yb in test_loader:
+            preds, _ = eval_step(state, jnp.array(Xb.numpy()))
+            all_preds.extend(np.array(preds))
+            
+        val_acc = (np.sum(np.array(all_preds) == y_all[idx_te]) / len(idx_te)) * 100
+        print(f"[{epoch:3d}] Loss: {np.mean(t_losses):.4f} | Train Acc: {np.mean(t_accs)*100:.2f}% | Val Acc: {val_acc:.2f}%")
+        best_acc = max(best_acc, val_acc)
+
+print(f"🔥 BEST TEST ACC (Riemannian Geodesic SNN): {best_acc:.2f}%")

@@ -81,7 +81,6 @@ def process_and_extract_sequential_features(subj):
     triu_idx = np.triu_indices(C)
     
     subj_seq_feats = []
-    # 🔥 수정된 부분: window를 1초(160)로 늘려 공분산 행렬의 Rank 부족 현상 원천 차단
     window, step = 160, 16 
     for x in X_aligned:
         win_feats = []
@@ -124,7 +123,7 @@ _, Seq_len, Feat_dim = X_bal_seq.shape
 print(f"✅ 입력 데이터 Shape: Sequence Length = {Seq_len}, Features = {Feat_dim}")
 
 # =========================================================
-# 2. 🚀 JAX/Flax SNN Architecture
+# 2. 🚀 JAX/Flax SNN Architecture (Robust Version)
 # =========================================================
 @jax.custom_vjp
 def spike(x): return (x > 0).astype(jnp.float32)
@@ -143,33 +142,39 @@ class LIFCell(nn.Module):
         z_new = spike(v - 0.5)
         return (v, z_new), z_new
 
-class Sequential_RTM_SNN(nn.Module):
+class Robust_Sequential_RTM_SNN(nn.Module):
     @nn.compact
     def __call__(self, x_seq, train=True):
         B, T, F = x_seq.shape
 
-        # Input Projection: 노이즈가 사라진 2080차원 궤적을 Spike-friendly하게 압축
-        x = nn.Dense(512)(x_seq)
+        # 🔥 처방 1: Input Dropout (들어오자마자 2080차원 중 절반을 끄고 시작)
+        x = nn.Dropout(0.5, deterministic=not train)(x_seq)
+
+        # 🔥 처방 3: Capacity 다이어트 (512 -> 128로 대폭 축소)
+        x = nn.Dense(128)(x)
         x = nn.gelu(x)
-        x = nn.Dense(256)(x)
         x = nn.LayerNorm()(x)
 
         # SNN Layer 1
-        init1 = (jnp.zeros((B, 256)), jnp.zeros((B, 256)))
+        init1 = (jnp.zeros((B, 128)), jnp.zeros((B, 128)))
         Scan1 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
-        _, spk1 = Scan1(256)(init1, x)
+        _, spk1 = Scan1(128)(init1, x)
 
-        # SNN Layer 2
-        x2 = nn.Dense(128)(spk1)
+        # 🔥 처방 2: Spike Dropout (터진 스파이크 중 30%를 무작위로 삭제)
+        spk1 = nn.Dropout(0.3, deterministic=not train)(spk1)
+
+        # SNN Layer 2 (128 -> 64)
+        x2 = nn.Dense(64)(spk1)
         x2 = nn.LayerNorm()(x2)
-        init2 = (jnp.zeros((B, 128)), jnp.zeros((B, 128)))
+        init2 = (jnp.zeros((B, 64)), jnp.zeros((B, 64)))
         Scan2 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
-        _, spk2 = Scan2(128)(init2, x2)
+        _, spk2 = Scan2(64)(init2, x2)
 
         # Temporal Attention (시간축 스파이크 중요도 가중합)
         attn = nn.softmax(nn.Dense(1)(spk2), axis=1)
         feat = jnp.sum(spk2 * attn, axis=1)
 
+        # Final Dropout
         feat = nn.Dropout(0.5, deterministic=not train)(feat)
         logits = nn.Dense(4)(feat)
 
@@ -199,8 +204,8 @@ def eval_step(state, x):
     logits, _ = state.apply_fn({'params': state.params}, x, train=False)
     return jnp.argmax(logits, -1)
 
-print("\n🚀 수학적 결함이 제거된 SNN 메인 학습 시작...")
-model = Sequential_RTM_SNN()
+print("\n🚀 규제가 강화된 Robust SNN 메인 학습 시작...")
+model = Robust_Sequential_RTM_SNN()
 rng = jax.random.PRNGKey(42)
 params = model.init({'params': rng, 'dropout': rng}, jnp.ones((1, Seq_len, Feat_dim)))['params']
 
@@ -235,7 +240,7 @@ print(f"\n🔥 BEST SNN TEST ACCURACY: {best_acc:.2f}%")
 # 4. IEEE-Grade Evaluation (최고 성능 파라미터로 측정)
 # =========================================================
 print("\n" + "="*60)
-print("📊 IEEE-Grade Final Evaluation: Full-Rank Sequential RTM + SNN")
+print("📊 IEEE-Grade Final Evaluation: Robust SNN")
 print("="*60)
 
 final_preds = []

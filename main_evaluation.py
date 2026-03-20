@@ -61,7 +61,9 @@ def process_subject(subj):
             else:
                 e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3
 
-            ep = mne.Epochs(raw, e, {0:0,1:1,2:2,3:3}, tmin=0.0, tmax=3.0, 
+            # 🔥 문제의 원인 수정 (해당 Run에 존재하는 이벤트만 지정)
+            event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
+            ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, 
                             baseline=None, preload=True, verbose=False)
             if len(ep) > 0: epochs_list.append(ep)
         except: continue
@@ -89,7 +91,7 @@ np.random.shuffle(balanced_indices)
 X_bal = X_raw[balanced_indices]
 y_bal = y_raw[balanced_indices]
 
-# 🔥 핵심 1: 데이터 분리를 가장 먼저 수행 (Data Leakage 원천 차단) 🔥
+# 🔥 핵심 1: 데이터 분리를 가장 먼저 수행 (Data Leakage 원천 차단)
 idx_tr, idx_te = train_test_split(np.arange(len(X_bal)), test_size=0.2, stratify=y_bal, random_state=42)
 y_tr, y_te = y_bal[idx_tr], y_bal[idx_te]
 
@@ -104,7 +106,7 @@ R_train = np.mean(covs_tr, axis=0) + np.eye(X_bal.shape[1]) * 1e-4
 vals, vecs = la.eigh(R_train)
 r_inv_sqrt = vecs @ np.diag(1.0 / np.sqrt(np.clip(vals, a_min=1e-6, a_max=None))) @ vecs.T
 
-# Train/Test 모두 R_train을 사용해 정렬 (현장 캘리브레이션 모사)
+# Train/Test 모두 R_train을 사용해 정렬
 X_aligned_tr = np.array([r_inv_sqrt @ x for x in X_bal[idx_tr]])
 X_aligned_te = np.array([r_inv_sqrt @ x for x in X_bal[idx_te]])
 
@@ -131,7 +133,7 @@ def extract_raw_logcov_trajectory(X_batch, window=64, step=32):
 raw_seq_tr = extract_raw_logcov_trajectory(X_aligned_tr)
 raw_seq_te = extract_raw_logcov_trajectory(X_aligned_te)
 
-# 🔥 핵심 2: Train 데이터의 시퀀스 평균만 계산해서 Centering 🔥
+# 🔥 핵심 2: Train 데이터의 시퀀스 평균만 계산해서 Centering
 train_barycenter = np.mean(raw_seq_tr, axis=(0, 1), keepdims=True)
 traj_seq_tr = raw_seq_tr - train_barycenter
 traj_seq_te = raw_seq_te - train_barycenter
@@ -146,7 +148,7 @@ B_te = traj_seq_te.shape[0]
 traj_tr_flat = traj_seq_tr.reshape(-1, F_dim)
 traj_te_flat = traj_seq_te.reshape(-1, F_dim)
 
-# 🔥 핵심 3: Train 데이터로만 PCA 가중치 학습 🔥
+# 🔥 핵심 3: Train 데이터로만 PCA 가중치 학습
 pca = PCA(n_components=256, whiten=True, random_state=42)
 pca.fit(traj_tr_flat)
 
@@ -158,7 +160,7 @@ train_loader = DataLoader(TensorDataset(torch.tensor(X_seq_tr, dtype=torch.float
 test_loader = DataLoader(TensorDataset(torch.tensor(X_seq_te, dtype=torch.float32), torch.tensor(y_te)), batch_size=128, shuffle=False)
 
 # =========================================================
-# 5. SNN Core & Architecture (유지)
+# 5. SNN Core & Architecture 
 # =========================================================
 @jax.custom_vjp
 def spike(x): return (x > 0).astype(jnp.float32)

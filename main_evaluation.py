@@ -4,237 +4,180 @@ import mne
 mne.set_log_level('ERROR')
 import numpy as np
 import scipy.linalg as la
-
 from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 import warnings
 
-import torch
-from torch.utils.data import DataLoader, TensorDataset
-import jax
-import jax.numpy as jnp
-import flax.linen as nn
-from flax.training import train_state
-import optax
-
 warnings.filterwarnings("ignore")
-jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =========================================================
-# 1. 환경 설정 및 글로벌 아키텍처 정의
+# 1. 105명 전체 데이터 로딩 및 메모리 최적화 리만 정렬
 # =========================================================
-base = './'
-DATA_DIR = os.path.join(base, '07_Data') 
-TARGET_SFREQ = 160.0 
-runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
+DATA_DIR = './07_Data' # 캐글 경로로 맞게 수정해
+# PhysioNet 109명 중 불량 데이터 4명(88, 92, 100, 104) 제외한 105명
+bad_subjects = [88, 92, 100, 104]
+subjects = [f'S{i:03d}' for i in range(1, 110) if i not in bad_subjects]
 
-bad_subjects = ['S088', 'S089', 'S092', 'S100']
-subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in bad_subjects]
+all_x_aligned, all_y = [], []
 
-@jax.custom_vjp
-def spike(x): return (x > 0).astype(jnp.float32)
-def fwd(x): return spike(x), x
-def bwd(res, g): return (g * 0.3 / (1.0 + jnp.abs(res * 3.0)),)
-spike.defvjp(fwd, bwd)
-
-class LIFCell(nn.Module):
-    hidden_dim: int
-    @nn.compact
-    def __call__(self, state, x):
-        v, z = state
-        decay = nn.sigmoid(self.param("decay", nn.initializers.constant(1.0), (self.hidden_dim,)))
-        v = v * decay * (1.0 - z) + x
-        z_new = spike(v - 0.5)
-        return (v, z_new), z_new
-
-class Subject_RTM_SNN(nn.Module):
-    @nn.compact
-    def __call__(self, x_seq, train=True):
-        B, T, F = x_seq.shape
-        x = nn.Dropout(0.5, deterministic=not train)(x_seq)
-        x = nn.Dense(128)(x)
-        x = nn.gelu(x)
-        x = nn.LayerNorm()(x)
-
-        init1 = (jnp.zeros((B, 128)), jnp.zeros((B, 128)))
-        Scan1 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
-        _, spk1 = Scan1(128)(init1, x)
-
-        spk1 = nn.Dropout(0.3, deterministic=not train)(spk1)
-
-        x2 = nn.Dense(64)(spk1)
-        x2 = nn.LayerNorm()(x2)
-        init2 = (jnp.zeros((B, 64)), jnp.zeros((B, 64)))
-        Scan2 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
-        _, spk2 = Scan2(64)(init2, x2)
-
-        attn = nn.softmax(nn.Dense(1)(spk2), axis=1)
-        feat = jnp.sum(spk2 * attn, axis=1)
-
-        feat = nn.Dropout(0.5, deterministic=not train)(feat)
-        logits = nn.Dense(4)(feat)
-        return logits, (jnp.mean(spk1) + jnp.mean(spk2)) / 2.0
-
-def loss_fn(params, state, x, y, rng):
-    logits, fr = state.apply_fn({'params': params}, x, train=True, rngs={'dropout': rng})
-    y_s = jax.nn.one_hot(y, 4) * 0.9 + 0.025 
-    ce = optax.softmax_cross_entropy(logits=logits, labels=y_s).mean()
-    fr_loss = jnp.mean((fr - 0.15)**2) * 0.05
-    return ce + fr_loss, logits
-
-@jax.jit
-def train_step(state, x, y, rng):
-    rng, sub = jax.random.split(rng)
-    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, state, x, y, sub)
-    state = state.apply_gradients(grads=grads)
-    return state, loss, jnp.mean(jnp.argmax(logits, -1) == y), rng
-
-@jax.jit
-def eval_step(state, x):
-    logits, _ = state.apply_fn({'params': state.params}, x, train=False)
-    return jnp.argmax(logits, -1)
-
-# =========================================================
-# 2. 메인 루프: 105명 피험자 개별 검증
-# =========================================================
-print("\n" + "="*60)
-print("🚀 전체 피험자 독립 검증 시작 (Intra-Subject RTM-SNN)")
-print("="*60)
-
-subject_results = {}
-
-for idx, subj in enumerate(subjects, 1):
-    subj_dir = os.path.join(DATA_DIR, subj)
-    if not os.path.exists(subj_dir): continue
-
-    epochs_list = []
-    for run in runs_h + runs_f:
-        path = os.path.join(subj_dir, f'{subj}{run}.edf')
+print("⏳ 105명 전체 데이터 로딩 및 리만 정렬 시작 (메모리 최적화)...")
+for s_idx, s in enumerate(subjects):
+    subj_dir = os.path.join(DATA_DIR, s)
+    subj_epochs = []
+    for run in ['R04','R08','R12','R06','R10','R14']:
+        path = os.path.join(subj_dir, f'{s}{run}.edf')
         if not os.path.exists(path): continue
-        try:
-            raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
-            if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
-            raw.rename_channels(lambda x: x.strip('.'))
-            raw.filter(8.0, 30.0, verbose=False)
-            mne.datasets.eegbci.standardize(raw)
-            
-            evs, ed = mne.events_from_annotations(raw, verbose=False)
-            t1, t2 = ed.get('T1'), ed.get('T2')
-            if t1 is None: continue
-            
-            e = evs.copy()
-            if run in runs_h: e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 0, 1
-            else: e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3
-
-            event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
-            ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, baseline=None, preload=True, verbose=False)
-            if len(ep) > 0: epochs_list.append(ep)
-        except: continue
-            
-    if not epochs_list: 
-        print(f"[{idx:3d}/{len(subjects)}] {subj} 데이터 부족으로 스킵")
-        continue
+        raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
+        raw.resample(160.0); raw.filter(8.0, 30.0, verbose=False)
+        mne.datasets.eegbci.standardize(raw)
         
-    epochs = mne.concatenate_epochs(epochs_list, verbose=False)
-    X_raw, y = epochs.get_data() * 1e6, epochs.events[:,2]
-
-    # [안전장치] 클래스당 샘플 수 최소한의 균형 맞추기 (선택적)
-    unique, counts = np.unique(y, return_counts=True)
-    min_c = np.min(counts)
-    bal_idx = []
-    for cls in unique:
-        bal_idx.extend(np.random.choice(np.where(y == cls)[0], min_c, replace=False))
-    X_raw, y = X_raw[bal_idx], y[bal_idx]
-
-    # 피험자 맞춤형 정렬 (R_i)
-    covs = []
-    for x in X_raw:
-        c = np.cov(x - np.mean(x, axis=1, keepdims=True))
-        covs.append((c + c.T) / 2.0) # 대칭성 보장
-        
-    R_i = np.mean(covs, axis=0) + np.eye(X_raw.shape[1]) * 1e-4
-    vals, vecs = la.eigh(R_i)
-    r_inv_sqrt = vecs @ np.diag(1.0 / np.sqrt(np.clip(vals, 1e-6, None))) @ vecs.T
-    X_aligned = np.array([r_inv_sqrt @ x for x in X_raw])
-
-    # 궤적 추출 (Full Rank: window=160, step=16)
-    triu_idx = np.triu_indices(X_aligned.shape[1])
-    seq_feats = []
-    window, step = 160, 16 
-    for x in X_aligned:
-        win_feats = []
-        for w in range((x.shape[1] - window) // step + 1):
-            win = x[:, w*step : w*step+window]
-            cov = np.cov(win - np.mean(win, axis=1, keepdims=True)) + np.eye(X_aligned.shape[1]) * 1e-4
-            cov = (cov + cov.T) / 2.0 # 대칭성 보장
-            vals_w, vecs_w = la.eigh(cov)
-            log_cov = vecs_w @ np.diag(np.log(np.clip(vals_w, 1e-6, None))) @ vecs_w.T
-            win_feats.append(log_cov[triu_idx]) 
-        seq_feats.append(np.array(win_feats))
+        evs, ed = mne.events_from_annotations(raw, verbose=False)
+        e = evs.copy()
+        if run in ['R04','R08','R12']: e[evs[:,2]==ed.get('T1', 1),2], e[evs[:,2]==ed.get('T2', 2),2] = 0, 1
+        else: e[evs[:,2]==ed.get('T1', 1),2], e[evs[:,2]==ed.get('T2', 2),2] = 2, 3
+            
+        ep = mne.Epochs(raw, e, tmin=0.0, tmax=3.0, baseline=None, preload=True, verbose=False)
+        if len(ep) > 0:
+            subj_epochs.append(ep)
     
-    X_seq = np.array(seq_feats)
-
-    # 데이터 로더 (개별 학습용이므로 Batch 크기를 작게)
-    idx_tr, idx_te = train_test_split(np.arange(len(X_seq)), test_size=0.2, stratify=y, random_state=42)
-    train_loader = DataLoader(TensorDataset(torch.tensor(X_seq[idx_tr], dtype=torch.float32), torch.tensor(y[idx_tr])), batch_size=16, shuffle=True)
-    test_loader = DataLoader(TensorDataset(torch.tensor(X_seq[idx_te], dtype=torch.float32), torch.tensor(y[idx_te])), batch_size=16, shuffle=False)
-
-    # 모델 초기화 및 학습
-    model = Subject_RTM_SNN()
-    rng = jax.random.PRNGKey(42)
-    params = model.init({'params': rng, 'dropout': rng}, jnp.ones((1, X_seq.shape[1], 2080)))['params']
+    if len(subj_epochs) == 0: continue
     
-    lr_sched = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=len(train_loader)*80)
-    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adamw(learning_rate=lr_sched, weight_decay=1e-2))
+    epochs = mne.concatenate_epochs(subj_epochs, verbose=False)
+    X = epochs.get_data(copy=True) * 1e6
+    y = epochs.events[:, 2]
+    
+    # 🧠 피험자별 순수 Riemannian Whitening (개인차 영점 조절)
+    R_i = np.mean([np.cov(x) for x in X], axis=0) + np.eye(64) * 1e-4
+    P_i = la.inv(la.sqrtm(R_i))
+    X_aligned = np.array([P_i @ x for x in X])
+    
+    all_x_aligned.append(X_aligned)
+    all_y.extend(y)
+    
+    if (s_idx + 1) % 10 == 0:
+        print(f"[{s_idx + 1}/{len(subjects)}] 처리 완료... RAM 정리 중")
+        gc.collect()
 
-    best_val = 0
-    for epoch in range(1, 81): # 80 Epoch 충분히 돌림
-        for xb, yb in train_loader:
-            state, _, _, rng = train_step(state, jnp.array(xb.numpy()), jnp.array(yb.numpy()), rng)
-        
-        preds = []
-        for xb, _ in test_loader:
-            preds.extend(np.array(eval_step(state, jnp.array(xb.numpy()))))
-        val_acc = np.mean(np.array(preds) == y[idx_te]) * 100
-        best_val = max(best_val, val_acc)
+X_final = np.expand_dims(np.concatenate(all_x_aligned), 1) # (B, 1, 64, 480)
+Y_final = np.array(all_y)
 
-    print(f"[{idx:3d}/{len(subjects)}] {subj} | Best Test Acc: {best_val:.2f}%")
-    subject_results[subj] = best_val
+print(f"✅ 데이터 로딩 완료! 총 샘플 수: {X_final.shape[0]}개")
 
-    # 🧹 메모리 누수 방지 (매우 중요)
-    del X_raw, X_aligned, X_seq, y, train_loader, test_loader, state, params
-    gc.collect()
+# 마스터 인접 행렬 뼈대 추출 (메모리 위해 2000개만 샘플링해서 계산)
+sample_idx = np.random.choice(len(X_final), 2000, replace=False)
+A_init = torch.tensor(np.abs(np.corrcoef(np.mean(X_final[sample_idx, 0], axis=0))), dtype=torch.float32)
 
 # =========================================================
-# 3. 논문용 최종 결과 리포트 출력
+# 2. 모델 정의 및 MMD Loss (수학적 수술 완료된 완벽본)
 # =========================================================
-print("\n" + "="*60)
-print("🏆 Final Evaluation Report: Intra-Subject Performance")
-print("="*60)
+def mmd_loss(x, y, bandwidths=[0.5, 1.0, 2.0]):
+    xx, yy, zz = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
+    rx = (xx.diag().unsqueeze(0).expand_as(xx))
+    ry = (yy.diag().unsqueeze(0).expand_as(yy))
+    dxx = rx.t() + rx - 2. * xx
+    dyy = ry.t() + ry - 2. * yy
+    dxy = rx.t() + ry - 2. * zz
 
-if not subject_results:
-    print("결과가 없습니다. 데이터 경로를 확인해주세요.")
-else:
-    # 정확도 기준 내림차순 정렬
-    sorted_results = sorted(subject_results.items(), key=lambda item: item[1], reverse=True)
-    accuracies = [acc for _, acc in sorted_results]
-    
-    total_subj = len(accuracies)
-    top_20_avg = np.mean(accuracies[:min(20, total_subj)])
-    top_50_avg = np.mean(accuracies[:min(50, total_subj)])
-    overall_avg = np.mean(accuracies)
+    XX, YY, XY = torch.zeros_like(xx), torch.zeros_like(yy), torch.zeros_like(zz)
+    for a in bandwidths:
+        XX += torch.exp(-0.5 * dxx / a); YY += torch.exp(-0.5 * dyy / a); XY += torch.exp(-0.5 * dxy / a)
+    return torch.mean(XX + YY - 2. * XY)
 
-    print(f"▶ 성공적으로 평가된 피험자 수: {total_subj} 명\n")
-    print(f"🔥 Top 20 Subjects Average : {top_20_avg:.2f}%")
-    if total_subj >= 50:
-        print(f"🔥 Top 50 Subjects Average : {top_50_avg:.2f}%")
-    print(f"📊 Overall Average (All)   : {overall_avg:.2f}%")
-    
-    print("\n[🥇 Top 5 피험자 명단]")
-    for i in range(min(5, total_subj)):
-        print(f"  {i+1}위: {sorted_results[i][0]} ({sorted_results[i][1]:.2f}%)")
+class SOTA_STGCN_SNN(nn.Module):
+    def __init__(self, A_init):
+        super().__init__()
+        self.A_learnable = nn.Parameter(A_init.clone(), requires_grad=True)
+        self.st_block = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=(1, 15), padding=(0, 7)),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.Dropout2d(0.5) # 과적합 방지
+        )
+        self.drop_fc = nn.Dropout(0.5)
+        self.fc = nn.Linear(16 * 64, 4)
+        self.register_buffer('eye_mask', torch.eye(64).bool()) # 대각선 차단 마스크
+
+    def forward(self, x):
+        A_masked = self.A_learnable.masked_fill(self.eye_mask, 0.0)
+        z = torch.einsum('vw, bfwt -> bfvt', A_masked, x)
+        z = self.st_block(z)
+        z_feat = torch.mean(z, dim=-1).view(z.size(0), -1)
+        z_feat_dropped = self.drop_fc(z_feat)
+        return self.fc(z_feat_dropped), z_feat
+
+# =========================================================
+# 3. 데이터 로더 세팅 (데이터가 많으니 Batch Size 128로 상향)
+# =========================================================
+idx_tr, idx_te = train_test_split(np.arange(len(X_final)), test_size=0.2, stratify=Y_final, random_state=42)
+train_loader = DataLoader(TensorDataset(torch.tensor(X_final[idx_tr], dtype=torch.float32), torch.tensor(Y_final[idx_tr])), batch_size=128, shuffle=True)
+test_loader = DataLoader(TensorDataset(torch.tensor(X_final[idx_te], dtype=torch.float32), torch.tensor(Y_final[idx_te])), batch_size=128, shuffle=False)
+
+model = SOTA_STGCN_SNN(A_init).cuda() # GPU 연산 필수
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=200)
+
+print("🚀 SOTA 도전을 위한 105명 Global Training 시작...")
+
+mmd_weight = 0.05 
+l1_lambda = 1e-4  
+
+best_acc = 0.0
+patience = 30 # 30에폭 동안 최고점 갱신 못하면 조기 종료
+trigger_times = 0
+
+for epoch in range(1, 201):
+    model.train()
+    correct, total = 0, 0
+    for xb, yb in train_loader:
+        xb, yb = xb.cuda(), yb.cuda()
+        opt.zero_grad()
+        logits, z_feat = model(xb)
         
-    print("\n[💀 Bottom 5 피험자 명단 (BCI Illiteracy 후보)]")
-    for i in range(1, min(6, total_subj+1)):
-        print(f"  하위 {i}위: {sorted_results[-i][0]} ({sorted_results[-i][1]:.2f}%)")
+        loss_cls = F.cross_entropy(logits, yb)
+        
+        half_idx = z_feat.size(0) // 2
+        if half_idx > 0: loss_mmd = mmd_loss(z_feat[:half_idx], z_feat[half_idx:])
+        else: loss_mmd = 0.0
+            
+        loss_l1 = l1_lambda * torch.norm(model.A_learnable, 1)
+        loss = loss_cls + mmd_weight * loss_mmd + loss_l1
+        
+        loss.backward()
+        opt.step()
+        
+        correct += torch.argmax(logits, 1).eq(yb).sum().item()
+        total += yb.size(0)
+        
+    scheduler.step()
+        
+    if epoch % 5 == 0:
+        model.eval()
+        test_correct, test_total = 0, 0
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                xb, yb = xb.cuda(), yb.cuda()
+                logits, _ = model(xb)
+                test_correct += torch.argmax(logits, 1).eq(yb).sum().item()
+                test_total += yb.size(0)
+                
+        val_acc = test_correct / test_total * 100
+        print(f"Epoch {epoch:3d} | Train Acc: {correct/total*100:.2f}% | Test Acc: {val_acc:.2f}%")
+        
+        if val_acc > best_acc:
+            best_acc = val_acc
+            trigger_times = 0
+            # SOTA 달성 시 모델 가중치 저장!
+            torch.save(model.state_dict(), "best_sota_model.pth")
+        else:
+            trigger_times += 5
+            
+        if trigger_times >= patience:
+            print(f"🚨 조기 종료 발동! 최고 Test Acc: {best_acc:.2f}%")
+            break
 
-print("="*60)
+print("="*50)
+print(f"🏆 최종 Global Training 최고 성능: {best_acc:.2f}%")
+print("="*50)

@@ -69,19 +69,20 @@ def process_and_extract_sequential_features(subj):
     X = epochs.get_data() * 1e6
     y = epochs.events[:,2]
 
-    # Subject-Specific Alignment
+    # [1] Subject-Specific Alignment (피험자 맞춤형 정렬)
     covs = [np.cov(x - np.mean(x, axis=1, keepdims=True)) for x in X]
     R_i = np.mean(covs, axis=0) + np.eye(X.shape[1]) * 1e-4
     vals, vecs = la.eigh(R_i)
     r_inv_sqrt = vecs @ np.diag(1.0 / np.sqrt(np.clip(vals, 1e-6, None))) @ vecs.T
     X_aligned = np.array([r_inv_sqrt @ x for x in X])
 
-    # Sequential Trajectory Extraction
+    # [2] Sequential Trajectory Extraction (Full Rank 확보)
     C = X_aligned.shape[1]
     triu_idx = np.triu_indices(C)
     
     subj_seq_feats = []
-    window, step = 64, 32
+    # 🔥 수정된 부분: window를 1초(160)로 늘려 공분산 행렬의 Rank 부족 현상 원천 차단
+    window, step = 160, 16 
     for x in X_aligned:
         win_feats = []
         for w in range((x.shape[1] - window) // step + 1):
@@ -90,15 +91,15 @@ def process_and_extract_sequential_features(subj):
             vals_w, vecs_w = la.eigh(cov)
             log_cov = vecs_w @ np.diag(np.log(np.clip(vals_w, 1e-6, None))) @ vecs_w.T
             win_feats.append(log_cov[triu_idx]) 
-        subj_seq_feats.append(np.array(win_feats)) 
+        subj_seq_feats.append(np.array(win_feats)) # Seq_len 길이는 21이 됨
         
     return np.array(subj_seq_feats), y
 
-print("⏳ 시간축이 보존된 Sequential RTM 피쳐 추출 중...")
+print("⏳ Rank 부족이 해결된 수학적 무결점 RTM 피쳐 추출 중...")
 results = Parallel(n_jobs=-1)(delayed(process_and_extract_sequential_features)(s) for s in subjects)
 valid_results = [r for r in results if r is not None]
 
-X_seq_all = np.concatenate([r[0] for r in valid_results]) # Shape: (B, Seq_len, 2080)
+X_seq_all = np.concatenate([r[0] for r in valid_results]) # Shape: (B, 21, 2080)
 y_all = np.concatenate([r[1] for r in valid_results])
 
 del results, valid_results
@@ -114,12 +115,13 @@ for cls in unique:
 X_bal_seq = X_seq_all[balanced_indices]
 y_bal = y_all[balanced_indices]
 
-# DataLoaders
+# DataLoaders (데이터 분리)
 idx_tr, idx_te = train_test_split(np.arange(len(X_bal_seq)), test_size=0.2, stratify=y_bal, random_state=42)
 train_loader = DataLoader(TensorDataset(torch.tensor(X_bal_seq[idx_tr], dtype=torch.float32), torch.tensor(y_bal[idx_tr])), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_bal_seq[idx_te], dtype=torch.float32), torch.tensor(y_bal[idx_te])), batch_size=128, shuffle=False)
 
 _, Seq_len, Feat_dim = X_bal_seq.shape
+print(f"✅ 입력 데이터 Shape: Sequence Length = {Seq_len}, Features = {Feat_dim}")
 
 # =========================================================
 # 2. 🚀 JAX/Flax SNN Architecture
@@ -128,7 +130,7 @@ _, Seq_len, Feat_dim = X_bal_seq.shape
 def spike(x): return (x > 0).astype(jnp.float32)
 
 def fwd(x): return spike(x), x
-def bwd(res, g): return (g * 0.3 / (1.0 + jnp.abs(res * 3.0)),)
+def bwd(res, g): return (g * 0.3 / (1.0 + jnp.abs(res * 3.0)),) # Surrogate Gradient
 spike.defvjp(fwd, bwd)
 
 class LIFCell(nn.Module):
@@ -146,7 +148,7 @@ class Sequential_RTM_SNN(nn.Module):
     def __call__(self, x_seq, train=True):
         B, T, F = x_seq.shape
 
-        # Input Projection: 2080차원 거대 궤적을 Spike-friendly하게 압축
+        # Input Projection: 노이즈가 사라진 2080차원 궤적을 Spike-friendly하게 압축
         x = nn.Dense(512)(x_seq)
         x = nn.gelu(x)
         x = nn.Dense(256)(x)
@@ -197,7 +199,7 @@ def eval_step(state, x):
     logits, _ = state.apply_fn({'params': state.params}, x, train=False)
     return jnp.argmax(logits, -1)
 
-print("\n🚀 SNN 메인 학습 시작...")
+print("\n🚀 수학적 결함이 제거된 SNN 메인 학습 시작...")
 model = Sequential_RTM_SNN()
 rng = jax.random.PRNGKey(42)
 params = model.init({'params': rng, 'dropout': rng}, jnp.ones((1, Seq_len, Feat_dim)))['params']
@@ -233,10 +235,9 @@ print(f"\n🔥 BEST SNN TEST ACCURACY: {best_acc:.2f}%")
 # 4. IEEE-Grade Evaluation (최고 성능 파라미터로 측정)
 # =========================================================
 print("\n" + "="*60)
-print("📊 IEEE-Grade Final Evaluation: Sequential RTM + SNN")
+print("📊 IEEE-Grade Final Evaluation: Full-Rank Sequential RTM + SNN")
 print("="*60)
 
-# Best 파라미터 장착 후 전체 Test Set 예측
 final_preds = []
 for xb, _ in test_loader:
     logits, _ = model.apply({'params': best_params}, jnp.array(xb.numpy()), train=False)

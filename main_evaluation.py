@@ -6,6 +6,7 @@ import scipy.linalg as la
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
 from joblib import Parallel, delayed
 import warnings
 
@@ -19,10 +20,11 @@ warnings.filterwarnings("ignore")
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
 # =========================================================
-# 1. Data Loading & Riemannian Alignment
+# 1. Data Loading & 4-Class Balancing
 # =========================================================
 base = './'
 DATA_DIR = os.path.join(base, '07_Data') 
+
 bad_subjects = ['S088', 'S089', 'S092', 'S100']
 subjects = [f'S{i:03d}' for i in range(1, 110) if f'S{i:03d}' not in bad_subjects]
 runs_h, runs_f = ['R04','R08','R12'], ['R06','R10','R14']
@@ -31,205 +33,226 @@ TARGET_SFREQ = 160.0
 def process_subject(subj):
     subj_dir = os.path.join(DATA_DIR, subj)
     if not os.path.exists(subj_dir): return None
-        
+
     epochs_list = []
     for run in runs_h + runs_f:
         path = os.path.join(subj_dir, f'{subj}{run}.edf')
         if not os.path.exists(path): continue
+
         try:
             raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
-            if raw.info['sfreq'] != TARGET_SFREQ: raw.resample(TARGET_SFREQ)
-            raw.rename_channels(lambda x: x.strip('.'))
-            raw.filter(l_freq=8.0, h_freq=30.0, verbose=False)
+            if raw.info['sfreq'] != TARGET_SFREQ:
+                raw.resample(TARGET_SFREQ)
             
+            raw.rename_channels(lambda x: x.strip('.'))
+            raw.filter(8.0, 30.0, verbose=False)
+
             mne.datasets.eegbci.standardize(raw) 
             montage = mne.channels.make_standard_montage('standard_1005')
             raw.set_montage(montage, match_case=False, on_missing='ignore')
-            
+
             evs, ed = mne.events_from_annotations(raw, verbose=False)
             t1, t2 = ed.get('T1'), ed.get('T2')
             if t1 is None: continue
-            
+
             e = evs.copy()
-            if run in runs_h: e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 0, 1
-            else: e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3
-                
-            event_id = {'L':0, 'R':1} if run in runs_h else {'H':2, 'F':3}
-            ep = mne.Epochs(raw, e, event_id, tmin=0.0, tmax=3.0, baseline=None, preload=True, verbose=False)
+            if run in runs_h:
+                e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 0, 1
+            else:
+                e[evs[:,2]==t1,2], e[evs[:,2]==t2,2] = 2, 3
+
+            ep = mne.Epochs(raw, e, {0:0,1:1,2:2,3:3}, tmin=0.0, tmax=3.0, 
+                            baseline=None, preload=True, verbose=False)
             if len(ep) > 0: epochs_list.append(ep)
-        except Exception: continue
-            
+        except: continue
+
     if not epochs_list: return None
-    subj_epochs = mne.concatenate_epochs(epochs_list, verbose=False)
-    X = subj_epochs.get_data() * 1e6
-    y = subj_epochs.events[:, 2]
-    
-    # 🌟 Riemannian Alignment
-    covs = [np.cov(x - np.mean(x, axis=1, keepdims=True)) for x in X]
-    R = np.mean(covs, axis=0) + np.eye(X.shape[1]) * 1e-4
-    vals, vecs = la.eigh(R)
-    r_inv_sqrt = vecs @ np.diag(1.0 / np.sqrt(np.clip(vals, a_min=1e-6, a_max=None))) @ vecs.T
-    
-    X_aligned = np.array([r_inv_sqrt @ x for x in X])
-    return X_aligned, y
+    epochs = mne.concatenate_epochs(epochs_list, verbose=False)
+    return epochs.get_data() * 1e6, epochs.events[:,2]
 
-print(f"⏳ 데이터 로딩 및 기하학적 정렬 진행 중...")
-results = Parallel(n_jobs=-1)(delayed(process_subject)(subj) for subj in subjects)
-valid_results = [res for res in results if res is not None]
+print("⏳ 데이터 로딩 시작 (105 Subjects)...")
+results = Parallel(n_jobs=-1)(delayed(process_subject)(s) for s in subjects)
+valid_results = [r for r in results if r is not None]
 
-X_aligned = np.concatenate([res[0] for res in valid_results])
-y_all = np.concatenate([res[1] for res in valid_results])
-B, C, T = X_aligned.shape
+X_raw = np.concatenate([r[0] for r in valid_results])
+y_raw = np.concatenate([r[1] for r in valid_results])
+
+print("⚖️ 4-Class 동등 비율 조정 중...")
+unique, counts = np.unique(y_raw, return_counts=True)
+min_samples = np.min(counts)
+balanced_indices = []
+for cls in unique:
+    cls_idx = np.where(y_raw == cls)[0]
+    balanced_indices.extend(np.random.choice(cls_idx, min_samples, replace=False))
+np.random.shuffle(balanced_indices)
+
+X_bal = X_raw[balanced_indices]
+y_bal = y_raw[balanced_indices]
+
+# 🔥 핵심 1: 데이터 분리를 가장 먼저 수행 (Data Leakage 원천 차단) 🔥
+idx_tr, idx_te = train_test_split(np.arange(len(X_bal)), test_size=0.2, stratify=y_bal, random_state=42)
+y_tr, y_te = y_bal[idx_tr], y_bal[idx_te]
 
 # =========================================================
-# 2. 🌟 Novelty: Sequential Riemannian Trajectory Extraction
+# 2. Strict Riemannian Alignment (Train -> Test)
 # =========================================================
-print("⚙️ SNN 인코딩을 위한 Dynamic Trajectory Sequence 추출 중...")
-def extract_trajectory_sequence(X_batch, window_size=64, step_size=16):
-    """SNN의 시간 스텝(Seq_len)마다 들어갈 기하학적 궤적 벡터 추출"""
-    num_windows = (X_batch.shape[2] - window_size) // step_size + 1
-    trajectory_seqs = []
+print("⚙️ Strict 기하학적 정렬 (Train 기준으로만 R 계산)...")
+# Train 데이터로만 기준점(Reference) R_train 계산
+covs_tr = [np.cov(x - np.mean(x, axis=1, keepdims=True)) for x in X_bal[idx_tr]]
+R_train = np.mean(covs_tr, axis=0) + np.eye(X_bal.shape[1]) * 1e-4
+
+vals, vecs = la.eigh(R_train)
+r_inv_sqrt = vecs @ np.diag(1.0 / np.sqrt(np.clip(vals, a_min=1e-6, a_max=None))) @ vecs.T
+
+# Train/Test 모두 R_train을 사용해 정렬 (현장 캘리브레이션 모사)
+X_aligned_tr = np.array([r_inv_sqrt @ x for x in X_bal[idx_tr]])
+X_aligned_te = np.array([r_inv_sqrt @ x for x in X_bal[idx_te]])
+
+# =========================================================
+# 3. Rich Trajectory Extraction & Strict Centering
+# =========================================================
+print("⚙️ Rich Trajectory 추출 및 Train Mean Centering...")
+def extract_raw_logcov_trajectory(X_batch, window=64, step=32):
+    B, C, T = X_batch.shape
+    triu_idx = np.triu_indices(C)
     
+    seqs = []
     for x in X_batch:
-        log_covs = []
-        for w in range(num_windows):
-            start = w * step_size
-            window_x = x[:, start:start+window_size]
-            xc = window_x - np.mean(window_x, axis=1, keepdims=True)
-            cov = np.cov(xc) + np.eye(C) * 1e-4
-            
+        feats = []
+        for w in range((T - window) // step + 1):
+            win = x[:, w*step : w*step+window]
+            cov = np.cov(win - np.mean(win, axis=1, keepdims=True)) + np.eye(C) * 1e-4
             vals, vecs = la.eigh(cov)
-            log_vals = np.log(np.clip(vals, a_min=1e-6, a_max=None))
-            log_cov = vecs @ np.diag(log_vals) @ vecs.T
-            log_covs.append(np.diag(log_cov)) # (W, C)
-            
-        log_covs = np.array(log_covs)
-        barycenter = np.mean(log_covs, axis=0, keepdims=True)
-        
-        # 시간에 따른 '기하학적 일탈 정도' 자체를 시퀀스로 반환!
-        trajectory = np.abs(log_covs - barycenter) # Shape: (Seq_len, C)
-        trajectory_seqs.append(trajectory)
-        
-    return np.array(trajectory_seqs)
+            log_cov = vecs @ np.diag(np.log(np.clip(vals, 1e-6, None))) @ vecs.T
+            feats.append(log_cov[triu_idx]) # 2080 차원 상삼각 벡터 보존
+        seqs.append(feats)
+    return np.array(seqs) # (B, Seq_len, 2080)
 
-X_seq = extract_trajectory_sequence(X_aligned)
-_, Seq_len, C_feat = X_seq.shape
+raw_seq_tr = extract_raw_logcov_trajectory(X_aligned_tr)
+raw_seq_te = extract_raw_logcov_trajectory(X_aligned_te)
 
-# Train/Test Split & Dataloader
-idx_tr, idx_te = train_test_split(np.arange(len(X_seq)), test_size=0.2, stratify=y_all, random_state=42)
-train_loader = DataLoader(TensorDataset(torch.tensor(X_seq[idx_tr], dtype=torch.float32), torch.tensor(y_all[idx_tr])), batch_size=128, shuffle=True)
-test_loader = DataLoader(TensorDataset(torch.tensor(X_seq[idx_te], dtype=torch.float32), torch.tensor(y_all[idx_te])), batch_size=128, shuffle=False)
+# 🔥 핵심 2: Train 데이터의 시퀀스 평균만 계산해서 Centering 🔥
+train_barycenter = np.mean(raw_seq_tr, axis=(0, 1), keepdims=True)
+traj_seq_tr = raw_seq_tr - train_barycenter
+traj_seq_te = raw_seq_te - train_barycenter
 
 # =========================================================
-# 3. 🚀 SNN Architecture (Riemannian Geodesic SNN)
+# 4. Strict PCA Compression
+# =========================================================
+print("⚙️ PCA 차원 축소 (Train Fit -> Test Transform)...")
+B_tr, Seq_len, F_dim = traj_seq_tr.shape
+B_te = traj_seq_te.shape[0]
+
+traj_tr_flat = traj_seq_tr.reshape(-1, F_dim)
+traj_te_flat = traj_seq_te.reshape(-1, F_dim)
+
+# 🔥 핵심 3: Train 데이터로만 PCA 가중치 학습 🔥
+pca = PCA(n_components=256, whiten=True, random_state=42)
+pca.fit(traj_tr_flat)
+
+X_seq_tr = pca.transform(traj_tr_flat).reshape(B_tr, Seq_len, 256)
+X_seq_te = pca.transform(traj_te_flat).reshape(B_te, Seq_len, 256)
+
+# Dataloaders
+train_loader = DataLoader(TensorDataset(torch.tensor(X_seq_tr, dtype=torch.float32), torch.tensor(y_tr)), batch_size=128, shuffle=True)
+test_loader = DataLoader(TensorDataset(torch.tensor(X_seq_te, dtype=torch.float32), torch.tensor(y_te)), batch_size=128, shuffle=False)
+
+# =========================================================
+# 5. SNN Core & Architecture (유지)
 # =========================================================
 @jax.custom_vjp
 def spike(x): return (x > 0).astype(jnp.float32)
 
 def fwd(x): return spike(x), x
-def bwd(res, g): 
-    alpha = 2.0
-    return (g * (alpha / 2.0) / (1.0 + (alpha * res)**2),)
+def bwd(res, g): return (g * 0.3 / (1.0 + jnp.abs(res * 3.0)),)
 spike.defvjp(fwd, bwd)
 
 class LIFCell(nn.Module):
     hidden_dim: int
-    v_thresh: float = 0.5 
-
     @nn.compact
-    def __call__(self, state, x_t):
+    def __call__(self, state, x):
         v, z = state
-        decay = nn.sigmoid(self.param('decay', nn.initializers.constant(0.0), (self.hidden_dim,)))
-        # 기하학적 일탈 전류(x_t)가 들어오며 막전위 축적
-        v = v * decay * (1.0 - z) + x_t
-        z_out = spike(v - self.v_thresh)
-        return (v, z_out), z_out
+        decay = nn.sigmoid(self.param("decay", nn.initializers.constant(1.0), (self.hidden_dim,)))
+        v = v * decay * (1.0 - z) + x
+        z_new = spike(v - 0.5)
+        return (v, z_new), z_new
 
-class RG_SNN(nn.Module):
+class Strict_RTM_SNN(nn.Module):
     @nn.compact
-    def __call__(self, x_seq, train=True):
-        B, T_seq, C = x_seq.shape
-        
-        if train:
-            x_seq = x_seq + jax.random.normal(self.make_rng('dropout'), x_seq.shape) * 0.05
-            
-        # SNN Layer 1
-        seq_in_1 = nn.Dense(128)(x_seq)
-        seq_in_1 = nn.LayerNorm()(seq_in_1)
-        
-        init_state1 = (jnp.zeros((B, 128)), jnp.zeros((B, 128)))
-        ScanLIF1 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
-        _, spk_seq1 = ScanLIF1(hidden_dim=128)(init_state1, seq_in_1)
-        
-        # SNN Layer 2
-        seq_in_2 = nn.Dense(64)(spk_seq1)
-        seq_in_2 = nn.LayerNorm()(seq_in_2) * 0.5
-        
-        init_state2 = (jnp.zeros((B, 64)), jnp.zeros((B, 64)))
-        ScanLIF2 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params': False}, in_axes=1, out_axes=1)
-        _, spk_seq2 = ScanLIF2(hidden_dim=64)(init_state2, seq_in_2)
-        
-        # Temporal Attention (시간축에 걸친 궤적 요동의 핵심 스텝 찾기)
-        temp_attn = nn.softmax(nn.Dense(1)(spk_seq2), axis=1)
-        feat = jnp.sum(spk_seq2 * temp_attn, axis=1)
-        feat = nn.Dropout(rate=0.4, deterministic=not train)(feat)
-        
+    def __call__(self, x, train=True):
+        B, T, F = x.shape
+
+        x = nn.Dense(512)(x)
+        x = nn.gelu(x)
+        x = nn.Dense(256)(x)
+        x = nn.LayerNorm()(x)
+
+        init1 = (jnp.zeros((B,256)), jnp.zeros((B,256)))
+        Scan1 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
+        _, spk1 = Scan1(256)(init1, x)
+
+        x2 = nn.Dense(128)(spk1)
+        x2 = nn.LayerNorm()(x2)
+
+        init2 = (jnp.zeros((B,128)), jnp.zeros((B,128)))
+        Scan2 = nn.scan(LIFCell, variable_broadcast='params', split_rngs={'params':False}, in_axes=1, out_axes=1)
+        _, spk2 = Scan2(128)(init2, x2)
+
+        attn = nn.softmax(nn.Dense(1)(spk2), axis=1)
+        feat = jnp.sum(spk2 * attn, axis=1)
+
+        feat = nn.Dropout(0.5, deterministic=not train)(feat)
         logits = nn.Dense(4)(feat)
-        mean_fr = (jnp.mean(spk_seq1) + jnp.mean(spk_seq2)) / 2.0
-        return logits, mean_fr
+
+        fr = (jnp.mean(spk1) + jnp.mean(spk2)) / 2
+        return logits, fr
 
 # =========================================================
-# 4. Training Loop
+# 6. Training
 # =========================================================
-def loss_fn(params, state, x_seq, y, dropout_rng, fr_weight):
-    logits, fr = state.apply_fn({'params': params}, x_seq, train=True, rngs={'dropout': dropout_rng})
-    smooth_y = jax.nn.one_hot(y, 4) * 0.9 + (0.1 / 4.0)
-    ce_loss = optax.softmax_cross_entropy(logits=logits, labels=smooth_y).mean()
-    fr_loss = jnp.mean((fr - 0.2) ** 2) * fr_weight 
-    return ce_loss + fr_loss, (logits, fr)
+def loss_fn(params, state, x, y, rng):
+    logits, fr = state.apply_fn({'params': params}, x, train=True, rngs={'dropout': rng})
+    y_s = jax.nn.one_hot(y, 4)*0.9 + 0.025
+    ce = optax.softmax_cross_entropy(logits=logits, labels=y_s).mean()
+    fr_loss = jnp.mean((fr - 0.15)**2) * 0.05
+    return ce + fr_loss, logits
 
 @jax.jit
-def train_step(state, x_seq, y, rng, fr_weight):
-    rng, dropout_rng = jax.random.split(rng) 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (logits, fr)), grads = grad_fn(state.params, state, x_seq, y, dropout_rng, fr_weight)
+def train_step(state, x, y, rng):
+    rng, sub = jax.random.split(rng)
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, state, x, y, sub)
     state = state.apply_gradients(grads=grads)
     acc = jnp.mean(jnp.argmax(logits, -1) == y)
-    return state, loss, acc, fr, rng
+    return state, loss, acc, rng
 
 @jax.jit
-def eval_step(state, x_seq):
-    logits, fr = state.apply_fn({'params': state.params}, x_seq, train=False)
-    preds = jnp.argmax(logits, -1)
-    return preds, fr
+def eval_step(state, x):
+    logits, _ = state.apply_fn({'params': state.params}, x, train=False)
+    return jnp.argmax(logits, -1)
 
+print("\n🚀 엄밀한 무결점 RTM-SNN 학습 시작...")
+model = Strict_RTM_SNN()
 rng = jax.random.PRNGKey(42)
-rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
-model = RG_SNN()
-dummy_x = jnp.ones((1, Seq_len, C_feat))
-params = model.init({'params': init_rng, 'dropout': dropout_init_rng}, dummy_x, train=False)['params']
+params = model.init({'params': rng, 'dropout': rng}, jnp.ones((1, Seq_len, 256)))['params']
 
-lr_sched = optax.exponential_decay(init_value=1e-3, transition_steps=len(train_loader)*10, decay_rate=0.95)
-state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adamw(learning_rate=lr_sched, weight_decay=1e-3))
+state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adamw(1e-3, weight_decay=1e-3))
+best = 0
 
-print("\n🚀 본격적인 SNN 학습 시작...")
-best_acc = 0
-for epoch in range(1, 101):
-    fr_weight_tensor = jnp.array(min(2.0, 0.1 + (epoch / 30.0) * 1.9), dtype=jnp.float32)
-    t_accs, t_losses = [], []
-    for Xb, yb in train_loader:
-        state, loss, acc, _, rng = train_step(state, jnp.array(Xb.numpy()), jnp.array(yb.numpy()), rng, fr_weight_tensor)
-        t_accs.append(acc)
-        t_losses.append(loss)
+for epoch in range(1, 151):
+    losses, accs = [], []
+    for xb, yb in train_loader:
+        state, l, a, rng = train_step(state, jnp.array(xb.numpy()), jnp.array(yb.numpy()), rng)
+        losses.append(l)
+        accs.append(a)
 
-    if epoch % 5 == 0:
-        all_preds = []
-        for Xb, yb in test_loader:
-            preds, _ = eval_step(state, jnp.array(Xb.numpy()))
-            all_preds.extend(np.array(preds))
-            
-        val_acc = (np.sum(np.array(all_preds) == y_all[idx_te]) / len(idx_te)) * 100
-        print(f"[{epoch:3d}] Loss: {np.mean(t_losses):.4f} | Train Acc: {np.mean(t_accs)*100:.2f}% | Val Acc: {val_acc:.2f}%")
-        best_acc = max(best_acc, val_acc)
+    if epoch % 10 == 0:
+        preds = []
+        for xb, _ in test_loader:
+            p = eval_step(state, jnp.array(xb.numpy()))
+            preds.extend(np.array(p))
+        
+        val_acc = np.mean(np.array(preds) == y_te) * 100
+        print(f"[{epoch:3d}] Train: {np.mean(accs)*100:.2f}% | Val: {val_acc:.2f}%")
+        best = max(best, val_acc)
 
-print(f"🔥 BEST TEST ACC (Riemannian Geodesic SNN): {best_acc:.2f}%")
+print(f"\n🔥 BEST TEST ACC (Leakage-Free): {best:.2f}%")

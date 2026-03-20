@@ -71,31 +71,33 @@ X_test, Y_test = load_and_align_subjects(test_subjs)
 
 print(f"✅ 로딩 완료! Train 샘플: {X_train.shape[0]}, Test 샘플: {X_test.shape[0]}")
 # =========================================================
-# 2. 실시간 동적 그래프 어텐션 (수학적 오류 완벽 수정)
+# 2. 실시간 동적 그래프 어텐션 (차원 및 텐서 축 완벽 수정)
 # =========================================================
 class DynamicGraphAttention(nn.Module):
     def __init__(self, hidden_dim=16):
         super().__init__()
-        # 전극 64개에 대한 Q, K 임베딩
-        self.query = nn.Conv1d(64, hidden_dim, kernel_size=1)
-        self.key = nn.Conv1d(64, hidden_dim, kernel_size=1)
+        # 🔥 수정 포인트 1: in_channels를 64가 아닌 1로 변경
+        # 각 전극(Node)당 1개의 분산(에너지) 특징을 갖도록 차원 재설계
+        self.query = nn.Conv1d(1, hidden_dim, kernel_size=1)
+        self.key = nn.Conv1d(1, hidden_dim, kernel_size=1)
         self.scale = hidden_dim ** -0.5
 
     def forward(self, x):
         # x: (B, 1, 64, 480)
         x_squeeze = x.squeeze(1) # (B, 64, 480)
         
-        # 🔥 수술 1: 뇌파의 평균(Mean)이 아닌 에너지(Variance) 추출
-        # 신호가 얼마나 강하게 요동치는지를 기반으로 노드 임베딩
-        x_energy = torch.var(x_squeeze, dim=-1, keepdim=True) # (B, 64, 1)
+        # 🔥 수정 포인트 2: (B, 64, 1)이 아니라 (B, 1, 64)로 변환
+        # torch.var 결과는 (B, 64) -> unsqueeze(1)을 통해 (B, 1(특징), 64(노드))로 맞춤
+        x_energy = torch.var(x_squeeze, dim=-1).unsqueeze(1) 
         
-        Q = self.query(x_energy) # (B, hidden, 1)
-        K = self.key(x_energy)   # (B, hidden, 1)
+        # Q, K shape: (B, hidden, 64) -> 완벽한 3D 텐서 완성
+        Q = self.query(x_energy) 
+        K = self.key(x_energy)   
         
-        # 실시간 인접 행렬 연산
-        attn = torch.einsum('b h i, b h j -> b i j', Q.squeeze(-1), K.squeeze(-1)) * self.scale
+        # 이제 squeeze 없이 바로 einsum 연산 가능
+        attn = torch.einsum('b h i, b h j -> b i j', Q, K) * self.scale
         
-        # 대각선 마스킹
+        # 대각선 마스킹 (자기 자신 참조 방지)
         eye = torch.eye(64, device=x.device).unsqueeze(0).bool()
         attn = attn.masked_fill(eye, -1e9)
         attn_weights = F.softmax(attn, dim=-1) # (B, 64, 64)
@@ -104,7 +106,7 @@ class DynamicGraphAttention(nn.Module):
         out = torch.einsum('b i j, b j t -> b i t', attn_weights, x_squeeze)
         out = out.unsqueeze(1) # (B, 1, 64, 480)
         
-        # 🔥 수술 2: Residual Connection (기울기 소멸 방지 및 원본 신호 보존)
+        # Residual Connection (원본 신호 보존)
         return out + x, attn_weights
 
 class SOTA_Dynamic_STGCN(nn.Module):

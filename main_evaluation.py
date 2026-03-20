@@ -258,3 +258,27 @@ for epoch in range(1, 151):
         best = max(best, val_acc)
 
 print(f"\n🔥 BEST TEST ACC (Leakage-Free): {best:.2f}%")
+
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+
+print("\n" + "="*50)
+print("🛑 Sanity Check: SNN vs Traditional ML")
+print("="*50)
+
+# 시계열(T) 차원을 평균 내서 정적(Static) 피쳐로 압축
+X_tr_static = np.mean(X_seq_tr, axis=1)
+X_te_static = np.mean(X_seq_te, axis=1)
+
+# 1. Linear SVM
+svm = SVC(kernel='linear', C=1.0)
+svm.fit(X_tr_static, y_tr)
+svm_acc = svm.score(X_te_static, y_te) * 100
+print(f"▶ Linear SVM Accuracy : {svm_acc:.2f}%")
+
+# 2. Logistic Regression
+lr = LogisticRegression(max_iter=1000)
+lr.fit(X_tr_static, y_tr)
+lr_acc = lr.score(X_te_static, y_te) * 100
+print(f"▶ Logistic Reg Accuracy: {lr_acc:.2f}%")
+print("="*50)

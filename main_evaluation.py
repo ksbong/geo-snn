@@ -158,17 +158,19 @@ class Hybrid_SOTA_SNN(nn.Module):
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
         # 2. 시간적 통합 (SNN)
-        spikes = LIFNode(tau=2.0, v_th=0.5)(z_ann) # (B, 64, 480, 16)
+        spikes = LIFNode(tau=2.0, v_th=0.5)(z_ann) # (B, 64, 481, 16)
         
-        # 3. Rate Coding
-        firing_rate = jnp.mean(spikes, axis=2) # (B, 64, 16)
-        z_feat = firing_rate.reshape((firing_rate.shape[0], -1))
+        # 🔥 수술 포인트 1: mean 대신 sum을 써서 기울기 소멸 방지
+        spike_count = jnp.sum(spikes, axis=2) # (B, 64, 16)
+        z_feat = spike_count.reshape((spike_count.shape[0], -1))
         
+        # 🔥 수술 포인트 2: 합산된 스파이크 특징을 안정적으로 정규화
+        z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, z_feat
-
+    
 def mmd_loss(x, y, bandwidths=(0.5, 1.0, 2.0)):
     xx = jnp.dot(x, x.T)
     yy = jnp.dot(y, y.T)

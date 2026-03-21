@@ -103,15 +103,31 @@ train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_tr
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
 # =========================================================
-# 2. SNN 코어 (미분 가능한 Hard Reset)
+# 2. SNN 코어 (대리 기울기 + 미분 가능한 Hard Reset)
 # =========================================================
+@jax.custom_vjp
+def spike_fn(v):
+    return jnp.where(v > 0, 1.0, 0.0)
+
+def spike_fn_fwd(v):
+    return spike_fn(v), v
+
+def spike_fn_bwd(res, g):
+    v = res
+    alpha = 2.0
+    # Surrogate Gradient (아크탄젠트 미분꼴)
+    grad = g / (1.0 + (alpha * v)**2)
+    return (grad,)
+
+spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
+
 class PLIFNode1D(nn.Module):
     v_th: float = 0.5 
 
     @nn.compact
     def __call__(self, x):
         x_seq = jnp.moveaxis(x, 1, 0) 
-        # 🔥 Fix 1: 초기값을 0.0으로 주어 sigmoid(0)=0.5 (기존 42% 모델과 동일한 밸런스)
+        # 초기값을 0.0으로 주어 sigmoid(0)=0.5
         decay_param = self.param('decay', nn.initializers.constant(0.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
@@ -119,8 +135,7 @@ class PLIFNode1D(nn.Module):
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
             
-            # 🔥 Fix 2: 미분 불가능한 jnp.where 대신 수학적으로 미분 가능한 Hard Reset
-            # 스파이크(s)가 1.0이면 전압(v)은 0.0이 되고, 기울기는 s를 타고 앞단으로 흘러감!
+            # 🔥 미분 가능한 Hard Reset (s가 1이면 v는 0이 되고, 미분 그래프는 보존됨)
             v = v * (1.0 - s) 
             return v, s
 
@@ -176,10 +191,10 @@ class Hybrid_SOTA_SNN(nn.Module):
         z_spatial = nn.elu(z_spatial)
         z_spatial = nn.Dropout(rate=0.2, deterministic=not train)(z_spatial)
         
-        # 4. PLIF 발화 (드디어 미분 그래프 정상 작동)
+        # 4. PLIF 발화
         spikes = PLIFNode1D(v_th=0.5)(z_spatial) 
         
-        # 5. 🔥 Fix 3: 어설픈 Attention 다 날리고 가장 확실한 Windowed Rate Coding 직행
+        # 5. Windowed Rate Coding (가장 강력하고 미분 손실 없는 방법)
         B, T, F = spikes.shape
         window_size = 24
         pad_len = (window_size - (T % window_size)) % window_size
@@ -187,7 +202,7 @@ class Hybrid_SOTA_SNN(nn.Module):
         num_windows = spikes_padded.shape[1] // window_size
         
         spikes_chunked = spikes_padded.reshape((B, num_windows, window_size, F))
-        window_spikes = jnp.sum(spikes_chunked, axis=2) # 윈도우 내 단순 합산 (기울기 100% 보존)
+        window_spikes = jnp.sum(spikes_chunked, axis=2) # 윈도우 내 단순 합산
         
         # 6. 시간축 특징 평탄화 및 최종 분류기
         z_feat = window_spikes.reshape((B, -1))
@@ -199,9 +214,8 @@ class Hybrid_SOTA_SNN(nn.Module):
         
         logits = nn.Dense(features=4)(z_feat)
         
-        # 더 이상 LINode나 DP_flat이 없으니 z_feat를 대신 반환
         return logits, z_feat, spikes
-
+    
 # =========================================================
 # 4. 학습 루프
 # =========================================================

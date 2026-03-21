@@ -101,8 +101,9 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
-# =========================================================
-# 2. SNN 코어 (장기 기억 PLIF)
+
+    # =========================================================
+# 2. SNN 코어 (안정적 대리 기울기 + 미분 가능 Hard Reset)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(v):
@@ -114,38 +115,38 @@ def spike_fn_fwd(v):
 def spike_fn_bwd(res, g):
     v = res
     alpha = 2.0
-    grad = g / (1.0 + (alpha * v)**2)
+    # 🔥 기존보다 훨씬 안정적으로 기울기를 살려주는 개선된 Surrogate 공식
+    grad = g / (1.0 + jnp.abs(alpha * v)) ** 2 
     return (grad,)
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 class PLIFNode(nn.Module):
-    v_th: float = 0.5
+    v_th: float = 1.0 # 기준 임계값 1.0으로 안정화
 
     @nn.compact
     def __call__(self, x):
-        # x shape: (B, 64, 60, Features)
         x_seq = jnp.moveaxis(x, 2, 0) 
-        
-        # 🔥 수술 1: Decay 초기값을 3.0 (sigmoid(3.0) ≈ 0.95)으로 줘서 기울기가 끝까지 살아남게 세팅
-        decay_param = self.param('decay', nn.initializers.constant(3.0), (x.shape[-1],))
+        decay_param = self.param('decay', nn.initializers.constant(0.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
-            v = v - s * self.v_th # 순정 Soft Reset
+            
+            # 🔥 미분 가능한 Hard Reset: 스파이크 발화 시 전압을 0으로 강제 초기화하여 폭발 방지
+            v = v * (1.0 - s) 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
-        return jnp.moveaxis(spikes, 0, 2)
+        return jnp.moveaxis(spikes, 0, 2) 
 
 # =========================================================
-# 3. 모델 아키텍처: Dynamic Graph + Temporal Pooling + SNN
+# 3. 모델 아키텍처: Dynamic Graph + Temporal Pooling + Rate Coding
 # =========================================================
 class DynamicGraphAttention(nn.Module):
-    hidden_dim: int = 32
+    hidden_dim: int = 16 # 공간 피처 최적화
 
     @nn.compact
     def __call__(self, x):
@@ -169,32 +170,32 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 1. 공간 유기성 파악
-        z_gcn, _ = DynamicGraphAttention(hidden_dim=32)(x)
+        # 1. 공간 유기성 파악 (기하학적 분석)
+        z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # 2. 시간 파동 추출 (ANN)
-        z_ann = nn.Conv(features=32, kernel_size=(1, 64), padding='SAME')(z_gcn)
+        # 2. 시간 파동 추출
+        z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
-        z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # 🔥 수술 2: Temporal Pooling (EEGNet 국룰 적용)
-        # 시간축(481스텝)을 8칸씩 묶어 평균냄 -> 약 60스텝으로 압축!
-        # 여기서 BPTT 기울기 소멸 문제가 100% 해결됨
-        z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8)) 
+        # 🔥 1번 범인 처단: SNN 직전의 Dropout(0.5) 완전 삭제!
         
-        # 3. PLIF 스파이크 발화 (압축된 60스텝만 처리)
-        spikes = PLIFNode(v_th=0.5)(z_pooled) # (B, 64, 60, 32)
+        # 🔥 2번 범인 처단: Temporal Pooling (시간축 압축으로 BPTT 부활)
+        # 481스텝을 8스텝 단위로 평균내어 약 60스텝으로 뇌파 흐름만 남김
+        z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8))
+        
+        # 3. PLIF 스파이크 발화
+        spikes = PLIFNode(v_th=1.0)(z_pooled) # (B, 64, 60, 16)
         
         # 4. 단순 합산(Rate Coding) - 이제 60스텝만 더하므로 시간 정보가 뭉개지지 않음
-        spike_count = jnp.sum(spikes, axis=2) # (B, 64, 32)
+        spike_count = jnp.sum(spikes, axis=2) # (B, 64, 16)
         z_feat = spike_count.reshape((spike_count.shape[0], -1)) 
         
-        # 5. 분류기 
+        # 5. 최종 분류기 (파라미터 폭발 없는 최적의 사이즈)
         z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
-        z_feat = nn.Dense(features=256)(z_feat)
+        z_feat = nn.Dense(features=128)(z_feat)
         z_feat = nn.elu(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         

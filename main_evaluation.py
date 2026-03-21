@@ -20,7 +20,7 @@ import torch
 warnings.filterwarnings("ignore")
 
 # =========================================================
-# 1. 완벽한 피험자 격리 및 데이터 밸런싱 (4-Class 1:1:1:1)
+# 1. 데이터 로딩 및 4-Class 1:1:1:1 밸런싱
 # =========================================================
 DATA_DIR = './07_Data'
 bad_subjects = [88, 92, 100, 104]
@@ -101,11 +101,27 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
+
 # =========================================================
-# 2. SNN 코어 (Hard Reset으로 발작 완벽 차단)
+# 2. SNN 코어 (대리 기울기 + Hard Reset PLIF + LINode)
 # =========================================================
+@jax.custom_vjp
+def spike_fn(v):
+    return jnp.where(v > 0, 1.0, 0.0)
+
+def spike_fn_fwd(v):
+    return spike_fn(v), v
+
+def spike_fn_bwd(res, g):
+    v = res
+    alpha = 2.0
+    grad = g / (1.0 + (alpha * v)**2)
+    return (grad,)
+
+spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
+
 class PLIFNode1D(nn.Module):
-    v_th: float = 0.5 # 🔥 임계값을 다시 0.5로 정상화
+    v_th: float = 0.5 
 
     @nn.compact
     def __call__(self, x):
@@ -116,9 +132,7 @@ class PLIFNode1D(nn.Module):
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
-            
-            # 🔥 핵심 수술: Soft Reset -> Hard Reset
-            # 스파이크가 터지면 전압을 무조건 0으로 강제 방전시켜서 무한 발화 루프를 끊음
+            # 🔥 무한 발작 차단을 위한 Hard Reset
             v = jnp.where(s > 0, 0.0, v) 
             return v, s
 
@@ -126,34 +140,72 @@ class PLIFNode1D(nn.Module):
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
         return jnp.moveaxis(spikes, 0, 1) 
 
+class LINode1D(nn.Module):
+    tau: float = 2.0
+    
+    @nn.compact
+    def __call__(self, x):
+        x_seq = jnp.moveaxis(x, 1, 0) 
+        def scan_fn(v, x_t):
+            v = v * (1.0 - 1.0/self.tau) + x_t
+            return v, v
+        v_init = jnp.zeros_like(x_seq[0])
+        _, potentials = jax.lax.scan(scan_fn, v_init, x_seq)
+        return jnp.moveaxis(potentials, 0, 1)
+
 # =========================================================
-# 3. Latent Cortical SNN (호출부 수정)
+# 3. 모델 아키텍처: Dynamic Graph + Temporal Conv + DP-Pooling
 # =========================================================
-class LatentCorticalSNN(nn.Module):
+class DynamicGraphAttention(nn.Module):
+    hidden_dim: int = 40 
+
+    @nn.compact
+    def __call__(self, x):
+        x_squeeze = x[..., 0] 
+        x_energy = jnp.var(x_squeeze, axis=-1, keepdims=True) 
+        
+        Q = nn.Dense(self.hidden_dim)(x_energy) 
+        K = nn.Dense(self.hidden_dim)(x_energy) 
+        
+        scale = self.hidden_dim ** -0.5
+        attn = jnp.einsum('b i h, b j h -> b i j', Q, K) * scale
+        
+        eye = jnp.eye(64, dtype=bool)
+        attn = jnp.where(eye, -1e9, attn)
+        attn_weights = jax.nn.softmax(attn, axis=-1)
+        
+        out = jnp.einsum('b i j, b j t -> b i t', attn_weights, x_squeeze)
+        out = jnp.expand_dims(out, -1) + x 
+        return out, attn_weights
+
+class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        x_squeeze = x[..., 0] 
-        x_time_first = jnp.moveaxis(x_squeeze, 1, 2)
+        # 1. 공간적 유기성 파악 (네 독창적 아이디어)
+        z_gcn, _ = DynamicGraphAttention(hidden_dim=40)(x)
         
-        # 1. Temporal First 
+        z_gcn_squeeze = z_gcn[..., 0] 
+        z_time_first = jnp.moveaxis(z_gcn_squeeze, 1, 2) # (B, 481, 64)
+        
+        # 2. 시간 파동 필터링 (주파수 추출)
         z_temp = nn.Conv(
             features=64, kernel_size=(64,), feature_group_count=64, 
             padding='SAME', use_bias=False
-        )(x_time_first)
+        )(z_time_first)
         z_temp = nn.BatchNorm(use_running_average=not train)(z_temp)
         z_temp = nn.elu(z_temp)
         z_temp = nn.Dropout(rate=0.2, deterministic=not train)(z_temp)
         
-        # 2. Spatial Projection 
+        # 3. 가상 피질 압축 (40 채널)
         z_spatial = nn.Dense(features=40, use_bias=False)(z_temp)
         z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
         z_spatial = nn.elu(z_spatial)
         z_spatial = nn.Dropout(rate=0.2, deterministic=not train)(z_spatial)
         
-        # 3. PLIF 스파이크 발화 (🔥 v_th 0.5 적용)
+        # 4. PLIF 발화 (v_th = 0.5, Hard Reset 적용됨)
         spikes = PLIFNode1D(v_th=0.5)(z_spatial) 
         
-        # 4. LI 뉴런 및 DP-Pooling
+        # 5. LI 누적 및 DP-Pooling (논문 디코더 완벽 이식)
         potentials = LINode1D(tau=2.0)(spikes) 
         
         L_dp, N_dp = 24, 12
@@ -183,21 +235,20 @@ class LatentCorticalSNN(nn.Module):
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, dp_flat, spikes
-    
+
 # =========================================================
-# 4. 학습 루프 (발화율 모니터링 + 안정적 LR)
+# 4. 학습 루프
 # =========================================================
 rng = jrandom.PRNGKey(42)
 rng, init_rng = jrandom.split(rng)
-model = LatentCorticalSNN()
+model = Hybrid_SOTA_SNN()
 
 T_dim = X_train.shape[2] 
 dummy_x = jnp.ones((1, 64, T_dim, 1))
 variables = model.init(init_rng, dummy_x, train=False)
 state = {'params': variables['params'], 'batch_stats': variables.get('batch_stats', {})}
 
-# 🔥 학습률을 1e-3으로 낮춰서 가중치 폭발 방지
-tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=optax.cosine_decay_schedule(1e-3, 200), weight_decay=1e-2))
+tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=optax.cosine_decay_schedule(2e-3, 200), weight_decay=1e-2))
 opt_state = tx.init(state['params'])
 
 @jax.jit
@@ -209,9 +260,7 @@ def train_step(state, opt_state, x, y, rng_key):
         y_onehot = jax.nn.one_hot(y, 4)
         loss_cls = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=y_onehot))
         
-        # 🔥 스파이크 발화율(Firing Rate) 계산
         firing_rate = jnp.mean(spikes)
-        
         return loss_cls, (logits, new_vars['batch_stats'], firing_rate)
 
     grads, (logits, new_batch_stats, firing_rate) = jax.grad(loss_fn, has_aux=True)(state['params'])
@@ -229,7 +278,7 @@ def eval_step(state, x, y):
     acc = jnp.mean(jnp.argmax(logits, -1) == y)
     return acc
 
-print("🚀 최종 결전: 뇌사(Dead Neuron) 방지 및 DP-Pooling 완전체 학습 시작...")
+print("🚀 최종 완전체: Dynamic Graph + PLIF(Hard Reset) + DP-Pooling 학습 시작...")
 
 best_acc = 0.0
 for epoch in range(1, 201):
@@ -239,7 +288,7 @@ for epoch in range(1, 201):
         xb_jax, yb_jax = jnp.array(xb.numpy()), jnp.array(yb.numpy())
         state, opt_state, acc, fr = train_step(state, opt_state, xb_jax, yb_jax, step_rng)
         train_accs.append(acc)
-        train_frs.append(fr) # 뇌사 모니터링용
+        train_frs.append(fr) 
         
     if epoch % 5 == 0:
         test_accs = []
@@ -251,7 +300,6 @@ for epoch in range(1, 201):
         train_acc = np.mean(train_accs) * 100
         avg_fr = np.mean(train_frs)
         
-        # 🔥 발화율(FR) 콘솔 출력 추가! (0.05 ~ 0.20 사이가 정상)
         print(f"Epoch {epoch:3d} | Train Acc: {train_acc:.2f}% | ⚡ Test Acc: {val_acc:.2f}% | 🧠 Firing Rate: {avg_fr:.4f}")
         
         if val_acc > best_acc:

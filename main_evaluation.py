@@ -209,8 +209,7 @@ class DPSpikingDecoder(nn.Module):
         # 최종 분류기를 위해 평탄화
         return attended_out.reshape((B, -1))
 class DynamicGraphAttention(nn.Module):
-    # 🔥 수술 1: 특징 추출 차원을 16 -> 32로 2배 확장
-    hidden_dim: int = 32
+    hidden_dim: int = 16 # 가볍고 빠르게 16으로 롤백
 
     @nn.compact
     def __call__(self, x):
@@ -234,48 +233,39 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=32)(x)
+        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=16)(x)
         
-        z_ann = nn.Conv(features=32, kernel_size=(1, 64), padding='SAME')(z_gcn)
+        z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # PLIF 뉴런 스파이크 발화 (B, 64, 481, 32)
+        # PLIF 뉴런 스파이크 발화 (B, 64, 481, 16)
         spikes = PLIFNode(v_th=0.5)(z_ann) 
         
-        # 🔥 수술 포인트: 481스텝 통째로 합산 금지 -> 48스텝(0.3초) 단위로 쪼개기
+        # 🔥 다이어트 1단계: 480스텝으로 깔끔하게 자르고 10개의 윈도우(0.3초)로 분할
+        spikes = spikes[:, :, :480, :] 
         B, S, T, F = spikes.shape
-        window_size = 48  
+        spikes_chunked = spikes.reshape((B, S, 10, 48, F))
         
-        # 깔끔하게 나눠지도록 패딩 추가
-        pad_len = (window_size - (T % window_size)) % window_size
-        spikes_padded = jnp.pad(spikes, ((0,0), (0,0), (0, pad_len), (0,0)))
+        # 윈도우(48스텝) 내의 평균 발화율(Rate) 계산 -> (B, 64, 10, 16)
+        spike_rates = jnp.mean(spikes_chunked, axis=3) 
         
-        T_new = spikes_padded.shape[2]
-        num_windows = T_new // window_size # 약 11개의 시간 윈도우 생성
+        # 🔥 다이어트 2단계 (가장 중요): 전극(64) 차원을 평균내어 1차원으로 압축
+        # 이미 Graph Attention이 전극 간 정보를 융합했으므로 안전함
+        z_temporal = jnp.mean(spike_rates, axis=1) # (B, 10, 16)
         
-        # (B, 64, 11, 48, 32) 로 텐서 재배열
-        spikes_chunked = spikes_padded.reshape((B, S, num_windows, window_size, F))
+        # 🔥 다이어트 3단계: 10(시간) * 16(피처) = 160 차원으로 평탄화!
+        # (기존 22,528 차원에서 극적으로 감소)
+        z_feat = z_temporal.reshape((B, -1)) # (B, 160)
         
-        # 윈도우 내부(48스텝)에서만 합산 -> (B, 64, 11, 32)
-        spike_windows = jnp.sum(spikes_chunked, axis=3) 
-        
-        # 시간 흐름이 보존된 상태로 평탄화
-        z_feat_flat = spike_windows.reshape((B, -1)) 
-        
-        # 넉넉해진 피처를 256차원으로 융합
-        z_feat = nn.LayerNorm()(z_feat_flat)
+        z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
-        z_feat = nn.Dense(features=256)(z_feat)
-        z_feat = nn.elu(z_feat)
-        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
-        
-        # 최종 분류기
+        # 최종 분류기 (Dense 파라미터 고작 644개!)
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, z_feat_flat
+        return logits, z_feat
             
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)

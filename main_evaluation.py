@@ -158,7 +158,7 @@ class Hybrid_SOTA_SNN(nn.Module):
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
         # 2. 시간적 통합 (SNN)
-        spikes = LIFNode(tau=2.0, v_threshold=0.5)(z_ann) # (B, 64, 480, 16)
+        spikes = LIFNode(tau=2.0, v_th=0.5)(z_ann) # (B, 64, 480, 16)
         
         # 3. Rate Coding
         firing_rate = jnp.mean(spikes, axis=2) # (B, 64, 16)

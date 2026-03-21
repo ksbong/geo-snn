@@ -101,62 +101,50 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
-
 # =========================================================
-# 2. SNN 코어 (논문 기반 최적화된 Triangle 대리 기울기)
+# 2. SNN 코어 (SuperSpike 대리 기울기 + Hard Reset)
 # =========================================================
 @jax.custom_vjp
-def spike_fn(u_minus_vth):
-    # 막전위가 임계값을 넘었는지(u - V_th > 0) 확인
-    return jnp.where(u_minus_vth > 0, 1.0, 0.0)
+def spike_fn(v):
+    return jnp.where(v > 0, 1.0, 0.0)
 
-def spike_fn_fwd(u_minus_vth):
-    return spike_fn(u_minus_vth), u_minus_vth
+def spike_fn_fwd(v):
+    return spike_fn(v), v
 
 def spike_fn_bwd(res, g):
-    u_minus_vth = res
-    # 🔥 논문 [표 1] 기준 최고 성능을 보인 Triangle 함수의 최적 너비 적용
-    alpha = 0.5 
-    beta = 1.0
-    
-    # 🔥 논문 수식 (3): h_2(u) Triangle 대리 기울기 함수 완벽 이식
-    # 임계값 주변(|u - V_th| <= alpha)에서만 정확하게 기울기 전달
-    grad = beta * (1.0 - jnp.abs(u_minus_vth) / alpha)
-    grad = jnp.where(jnp.abs(u_minus_vth) <= alpha, grad, 0.0)
-    
-    return (g * grad,)
+    v = res
+    alpha = 2.0
+    # 🔥 꼬리가 길어 죽은 뉴런도 살려내는 SuperSpike(ATan) 기울기
+    grad = g / (1.0 + jnp.abs(alpha * v)) ** 2
+    return (grad,)
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 class PLIFNode(nn.Module):
-    # 🔥 논문 설정값과 동일하게 임계값 0.5로 세팅
     v_th: float = 0.5 
 
     @nn.compact
     def __call__(self, x):
         x_seq = jnp.moveaxis(x, 2, 0) 
-        decay_param = self.param('decay', nn.initializers.constant(0.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
-            decay = jax.nn.sigmoid(decay_param)
-            v = v * decay + x_t
-            
-            # 🔥 대리 기울기의 중심축을 맞추기 위해 (v - v_th)를 통째로 넘김
+            # 🔥 어설픈 학습 대신 가장 안정적인 0.8 고정 Decay 사용
+            v = v * 0.8 + x_t
             s = spike_fn(v - self.v_th)
             
-            # 순정 Soft Reset (방전)
-            v = v - s * self.v_th 
+            # 🔥 Hard Reset: 스파이크 발화 후 전압 0으로 완전 방전
+            v = v * (1.0 - s) 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
         return jnp.moveaxis(spikes, 0, 2)
-    
+
 # =========================================================
-# 3. 모델 아키텍처: Dynamic Graph + Temporal Pooling + Rate Coding
+# 3. 모델 아키텍처 (ReLU 양수 강제 + Temporal Pooling)
 # =========================================================
 class DynamicGraphAttention(nn.Module):
-    hidden_dim: int = 16 # 공간 피처 최적화
+    hidden_dim: int = 16 
 
     @nn.compact
     def __call__(self, x):
@@ -180,33 +168,29 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 1. 공간 유기성 파악 (기하학적 분석)
         z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # 2. 시간 파동 추출
         z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
-        z_ann = nn.elu(z_ann)
         
-        # 🔥 1번 범인 처단: SNN 직전의 Dropout(0.5) 완전 삭제!
+        # 🔥 핵심 1: ELU 대신 ReLU 사용! SNN에 무조건 양수(+) 전류만 공급하여 뇌사 방지
+        z_ann = nn.relu(z_ann)
         
-        # 🔥 2번 범인 처단: Temporal Pooling (시간축 압축으로 BPTT 부활)
-        # 481스텝을 8스텝 단위로 평균내어 약 60스텝으로 뇌파 흐름만 남김
+        # Temporal Pooling으로 BPTT 시간축 압축
         z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8))
         
-        # 3. PLIF 스파이크 발화
-        spikes = PLIFNode(v_th=1.0)(z_pooled) # (B, 64, 60, 16)
+        # SNN 발화
+        spikes = PLIFNode(v_th=0.5)(z_pooled) 
         
-        # 4. 단순 합산(Rate Coding) - 이제 60스텝만 더하므로 시간 정보가 뭉개지지 않음
-        spike_count = jnp.sum(spikes, axis=2) # (B, 64, 16)
+        # 단순 합산(Rate Coding)
+        spike_count = jnp.sum(spikes, axis=2) 
         z_feat = spike_count.reshape((spike_count.shape[0], -1)) 
         
-        # 5. 최종 분류기 (파라미터 폭발 없는 최적의 사이즈)
         z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
         z_feat = nn.Dense(features=128)(z_feat)
-        z_feat = nn.elu(z_feat)
+        z_feat = nn.elu(z_feat) # 여긴 SNN 뒤니까 ELU 써도 됨
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
         logits = nn.Dense(features=4)(z_feat)

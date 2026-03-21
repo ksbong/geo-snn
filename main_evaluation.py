@@ -103,58 +103,33 @@ train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_tr
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
 # =========================================================
-# 2. SNN 코어 (대리 기울기 + Hard Reset PLIF + LINode)
+# 2. SNN 코어 (미분 가능한 Hard Reset)
 # =========================================================
-@jax.custom_vjp
-def spike_fn(v):
-    return jnp.where(v > 0, 1.0, 0.0)
-
-def spike_fn_fwd(v):
-    return spike_fn(v), v
-
-def spike_fn_bwd(res, g):
-    v = res
-    alpha = 2.0
-    grad = g / (1.0 + (alpha * v)**2)
-    return (grad,)
-
-spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
-
 class PLIFNode1D(nn.Module):
     v_th: float = 0.5 
 
     @nn.compact
     def __call__(self, x):
         x_seq = jnp.moveaxis(x, 1, 0) 
-        decay_param = self.param('decay', nn.initializers.constant(2.0), (x.shape[-1],))
+        # 🔥 Fix 1: 초기값을 0.0으로 주어 sigmoid(0)=0.5 (기존 42% 모델과 동일한 밸런스)
+        decay_param = self.param('decay', nn.initializers.constant(0.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
-            # 🔥 무한 발작 차단을 위한 Hard Reset
-            v = jnp.where(s > 0, 0.0, v) 
+            
+            # 🔥 Fix 2: 미분 불가능한 jnp.where 대신 수학적으로 미분 가능한 Hard Reset
+            # 스파이크(s)가 1.0이면 전압(v)은 0.0이 되고, 기울기는 s를 타고 앞단으로 흘러감!
+            v = v * (1.0 - s) 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
         return jnp.moveaxis(spikes, 0, 1) 
 
-class LINode1D(nn.Module):
-    tau: float = 2.0
-    
-    @nn.compact
-    def __call__(self, x):
-        x_seq = jnp.moveaxis(x, 1, 0) 
-        def scan_fn(v, x_t):
-            v = v * (1.0 - 1.0/self.tau) + x_t
-            return v, v
-        v_init = jnp.zeros_like(x_seq[0])
-        _, potentials = jax.lax.scan(scan_fn, v_init, x_seq)
-        return jnp.moveaxis(potentials, 0, 1)
-
 # =========================================================
-# 3. 모델 아키텍처: Dynamic Graph + Windowed Rate Coding
+# 3. 모델 아키텍처: Dynamic Graph + 순정 Windowed SNN
 # =========================================================
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 40 
@@ -181,12 +156,12 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 1. 공간적 유기성 (Dynamic Graph Attention)
+        # 1. 공간적 유기성 파악
         z_gcn, _ = DynamicGraphAttention(hidden_dim=40)(x)
         z_gcn_squeeze = z_gcn[..., 0] 
-        z_time_first = jnp.moveaxis(z_gcn_squeeze, 1, 2) # (B, 481, 64)
+        z_time_first = jnp.moveaxis(z_gcn_squeeze, 1, 2)
         
-        # 2. 시간 파동 필터링
+        # 2. 시간 파동 필터링 (Depthwise)
         z_temp = nn.Conv(
             features=64, kernel_size=(64,), feature_group_count=64, 
             padding='SAME', use_bias=False
@@ -201,11 +176,10 @@ class Hybrid_SOTA_SNN(nn.Module):
         z_spatial = nn.elu(z_spatial)
         z_spatial = nn.Dropout(rate=0.2, deterministic=not train)(z_spatial)
         
-        # 4. PLIF 발화 (v_th = 0.5, Hard Reset)
-        spikes = PLIFNode1D(v_th=0.5)(z_spatial) # (B, 481, 40)
+        # 4. PLIF 발화 (드디어 미분 그래프 정상 작동)
+        spikes = PLIFNode1D(v_th=0.5)(z_spatial) 
         
-        # 5. 🔥 죽어버린 LINode 삭제, "Windowed Rate Coding" 도입
-        # 481스텝을 24스텝 단위 윈도우로 쪼개서 sum (기울기 100% 보존)
+        # 5. 🔥 Fix 3: 어설픈 Attention 다 날리고 가장 확실한 Windowed Rate Coding 직행
         B, T, F = spikes.shape
         window_size = 24
         pad_len = (window_size - (T % window_size)) % window_size
@@ -213,20 +187,10 @@ class Hybrid_SOTA_SNN(nn.Module):
         num_windows = spikes_padded.shape[1] // window_size
         
         spikes_chunked = spikes_padded.reshape((B, num_windows, window_size, F))
-        window_spikes = jnp.sum(spikes_chunked, axis=2) # (B, 21, 40)
+        window_spikes = jnp.sum(spikes_chunked, axis=2) # 윈도우 내 단순 합산 (기울기 100% 보존)
         
-        # 6. Temporal Attention (중요한 시간대 증폭)
-        window_flat = window_spikes.reshape((B, -1)) 
-        ta_fc1 = nn.Dense(features=num_windows // 2)(window_flat)
-        ta_elu = nn.elu(ta_fc1) # ReLU 대신 ELU로 안정화
-        ta_fc2 = nn.Dense(features=num_windows)(ta_elu)
-        ta_weights = jax.nn.softmax(ta_fc2, axis=-1)
-        ta_weights_exp = jnp.expand_dims(ta_weights, axis=-1)
-        
-        attended_out = window_spikes * ta_weights_exp # (B, 21, 40)
-        
-        # 7. 넉넉한 융합층과 최종 분류기
-        z_feat = attended_out.reshape((B, -1))
+        # 6. 시간축 특징 평탄화 및 최종 분류기
+        z_feat = window_spikes.reshape((B, -1))
         z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
         
         z_feat = nn.Dense(features=256)(z_feat)
@@ -235,7 +199,8 @@ class Hybrid_SOTA_SNN(nn.Module):
         
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, window_flat, spikes
+        # 더 이상 LINode나 DP_flat이 없으니 z_feat를 대신 반환
+        return logits, z_feat, spikes
 
 # =========================================================
 # 4. 학습 루프

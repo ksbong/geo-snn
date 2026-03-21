@@ -102,27 +102,35 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
-    # =========================================================
-# 2. SNN 코어 (안정적 대리 기울기 + 미분 가능 Hard Reset)
+# =========================================================
+# 2. SNN 코어 (논문 기반 최적화된 Triangle 대리 기울기)
 # =========================================================
 @jax.custom_vjp
-def spike_fn(v):
-    return jnp.where(v > 0, 1.0, 0.0)
+def spike_fn(u_minus_vth):
+    # 막전위가 임계값을 넘었는지(u - V_th > 0) 확인
+    return jnp.where(u_minus_vth > 0, 1.0, 0.0)
 
-def spike_fn_fwd(v):
-    return spike_fn(v), v
+def spike_fn_fwd(u_minus_vth):
+    return spike_fn(u_minus_vth), u_minus_vth
 
 def spike_fn_bwd(res, g):
-    v = res
-    alpha = 2.0
-    # 🔥 기존보다 훨씬 안정적으로 기울기를 살려주는 개선된 Surrogate 공식
-    grad = g / (1.0 + jnp.abs(alpha * v)) ** 2 
-    return (grad,)
+    u_minus_vth = res
+    # 🔥 논문 [표 1] 기준 최고 성능을 보인 Triangle 함수의 최적 너비 적용
+    alpha = 0.5 
+    beta = 1.0
+    
+    # 🔥 논문 수식 (3): h_2(u) Triangle 대리 기울기 함수 완벽 이식
+    # 임계값 주변(|u - V_th| <= alpha)에서만 정확하게 기울기 전달
+    grad = beta * (1.0 - jnp.abs(u_minus_vth) / alpha)
+    grad = jnp.where(jnp.abs(u_minus_vth) <= alpha, grad, 0.0)
+    
+    return (g * grad,)
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
 class PLIFNode(nn.Module):
-    v_th: float = 1.0 # 기준 임계값 1.0으로 안정화
+    # 🔥 논문 설정값과 동일하게 임계값 0.5로 세팅
+    v_th: float = 0.5 
 
     @nn.compact
     def __call__(self, x):
@@ -132,16 +140,18 @@ class PLIFNode(nn.Module):
         def scan_fn(v, x_t):
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
+            
+            # 🔥 대리 기울기의 중심축을 맞추기 위해 (v - v_th)를 통째로 넘김
             s = spike_fn(v - self.v_th)
             
-            # 🔥 미분 가능한 Hard Reset: 스파이크 발화 시 전압을 0으로 강제 초기화하여 폭발 방지
-            v = v * (1.0 - s) 
+            # 순정 Soft Reset (방전)
+            v = v - s * self.v_th 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
-        return jnp.moveaxis(spikes, 0, 2) 
-
+        return jnp.moveaxis(spikes, 0, 2)
+    
 # =========================================================
 # 3. 모델 아키텍처: Dynamic Graph + Temporal Pooling + Rate Coding
 # =========================================================

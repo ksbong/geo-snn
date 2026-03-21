@@ -236,20 +236,35 @@ class Hybrid_SOTA_SNN(nn.Module):
     def __call__(self, x, train: bool = True):
         z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=32)(x)
         
-        # 공간 피처를 32차원으로 넉넉하게 추출
         z_ann = nn.Conv(features=32, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # PLIF 뉴런 스파이크 발화 (출력 차원: B, 64, 481, 32)
+        # PLIF 뉴런 스파이크 발화 (B, 64, 481, 32)
         spikes = PLIFNode(v_th=0.5)(z_ann) 
         
-        # Rate Coding (시간축 합산) -> (B, 64, 32)
-        spike_count = jnp.sum(spikes, axis=2) 
-        z_feat_flat = spike_count.reshape((spike_count.shape[0], -1)) # (B, 2048)
+        # 🔥 수술 포인트: 481스텝 통째로 합산 금지 -> 48스텝(0.3초) 단위로 쪼개기
+        B, S, T, F = spikes.shape
+        window_size = 48  
         
-        # 🔥 수술 2 & 3: Flatten된 피처를 바로 4-Class로 꽂지 않고, 중간 융합층(Dense 256) 추가
+        # 깔끔하게 나눠지도록 패딩 추가
+        pad_len = (window_size - (T % window_size)) % window_size
+        spikes_padded = jnp.pad(spikes, ((0,0), (0,0), (0, pad_len), (0,0)))
+        
+        T_new = spikes_padded.shape[2]
+        num_windows = T_new // window_size # 약 11개의 시간 윈도우 생성
+        
+        # (B, 64, 11, 48, 32) 로 텐서 재배열
+        spikes_chunked = spikes_padded.reshape((B, S, num_windows, window_size, F))
+        
+        # 윈도우 내부(48스텝)에서만 합산 -> (B, 64, 11, 32)
+        spike_windows = jnp.sum(spikes_chunked, axis=3) 
+        
+        # 시간 흐름이 보존된 상태로 평탄화
+        z_feat_flat = spike_windows.reshape((B, -1)) 
+        
+        # 넉넉해진 피처를 256차원으로 융합
         z_feat = nn.LayerNorm()(z_feat_flat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         

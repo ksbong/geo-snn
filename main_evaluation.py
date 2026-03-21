@@ -104,7 +104,7 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 # =========================================================
-# 2. PLIF (Parametric LIF) 뉴런 도입
+# 2. 1D 기반 PLIF 뉴런 (독립적 피질 영역 발화용)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(v):
@@ -121,158 +121,78 @@ def spike_fn_bwd(res, g):
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
-class PLIFNode(nn.Module):
+class PLIFNode1D(nn.Module):
     v_th: float = 0.5
 
     @nn.compact
     def __call__(self, x):
-        x_seq = jnp.moveaxis(x, 2, 0) # 시간을 앞으로 (481, B, 64, 16)
+        # x shape: (Batch, Time, Features) -> Scan을 위해 (Time, Batch, Features)
+        x_seq = jnp.moveaxis(x, 1, 0) 
         
-        # 🔥 핵심 수술 1: 채널별로 기억력(망각 곡선)을 스스로 학습하는 파라미터 생성
-        # 초기값을 2.0으로 주어 sigmoid(2.0) ≈ 0.88의 긴 기억력으로 시작 유도
+        # 16개의 피처(가상 피질)가 각자 독립적인 기억력(Decay)을 학습
         decay_param = self.param('decay', nn.initializers.constant(2.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
-            # Sigmoid를 통과시켜 0~1 사이의 안정적인 망각률 보장
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
-            v = v - s * self.v_th # Hard reset
+            v = v - s * self.v_th
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
-        return jnp.moveaxis(spikes, 0, 2)
+        return jnp.moveaxis(spikes, 0, 1) # (Batch, Time, Features) 복구
+
 # =========================================================
-# 3. 하이브리드 SNN 아키텍처 (DP-Spiking Decoder 완전판)
+# 3. Latent Cortical SNN (극초경량 독창적 아키텍처)
 # =========================================================
-class LINode(nn.Module):
-    # 스파이크를 발화하지 않고 전위(Potential)만 누적하는 뉴런
-    tau: float = 2.0
-    
-    @nn.compact
-    def __call__(self, x):
-        x_seq = jnp.moveaxis(x, 2, 0) # (T, B, S, F)
-        
-        def scan_fn(v, x_t):
-            v = v * (1.0 - 1.0/self.tau) + x_t
-            return v, v # 스파이크 리셋 없이 전위만 반환
-
-        v_init = jnp.zeros_like(x_seq[0])
-        _, potentials = jax.lax.scan(scan_fn, v_init, x_seq)
-        return jnp.moveaxis(potentials, 0, 2) # (B, 64, 481, 16)
-
-class DPSpikingDecoder(nn.Module):
-    L_dp: int = 24
-    N_dp: int = 12
-
-    @nn.compact
-    def __call__(self, spikes, train: bool = True):
-        # 1. LI Layer: 스파이크(이산) -> 전위(연속) 변환
-        potentials = LINode(tau=2.0)(spikes) 
-        
-        # 2. 공간축(64) 차원 축소: 논문의 Avg-pooling 구조 적용
-        v_pooled = jnp.mean(potentials, axis=1) # (B, 481, 16)
-        B, T, F = v_pooled.shape
-        
-        # 3. 패딩 및 DP 윈도우 분할
-        pad_len = (self.L_dp - (T % self.L_dp)) % self.L_dp
-        v_padded = jnp.pad(v_pooled, ((0,0), (0, pad_len), (0,0)))
-        T_new = v_padded.shape[1]
-        num_windows = T_new // self.L_dp # 21개 윈도우
-        
-        v_chunked = v_padded.reshape((B, num_windows, self.L_dp, F))
-        
-        # 4. DP-Pooling 연산 (앞뒤 평균의 차이 추출)
-        first_part = jnp.mean(v_chunked[:, :, :self.N_dp, :], axis=2)
-        last_part = jnp.mean(v_chunked[:, :, -self.N_dp:, :], axis=2)
-        dp_out = last_part - first_part # (B, 21, 16)
-        
-        # 5. Temporal Attention (TA) - 차원 에러 완벽 해결
-        # 먼저 평탄화하여 21개 윈도우 전체의 글로벌 문맥 파악
-        dp_flat = dp_out.reshape((B, -1)) # (B, 21 * 16)
-        
-        ta_fc1 = nn.Dense(features=num_windows // 2)(dp_flat) # (B, 10)
-        ta_relu = nn.relu(ta_fc1)
-        ta_fc2 = nn.Dense(features=num_windows)(ta_relu) # (B, 21)
-        
-        # 21개 윈도우 각각의 중요도 가중치 산출
-        ta_weights = jax.nn.softmax(ta_fc2, axis=-1) # (B, 21)
-        
-        # 브로드캐스팅을 위해 (B, 21, 1)로 차원 확장
-        ta_weights_expanded = jnp.expand_dims(ta_weights, axis=-1) 
-        
-        # 6. Hadamard product (중요한 시간 구간의 특징 증폭)
-        # (B, 21, 16) * (B, 21, 1) -> 완벽한 차원 매칭
-        attended_out = dp_out * ta_weights_expanded 
-        
-        # 최종 분류기를 위해 평탄화
-        return attended_out.reshape((B, -1))
-class DynamicGraphAttention(nn.Module):
-    hidden_dim: int = 16 # 가볍고 빠르게 16으로 롤백
-
-    @nn.compact
-    def __call__(self, x):
-        x_squeeze = x[..., 0] 
-        x_energy = jnp.var(x_squeeze, axis=-1, keepdims=True) 
-        
-        Q = nn.Dense(self.hidden_dim)(x_energy) 
-        K = nn.Dense(self.hidden_dim)(x_energy) 
-        
-        scale = self.hidden_dim ** -0.5
-        attn = jnp.einsum('b i h, b j h -> b i j', Q, K) * scale
-        
-        eye = jnp.eye(64, dtype=bool)
-        attn = jnp.where(eye, -1e9, attn)
-        attn_weights = jax.nn.softmax(attn, axis=-1)
-        
-        out = jnp.einsum('b i j, b j t -> b i t', attn_weights, x_squeeze)
-        out = jnp.expand_dims(out, -1) + x 
-        return out, attn_weights
-
-class Hybrid_SOTA_SNN(nn.Module):
+class LatentCorticalSNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=16)(x)
+        # x shape: (B, 64, 481, 1)
+        x_squeeze = x[..., 0] # (B, 64, 481)
         
-        z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
-        z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
-        z_ann = nn.elu(z_ann)
-        z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
+        # JAX의 시계열 처리를 위해 축 변경 -> (B, 481, 64)
+        x_time_first = jnp.moveaxis(x_squeeze, 1, 2)
         
-        # PLIF 뉴런 스파이크 발화 (B, 64, 481, 16)
-        spikes = PLIFNode(v_th=0.5)(z_ann) 
+        # 🔥 노벨티 1: Spatial Projection (공간 투영)
+        # 64개의 물리적 전극 신호를 16개의 '가상 대뇌 피질(Latent Region)'로 압축
+        # 파라미터 단 1,024개로 공간의 본질적 특징을 뽑음
+        z_spatial = nn.Dense(features=16, use_bias=False)(x_time_first) # (B, 481, 16)
         
-        # 🔥 다이어트 1단계: 480스텝으로 깔끔하게 자르고 10개의 윈도우(0.3초)로 분할
-        spikes = spikes[:, :, :480, :] 
-        B, S, T, F = spikes.shape
-        spikes_chunked = spikes.reshape((B, S, 10, 48, F))
+        # 🔥 노벨티 2: Depthwise Temporal Conv (독립적 시간 필터링)
+        # 16개의 피질 영역 신호를 서로 섞지 않고 '각각 독립적으로' 64스텝(0.4초) 동안 필터링
+        # feature_group_count=16을 통해 연산량을 극단적으로 줄임
+        z_temporal = nn.Conv(
+            features=16, 
+            kernel_size=(64,), 
+            feature_group_count=16, # Depthwise의 핵심
+            padding='SAME',
+            use_bias=False
+        )(z_spatial) # (B, 481, 16)
         
-        # 윈도우(48스텝) 내의 평균 발화율(Rate) 계산 -> (B, 64, 10, 16)
-        spike_rates = jnp.mean(spikes_chunked, axis=3) 
+        z_temporal = nn.BatchNorm(use_running_average=not train)(z_temporal)
+        z_temporal = nn.elu(z_temporal)
+        z_temporal = nn.Dropout(rate=0.5, deterministic=not train)(z_temporal)
         
-        # 🔥 다이어트 2단계 (가장 중요): 전극(64) 차원을 평균내어 1차원으로 압축
-        # 이미 Graph Attention이 전극 간 정보를 융합했으므로 안전함
-        z_temporal = jnp.mean(spike_rates, axis=1) # (B, 10, 16)
+        # 🔥 노벨티 3: PLIF 뉴런 발화
+        spikes = PLIFNode1D(v_th=0.5)(z_temporal) # (B, 481, 16)
         
-        # 🔥 다이어트 3단계: 10(시간) * 16(피처) = 160 차원으로 평탄화!
-        # (기존 22,528 차원에서 극적으로 감소)
-        z_feat = z_temporal.reshape((B, -1)) # (B, 160)
+        # Rate Coding: 전체 시간 동안 터진 스파이크 비율 계산
+        spike_rate = jnp.mean(spikes, axis=1) # (B, 16)
         
-        z_feat = nn.LayerNorm()(z_feat)
-        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
-        
-        # 최종 분류기 (Dense 파라미터 고작 644개!)
+        # 최종 분류기 (파라미터 단 64개)
+        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(spike_rate)
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, z_feat
+        return logits, spike_rate
             
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)
 # =========================================================
 rng = jrandom.PRNGKey(42)
 rng, init_rng = jrandom.split(rng)
-model = Hybrid_SOTA_SNN()
+model = LatentCorticalSNN()
 
 T_dim = X_train.shape[2] 
 dummy_x = jnp.ones((1, 64, T_dim, 1))

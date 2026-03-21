@@ -143,39 +143,62 @@ class PLIFNode(nn.Module):
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
         return jnp.moveaxis(spikes, 0, 2)
+# =========================================================
+# 3. 하이브리드 SNN 아키텍처 (DP-Spiking Decoder 완전판)
+# =========================================================
+class LINode(nn.Module):
+    # 스파이크를 발화하지 않고 전위(Potential)만 누적하는 뉴런
+    tau: float = 2.0
+    
+    @nn.compact
+    def __call__(self, x):
+        x_seq = jnp.moveaxis(x, 2, 0) # (T, B, S, F)
+        
+        def scan_fn(v, x_t):
+            v = v * (1.0 - 1.0/self.tau) + x_t
+            return v, v # 스파이크 리셋 없이 전위만 반환
 
-# =========================================================
-# 3. 하이브리드 SNN 아키텍처 (DP-Pooling 완전 이식)
-# =========================================================
-class DPPooling(nn.Module):
-    # 논문에 기재된 최적 파라미터 [L_DP, N_DP] = [24, 12]
+        v_init = jnp.zeros_like(x_seq[0])
+        _, potentials = jax.lax.scan(scan_fn, v_init, x_seq)
+        return jnp.moveaxis(potentials, 0, 2) # (B, 64, 481, 16)
+
+class DPSpikingDecoder(nn.Module):
     L_dp: int = 24
     N_dp: int = 12
 
     @nn.compact
-    def __call__(self, x):
-        # x shape: (B, Spatial=64, Time=481, Features=16)
-        B, S, T, F = x.shape
+    def __call__(self, spikes, train: bool = True):
+        # 1. LI Layer: 스파이크(이산) -> 전위(연속) 변환
+        potentials = LINode(tau=2.0)(spikes) 
         
-        # 1. 시간축(T)을 L_dp(24)로 깔끔하게 나누기 위해 패딩
+        # 2. 공간축(64) 차원 축소: 논문의 Avg-pooling 구조 적용
+        v_pooled = jnp.mean(potentials, axis=1) # (B, 481, 16)
+        B, T, F = v_pooled.shape
+        
+        # 3. 패딩 및 DP 윈도우 분할
         pad_len = (self.L_dp - (T % self.L_dp)) % self.L_dp
-        x_padded = jnp.pad(x, ((0,0), (0,0), (0, pad_len), (0,0)))
+        v_padded = jnp.pad(v_pooled, ((0,0), (0, pad_len), (0,0)))
+        T_new = v_padded.shape[1]
+        num_windows = T_new // self.L_dp
         
-        T_new = x_padded.shape[2]
+        v_chunked = v_padded.reshape((B, num_windows, self.L_dp, F))
         
-        # 2. 시간축을 윈도우(Chunk) 단위로 쪼개기
-        # (B, 64, 481+23, 16) -> (B, 64, 21개 윈도우, 24 길이, 16 피처)
-        x_chunked = x_padded.reshape((B, S, T_new // self.L_dp, self.L_dp, F))
+        # 4. DP-Pooling 연산 (앞뒤 평균의 차이 추출)
+        first_part = jnp.mean(v_chunked[:, :, :self.N_dp, :], axis=2)
+        last_part = jnp.mean(v_chunked[:, :, -self.N_dp:, :], axis=2)
+        dp_out = last_part - first_part # (B, num_windows, F)
         
-        # 3. 논문의 핵심 수식: 앞부분 평균과 뒷부분 평균의 차이(Difference) 계산
-        first_part = jnp.mean(x_chunked[:, :, :, :self.N_dp, :], axis=3)
-        last_part = jnp.mean(x_chunked[:, :, :, -self.N_dp:, :], axis=3)
+        # 5. Temporal Attention (TA) - 논문 수식 (12) 적용
+        ta_fc1 = nn.Dense(features=num_windows // 2)(dp_out)
+        ta_relu = nn.relu(ta_fc1)
+        ta_fc2 = nn.Dense(features=num_windows)(ta_relu)
+        ta_weights = jax.nn.softmax(ta_fc2, axis=1) # (B, num_windows, F)
         
-        # 파동의 변화량(Diff-Potential) 추출
-        dp_out = last_part - first_part # (B, 64, 21, 16)
+        # 6. Hadamard product (중요한 시간 구간의 특징 증폭)
+        attended_out = dp_out * ta_weights
         
-        # 최종 분류기를 위해 1D 벡터로 평탄화
-        return dp_out.reshape((B, -1))
+        # 최종 평탄화
+        return attended_out.reshape((B, -1))
 
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 16
@@ -209,18 +232,18 @@ class Hybrid_SOTA_SNN(nn.Module):
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # PLIF 뉴런 적용
-        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 16)
+        # PLIF 뉴런 스파이크 발화
+        spikes = PLIFNode(v_th=0.5)(z_ann) 
         
-        # 🔥 단순 sum()을 지우고 SOTA의 핵심인 DP-Pooling 연결
-        z_feat = DPPooling(L_dp=24, N_dp=12)(spikes)
+        # 🔥 완벽하게 재현된 DP-Spiking Decoder 투입
+        z_feat = DPSpikingDecoder()(spikes, train)
         
         z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, z_feat
-        
+            
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)
 # =========================================================

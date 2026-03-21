@@ -171,38 +171,34 @@ class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
         # 1. 공간 유기성 파악 (Dynamic Graph)
-        z_gcn, _ = DynamicGraphAttention(hidden_dim=32)(x)
+        z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # 2. 시간 파동 추출
-        z_ann = nn.Conv(features=32, kernel_size=(1, 64), padding='SAME')(z_gcn)
+        # 2. 시간 파동 추출 
+        # 🔥 피처를 8개로 극단적 다이어트 (뒤에서 공간 채널을 살리기 위함)
+        z_ann = nn.Conv(features=8, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # 3. PLIF 스파이크 발화 (Soft Reset 적용된 순정 상태)
-        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 32)
+        # 3. PLIF 스파이크 발화 (순정 Soft Reset)
+        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 8)
         
-        # 🔥 핵심 수술: 시간 정보 보존 + 공간 압축 (기울기 100% 생존)
-        
-        # 481스텝을 깔끔하게 480으로 자르기
-        spikes = spikes[:, :, :480, :] # (B, 64, 480, 32)
-        
-        # 64개 전극 차원은 이미 GCN이 섞어놨으니 과감하게 평균(GAP) 내서 파라미터 폭발 방지
-        z_spatial_pooled = jnp.mean(spikes, axis=1) # (B, 480, 32)
+        # 🔥 핵심 수술: 공간(64전극) 정보는 절대 평균내지 않고 100% 보존!
+        spikes = spikes[:, :, :480, :] # (B, 64, 480, 8)
+        B, S, T, F = spikes.shape
         
         # 480스텝을 10개의 윈도우(0.3초)로 쪼개기
-        B, T, F = z_spatial_pooled.shape
-        spikes_chunked = z_spatial_pooled.reshape((B, 10, 48, F))
+        spikes_chunked = spikes.reshape((B, S, 10, 48, F))
         
-        # 윈도우 내부에서만 합산 (시간의 흐름 10단계가 그대로 살아남음!)
-        window_spikes = jnp.sum(spikes_chunked, axis=2) # (B, 10, 32)
+        # 윈도우 내부에서만 합산 (시간의 흐름 보존)
+        window_spikes = jnp.sum(spikes_chunked, axis=3) # (B, 64, 10, 8)
         
-        # (B, 320)으로 평탄화. 파라미터가 엄청나게 가벼움
+        # 64(공간) * 10(시간) * 8(피처) = 5120 차원으로 평탄화
         z_feat = window_spikes.reshape((B, -1)) 
         z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
-        # 최종 분류기
+        # 분류기 (파라미터 약 65만개로 매우 안정적)
         z_feat = nn.Dense(features=128)(z_feat)
         z_feat = nn.elu(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)

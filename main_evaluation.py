@@ -103,7 +103,7 @@ train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_tr
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
 # =========================================================
-# 2. SNN 코어 (대리 기울기 + 미분 가능한 Hard Reset)
+# 2. SNN 코어 (원래 잘 작동하던 순정 Soft Reset 복구)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(v):
@@ -115,39 +115,38 @@ def spike_fn_fwd(v):
 def spike_fn_bwd(res, g):
     v = res
     alpha = 2.0
-    # Surrogate Gradient (아크탄젠트 미분꼴)
     grad = g / (1.0 + (alpha * v)**2)
     return (grad,)
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
-class PLIFNode1D(nn.Module):
-    v_th: float = 0.5 
+class PLIFNode(nn.Module):
+    v_th: float = 0.5
 
     @nn.compact
     def __call__(self, x):
-        x_seq = jnp.moveaxis(x, 1, 0) 
-        # 초기값을 0.0으로 주어 sigmoid(0)=0.5
-        decay_param = self.param('decay', nn.initializers.constant(0.0), (x.shape[-1],))
+        # x shape: (B, 64, 481, Features)
+        x_seq = jnp.moveaxis(x, 2, 0) 
+        decay_param = self.param('decay', nn.initializers.constant(2.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
             
-            # 🔥 미분 가능한 Hard Reset (s가 1이면 v는 0이 되고, 미분 그래프는 보존됨)
-            v = v * (1.0 - s) 
+            # 🔥 가장 안정적으로 기울기를 전달하던 Soft Reset으로 롤백!
+            v = v - s * self.v_th 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
-        return jnp.moveaxis(spikes, 0, 1) 
+        return jnp.moveaxis(spikes, 0, 2)
 
 # =========================================================
-# 3. 모델 아키텍처: Dynamic Graph + 순정 Windowed SNN
+# 3. 모델 아키텍처: 순정 Dynamic Graph + 단순 합산(Rate Coding)
 # =========================================================
 class DynamicGraphAttention(nn.Module):
-    hidden_dim: int = 40 
+    hidden_dim: int = 32 # 넉넉한 공간 피처
 
     @nn.compact
     def __call__(self, x):
@@ -171,46 +170,29 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 1. 공간적 유기성 파악
-        z_gcn, _ = DynamicGraphAttention(hidden_dim=40)(x)
-        z_gcn_squeeze = z_gcn[..., 0] 
-        z_time_first = jnp.moveaxis(z_gcn_squeeze, 1, 2)
+        # 1. 공간 유기성 파악 (네 독창적 모델)
+        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=32)(x)
         
-        # 2. 시간 파동 필터링 (Depthwise)
-        z_temp = nn.Conv(
-            features=64, kernel_size=(64,), feature_group_count=64, 
-            padding='SAME', use_bias=False
-        )(z_time_first)
-        z_temp = nn.BatchNorm(use_running_average=not train)(z_temp)
-        z_temp = nn.elu(z_temp)
-        z_temp = nn.Dropout(rate=0.2, deterministic=not train)(z_temp)
+        # 2. 시간 파동 추출
+        z_ann = nn.Conv(features=32, kernel_size=(1, 64), padding='SAME')(z_gcn)
+        z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
+        z_ann = nn.elu(z_ann)
+        z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # 3. 가상 피질 압축
-        z_spatial = nn.Dense(features=40, use_bias=False)(z_temp)
-        z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
-        z_spatial = nn.elu(z_spatial)
-        z_spatial = nn.Dropout(rate=0.2, deterministic=not train)(z_spatial)
+        # 3. PLIF 스파이크 발화
+        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 32)
         
-        # 4. PLIF 발화
-        spikes = PLIFNode1D(v_th=0.5)(z_spatial) 
+        # 4. 🔥 모든 꼬인 로직 제거, 가장 확실했던 '단순 합산' 복구
+        spike_count = jnp.sum(spikes, axis=2) # (B, 64, 32)
+        z_feat = spike_count.reshape((spike_count.shape[0], -1)) 
         
-        # 5. Windowed Rate Coding (가장 강력하고 미분 손실 없는 방법)
-        B, T, F = spikes.shape
-        window_size = 24
-        pad_len = (window_size - (T % window_size)) % window_size
-        spikes_padded = jnp.pad(spikes, ((0,0), (0, pad_len), (0,0)))
-        num_windows = spikes_padded.shape[1] // window_size
-        
-        spikes_chunked = spikes_padded.reshape((B, num_windows, window_size, F))
-        window_spikes = jnp.sum(spikes_chunked, axis=2) # 윈도우 내 단순 합산
-        
-        # 6. 시간축 특징 평탄화 및 최종 분류기
-        z_feat = window_spikes.reshape((B, -1))
-        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
+        # 5. 분류기 
+        z_feat = nn.LayerNorm()(z_feat)
+        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
         z_feat = nn.Dense(features=256)(z_feat)
         z_feat = nn.elu(z_feat)
-        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
+        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
         logits = nn.Dense(features=4)(z_feat)
         

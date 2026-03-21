@@ -208,9 +208,9 @@ class DPSpikingDecoder(nn.Module):
         
         # 최종 분류기를 위해 평탄화
         return attended_out.reshape((B, -1))
-    
-class DynamicGraphAttention(nn.Module):
-    hidden_dim: int = 16
+    class DynamicGraphAttention(nn.Module):
+    # 🔥 수술 1: 특징 추출 차원을 16 -> 32로 2배 확장
+    hidden_dim: int = 32
 
     @nn.compact
     def __call__(self, x):
@@ -234,24 +234,33 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=16)(x)
+        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=32)(x)
         
-        z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
+        # 공간 피처를 32차원으로 넉넉하게 추출
+        z_ann = nn.Conv(features=32, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # PLIF 뉴런 스파이크 발화
+        # PLIF 뉴런 스파이크 발화 (출력 차원: B, 64, 481, 32)
         spikes = PLIFNode(v_th=0.5)(z_ann) 
         
-        # 🔥 완벽하게 재현된 DP-Spiking Decoder 투입
-        z_feat = DPSpikingDecoder()(spikes, train)
+        # Rate Coding (시간축 합산) -> (B, 64, 32)
+        spike_count = jnp.sum(spikes, axis=2) 
+        z_feat_flat = spike_count.reshape((spike_count.shape[0], -1)) # (B, 2048)
         
-        z_feat = nn.LayerNorm()(z_feat)
+        # 🔥 수술 2 & 3: Flatten된 피처를 바로 4-Class로 꽂지 않고, 중간 융합층(Dense 256) 추가
+        z_feat = nn.LayerNorm()(z_feat_flat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
+        
+        z_feat = nn.Dense(features=256)(z_feat)
+        z_feat = nn.elu(z_feat)
+        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
+        
+        # 최종 분류기
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, z_feat
+        return logits, z_feat_flat
             
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)

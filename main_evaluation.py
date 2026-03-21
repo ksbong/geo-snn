@@ -101,27 +101,11 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
-
 # =========================================================
-# 2. SNN 코어 (PLIF + LI 뉴런)
+# 2. SNN 코어 (Hard Reset으로 발작 완벽 차단)
 # =========================================================
-@jax.custom_vjp
-def spike_fn(v):
-    return jnp.where(v > 0, 1.0, 0.0)
-
-def spike_fn_fwd(v):
-    return spike_fn(v), v
-
-def spike_fn_bwd(res, g):
-    v = res
-    alpha = 2.0
-    grad = g / (1.0 + (alpha * v)**2)
-    return (grad,)
-
-spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
-
 class PLIFNode1D(nn.Module):
-    v_th: float = 0.5
+    v_th: float = 0.5 # 🔥 임계값을 다시 0.5로 정상화
 
     @nn.compact
     def __call__(self, x):
@@ -132,62 +116,46 @@ class PLIFNode1D(nn.Module):
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
-            v = v - s * self.v_th
+            
+            # 🔥 핵심 수술: Soft Reset -> Hard Reset
+            # 스파이크가 터지면 전압을 무조건 0으로 강제 방전시켜서 무한 발화 루프를 끊음
+            v = jnp.where(s > 0, 0.0, v) 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
         return jnp.moveaxis(spikes, 0, 1) 
 
-class LINode1D(nn.Module):
-    tau: float = 2.0
-    
-    @nn.compact
-    def __call__(self, x):
-        x_seq = jnp.moveaxis(x, 1, 0) 
-        
-        def scan_fn(v, x_t):
-            v = v * (1.0 - 1.0/self.tau) + x_t
-            return v, v
-
-        v_init = jnp.zeros_like(x_seq[0])
-        _, potentials = jax.lax.scan(scan_fn, v_init, x_seq)
-        return jnp.moveaxis(potentials, 0, 1)
-
 # =========================================================
-# 3. Latent Cortical SNN + DP-Pooling (Temporal-First 완전체)
+# 3. Latent Cortical SNN (호출부 수정)
 # =========================================================
 class LatentCorticalSNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
         x_squeeze = x[..., 0] 
-        x_time_first = jnp.moveaxis(x_squeeze, 1, 2) # (B, 481, 64)
+        x_time_first = jnp.moveaxis(x_squeeze, 1, 2)
         
-        # 1. Temporal First (주파수 파동 먼저 독립적으로 추출)
+        # 1. Temporal First 
         z_temp = nn.Conv(
-            features=64, 
-            kernel_size=(64,), 
-            feature_group_count=64, 
-            padding='SAME',
-            use_bias=False
+            features=64, kernel_size=(64,), feature_group_count=64, 
+            padding='SAME', use_bias=False
         )(x_time_first)
         z_temp = nn.BatchNorm(use_running_average=not train)(z_temp)
         z_temp = nn.elu(z_temp)
         z_temp = nn.Dropout(rate=0.2, deterministic=not train)(z_temp)
         
-        # 2. Spatial Projection (깨끗한 주파수를 40개의 가상 피질로 묶음)
+        # 2. Spatial Projection 
         z_spatial = nn.Dense(features=40, use_bias=False)(z_temp)
         z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
         z_spatial = nn.elu(z_spatial)
         z_spatial = nn.Dropout(rate=0.2, deterministic=not train)(z_spatial)
         
-        # 3. PLIF 스파이크 발화 (🔥 임계값을 0.15로 대폭 낮춰 뇌사 방지!)
-        spikes = PLIFNode1D(v_th=0.15)(z_spatial) # (B, 481, 40)
+        # 3. PLIF 스파이크 발화 (🔥 v_th 0.5 적용)
+        spikes = PLIFNode1D(v_th=0.5)(z_spatial) 
         
-        # 4. LI 뉴런 (전위 누적)
+        # 4. LI 뉴런 및 DP-Pooling
         potentials = LINode1D(tau=2.0)(spikes) 
         
-        # 5. DP-Pooling (시간 변화량 캐치)
         L_dp, N_dp = 24, 12
         B, T, F = potentials.shape
         pad_len = (L_dp - (T % L_dp)) % L_dp
@@ -195,10 +163,9 @@ class LatentCorticalSNN(nn.Module):
         num_windows = v_padded.shape[1] // L_dp 
         
         v_chunked = v_padded.reshape((B, num_windows, L_dp, F))
-        
         first_part = jnp.mean(v_chunked[:, :, :N_dp, :], axis=2)
         last_part = jnp.mean(v_chunked[:, :, -N_dp:, :], axis=2)
-        dp_out = last_part - first_part # (B, 21, 40)
+        dp_out = last_part - first_part 
         
         # 6. Temporal Attention
         dp_flat = dp_out.reshape((B, -1)) 
@@ -208,17 +175,15 @@ class LatentCorticalSNN(nn.Module):
         ta_weights = jax.nn.softmax(ta_fc2, axis=-1)
         ta_weights_exp = jnp.expand_dims(ta_weights, axis=-1)
         
-        attended_out = dp_out * ta_weights_exp # (B, 21, 40)
+        attended_out = dp_out * ta_weights_exp 
         
         # 7. 최종 분류기
         z_feat = attended_out.reshape((B, -1))
         z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
-        
         logits = nn.Dense(features=4)(z_feat)
         
-        # 🔥 발화율 모니터링을 위해 spikes 텐서를 같이 반환
         return logits, dp_flat, spikes
-
+    
 # =========================================================
 # 4. 학습 루프 (발화율 모니터링 + 안정적 LR)
 # =========================================================

@@ -144,7 +144,7 @@ class PLIFNode1D(nn.Module):
         return jnp.moveaxis(spikes, 0, 1) # (Batch, Time, Features) 복구
 
 # =========================================================
-# 3. Latent Cortical SNN (극초경량 독창적 아키텍처)
+# 3. Latent Cortical SNN (수학적 결함 완벽 수정본)
 # =========================================================
 class LatentCorticalSNN(nn.Module):
     @nn.compact
@@ -155,38 +155,41 @@ class LatentCorticalSNN(nn.Module):
         # JAX의 시계열 처리를 위해 축 변경 -> (B, 481, 64)
         x_time_first = jnp.moveaxis(x_squeeze, 1, 2)
         
-        # 🔥 노벨티 1: Spatial Projection (공간 투영)
-        # 64개의 물리적 전극 신호를 16개의 '가상 대뇌 피질(Latent Region)'로 압축
-        # 파라미터 단 1,024개로 공간의 본질적 특징을 뽑음
-        z_spatial = nn.Dense(features=16, use_bias=False)(x_time_first) # (B, 481, 16)
+        # 🔥 수정 1: Spatial Projection 후 비선형 함수(ELU) 추가! (선형 붕괴 방지)
+        z_spatial = nn.Dense(features=16, use_bias=False)(x_time_first)
+        z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
+        z_spatial = nn.elu(z_spatial) 
+        z_spatial = nn.Dropout(rate=0.5, deterministic=not train)(z_spatial)
         
-        # 🔥 노벨티 2: Depthwise Temporal Conv (독립적 시간 필터링)
-        # 16개의 피질 영역 신호를 서로 섞지 않고 '각각 독립적으로' 64스텝(0.4초) 동안 필터링
-        # feature_group_count=16을 통해 연산량을 극단적으로 줄임
+        # Depthwise Temporal Conv (독립적 시간 필터링)
         z_temporal = nn.Conv(
             features=16, 
             kernel_size=(64,), 
-            feature_group_count=16, # Depthwise의 핵심
+            feature_group_count=16, 
             padding='SAME',
             use_bias=False
-        )(z_spatial) # (B, 481, 16)
-        
+        )(z_spatial)
         z_temporal = nn.BatchNorm(use_running_average=not train)(z_temporal)
         z_temporal = nn.elu(z_temporal)
         z_temporal = nn.Dropout(rate=0.5, deterministic=not train)(z_temporal)
         
-        # 🔥 노벨티 3: PLIF 뉴런 발화
+        # PLIF 뉴런 발화
         spikes = PLIFNode1D(v_th=0.5)(z_temporal) # (B, 481, 16)
         
-        # Rate Coding: 전체 시간 동안 터진 스파이크 비율 계산
-        spike_rate = jnp.mean(spikes, axis=1) # (B, 16)
+        # 🔥 수정 2: mean 대신 sum 사용! (기울기 소멸 완벽 차단)
+        spike_count = jnp.sum(spikes, axis=1) # (B, 16)
         
-        # 최종 분류기 (파라미터 단 64개)
-        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(spike_rate)
+        # 🔥 수정 3: 16개의 가상 피질 특징을 조합할 수 있는 가벼운 융합층 제공
+        z_feat = nn.LayerNorm()(spike_count)
+        z_feat = nn.Dense(features=64)(z_feat)
+        z_feat = nn.elu(z_feat)
+        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
+        
+        # 최종 분류기
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, spike_rate
-            
+        return logits, spike_count
+    
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)
 # =========================================================

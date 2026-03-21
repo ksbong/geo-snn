@@ -101,8 +101,9 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
-# =========================================================
-# 2. SNN 코어 (SuperSpike 대리 기울기 + Hard Reset)
+
+    # =========================================================
+# 2. SNN 코어 (기생 기울기 완벽 차단!)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(v):
@@ -114,7 +115,7 @@ def spike_fn_fwd(v):
 def spike_fn_bwd(res, g):
     v = res
     alpha = 2.0
-    # 🔥 꼬리가 길어 죽은 뉴런도 살려내는 SuperSpike(ATan) 기울기
+    # SuperSpike 대리 기울기
     grad = g / (1.0 + jnp.abs(alpha * v)) ** 2
     return (grad,)
 
@@ -128,12 +129,12 @@ class PLIFNode(nn.Module):
         x_seq = jnp.moveaxis(x, 2, 0) 
 
         def scan_fn(v, x_t):
-            # 🔥 어설픈 학습 대신 가장 안정적인 0.8 고정 Decay 사용
+            # 안정적인 0.8 Decay
             v = v * 0.8 + x_t
             s = spike_fn(v - self.v_th)
             
-            # 🔥 Hard Reset: 스파이크 발화 후 전압 0으로 완전 방전
-            v = v * (1.0 - s) 
+            # 🔥 기적의 1줄: stop_gradient로 역전파 충돌(기생 기울기) 완벽 차단
+            v = v * (1.0 - jax.lax.stop_gradient(s))
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])

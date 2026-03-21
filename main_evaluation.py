@@ -101,9 +101,8 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
-
 # =========================================================
-# 2. SNN 코어 (원래 잘 작동하던 순정 Soft Reset 복구)
+# 2. SNN 코어 (장기 기억 PLIF)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(v):
@@ -125,17 +124,17 @@ class PLIFNode(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        # x shape: (B, 64, 481, Features)
+        # x shape: (B, 64, 60, Features)
         x_seq = jnp.moveaxis(x, 2, 0) 
-        decay_param = self.param('decay', nn.initializers.constant(2.0), (x.shape[-1],))
+        
+        # 🔥 수술 1: Decay 초기값을 3.0 (sigmoid(3.0) ≈ 0.95)으로 줘서 기울기가 끝까지 살아남게 세팅
+        decay_param = self.param('decay', nn.initializers.constant(3.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
             decay = jax.nn.sigmoid(decay_param)
             v = v * decay + x_t
             s = spike_fn(v - self.v_th)
-            
-            # 🔥 가장 안정적으로 기울기를 전달하던 Soft Reset으로 롤백!
-            v = v - s * self.v_th 
+            v = v - s * self.v_th # 순정 Soft Reset
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
@@ -143,10 +142,10 @@ class PLIFNode(nn.Module):
         return jnp.moveaxis(spikes, 0, 2)
 
 # =========================================================
-# 3. 모델 아키텍처: 순정 Dynamic Graph + 단순 합산(Rate Coding)
+# 3. 모델 아키텍처: Dynamic Graph + Temporal Pooling + SNN
 # =========================================================
 class DynamicGraphAttention(nn.Module):
-    hidden_dim: int = 32 # 넉넉한 공간 피처
+    hidden_dim: int = 32
 
     @nn.compact
     def __call__(self, x):
@@ -170,36 +169,32 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 1. 공간 유기성 파악 (Dynamic Graph)
-        z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
+        # 1. 공간 유기성 파악
+        z_gcn, _ = DynamicGraphAttention(hidden_dim=32)(x)
         
-        # 2. 시간 파동 추출 
-        # 🔥 피처를 8개로 극단적 다이어트 (뒤에서 공간 채널을 살리기 위함)
-        z_ann = nn.Conv(features=8, kernel_size=(1, 64), padding='SAME')(z_gcn)
+        # 2. 시간 파동 추출 (ANN)
+        z_ann = nn.Conv(features=32, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # 3. PLIF 스파이크 발화 (순정 Soft Reset)
-        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 8)
+        # 🔥 수술 2: Temporal Pooling (EEGNet 국룰 적용)
+        # 시간축(481스텝)을 8칸씩 묶어 평균냄 -> 약 60스텝으로 압축!
+        # 여기서 BPTT 기울기 소멸 문제가 100% 해결됨
+        z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8)) 
         
-        # 🔥 핵심 수술: 공간(64전극) 정보는 절대 평균내지 않고 100% 보존!
-        spikes = spikes[:, :, :480, :] # (B, 64, 480, 8)
-        B, S, T, F = spikes.shape
+        # 3. PLIF 스파이크 발화 (압축된 60스텝만 처리)
+        spikes = PLIFNode(v_th=0.5)(z_pooled) # (B, 64, 60, 32)
         
-        # 480스텝을 10개의 윈도우(0.3초)로 쪼개기
-        spikes_chunked = spikes.reshape((B, S, 10, 48, F))
+        # 4. 단순 합산(Rate Coding) - 이제 60스텝만 더하므로 시간 정보가 뭉개지지 않음
+        spike_count = jnp.sum(spikes, axis=2) # (B, 64, 32)
+        z_feat = spike_count.reshape((spike_count.shape[0], -1)) 
         
-        # 윈도우 내부에서만 합산 (시간의 흐름 보존)
-        window_spikes = jnp.sum(spikes_chunked, axis=3) # (B, 64, 10, 8)
-        
-        # 64(공간) * 10(시간) * 8(피처) = 5120 차원으로 평탄화
-        z_feat = window_spikes.reshape((B, -1)) 
+        # 5. 분류기 
         z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
-        # 분류기 (파라미터 약 65만개로 매우 안정적)
-        z_feat = nn.Dense(features=128)(z_feat)
+        z_feat = nn.Dense(features=256)(z_feat)
         z_feat = nn.elu(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         

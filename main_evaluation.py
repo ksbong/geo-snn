@@ -208,7 +208,7 @@ class DPSpikingDecoder(nn.Module):
         
         # 최종 분류기를 위해 평탄화
         return attended_out.reshape((B, -1))
-    class DynamicGraphAttention(nn.Module):
+class DynamicGraphAttention(nn.Module):
     # 🔥 수술 1: 특징 추출 차원을 16 -> 32로 2배 확장
     hidden_dim: int = 32
 

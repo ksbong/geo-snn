@@ -179,27 +179,36 @@ class DPSpikingDecoder(nn.Module):
         pad_len = (self.L_dp - (T % self.L_dp)) % self.L_dp
         v_padded = jnp.pad(v_pooled, ((0,0), (0, pad_len), (0,0)))
         T_new = v_padded.shape[1]
-        num_windows = T_new // self.L_dp
+        num_windows = T_new // self.L_dp # 21개 윈도우
         
         v_chunked = v_padded.reshape((B, num_windows, self.L_dp, F))
         
         # 4. DP-Pooling 연산 (앞뒤 평균의 차이 추출)
         first_part = jnp.mean(v_chunked[:, :, :self.N_dp, :], axis=2)
         last_part = jnp.mean(v_chunked[:, :, -self.N_dp:, :], axis=2)
-        dp_out = last_part - first_part # (B, num_windows, F)
+        dp_out = last_part - first_part # (B, 21, 16)
         
-        # 5. Temporal Attention (TA) - 논문 수식 (12) 적용
-        ta_fc1 = nn.Dense(features=num_windows // 2)(dp_out)
+        # 5. Temporal Attention (TA) - 차원 에러 완벽 해결
+        # 먼저 평탄화하여 21개 윈도우 전체의 글로벌 문맥 파악
+        dp_flat = dp_out.reshape((B, -1)) # (B, 21 * 16)
+        
+        ta_fc1 = nn.Dense(features=num_windows // 2)(dp_flat) # (B, 10)
         ta_relu = nn.relu(ta_fc1)
-        ta_fc2 = nn.Dense(features=num_windows)(ta_relu)
-        ta_weights = jax.nn.softmax(ta_fc2, axis=1) # (B, num_windows, F)
+        ta_fc2 = nn.Dense(features=num_windows)(ta_relu) # (B, 21)
+        
+        # 21개 윈도우 각각의 중요도 가중치 산출
+        ta_weights = jax.nn.softmax(ta_fc2, axis=-1) # (B, 21)
+        
+        # 브로드캐스팅을 위해 (B, 21, 1)로 차원 확장
+        ta_weights_expanded = jnp.expand_dims(ta_weights, axis=-1) 
         
         # 6. Hadamard product (중요한 시간 구간의 특징 증폭)
-        attended_out = dp_out * ta_weights
+        # (B, 21, 16) * (B, 21, 1) -> 완벽한 차원 매칭
+        attended_out = dp_out * ta_weights_expanded 
         
-        # 최종 평탄화
+        # 최종 분류기를 위해 평탄화
         return attended_out.reshape((B, -1))
-
+    
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 16
 

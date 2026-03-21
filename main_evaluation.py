@@ -145,67 +145,89 @@ class PLIFNode1D(nn.Module):
 # =========================================================
 # 3. Dynamic Graph SNN (완전체 귀환)
 # =========================================================
-class DynamicGraphAttention(nn.Module):
-    hidden_dim: int = 40 # 가상 피질 수에 맞춤
-
+# =========================================================
+# 3. Latent Cortical SNN (Temporal-First 완벽 수정본)
+# =========================================================
+class LINode1D(nn.Module):
+    # 스파이크를 받아 막전위(Potential)만 누적하는 특수 뉴런
+    tau: float = 2.0
+    
     @nn.compact
     def __call__(self, x):
-        x_squeeze = x[..., 0] 
-        x_energy = jnp.var(x_squeeze, axis=-1, keepdims=True) 
+        x_seq = jnp.moveaxis(x, 1, 0) # (T, B, F)
         
-        Q = nn.Dense(self.hidden_dim)(x_energy) 
-        K = nn.Dense(self.hidden_dim)(x_energy) 
-        
-        scale = self.hidden_dim ** -0.5
-        attn = jnp.einsum('b i h, b j h -> b i j', Q, K) * scale
-        
-        eye = jnp.eye(64, dtype=bool)
-        attn = jnp.where(eye, -1e9, attn)
-        attn_weights = jax.nn.softmax(attn, axis=-1)
-        
-        out = jnp.einsum('b i j, b j t -> b i t', attn_weights, x_squeeze)
-        # Residual Connection
-        out = jnp.expand_dims(out, -1) + x 
-        return out, attn_weights
+        def scan_fn(v, x_t):
+            v = v * (1.0 - 1.0/self.tau) + x_t
+            return v, v
+
+        v_init = jnp.zeros_like(x_seq[0])
+        _, potentials = jax.lax.scan(scan_fn, v_init, x_seq)
+        return jnp.moveaxis(potentials, 0, 1) # (B, 481, F)
 
 class LatentCorticalSNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 🔥 네 노벨티의 핵심: Dynamic Graph Attention 복구
-        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=40)(x)
+        x_squeeze = x[..., 0] 
+        x_time_first = jnp.moveaxis(x_squeeze, 1, 2) # (B, 481, 64)
         
-        z_gcn_squeeze = z_gcn[..., 0]
-        z_time_first = jnp.moveaxis(z_gcn_squeeze, 1, 2) # (B, 481, 64)
-        
-        # 공간 피처를 40개로 압축 (선형 붕괴 방지)
-        z_spatial = nn.Dense(features=40, use_bias=False)(z_time_first)
-        z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
-        z_spatial = nn.elu(z_spatial) 
-        z_spatial = nn.Dropout(rate=0.1, deterministic=not train)(z_spatial)
-        
-        # Depthwise Temporal Conv (독립적 시간 필터링)
-        z_temporal = nn.Conv(
-            features=40, 
+        # 🔥 수술 1: 주파수 추출 무조건 먼저! (Temporal First)
+        # 64개 채널을 섞지 않고 독립적으로(feature_group_count=64) 시간 파동만 추출
+        z_temp = nn.Conv(
+            features=64, 
             kernel_size=(64,), 
-            feature_group_count=40, 
+            feature_group_count=64, 
             padding='SAME',
             use_bias=False
-        )(z_spatial)
-        z_temporal = nn.BatchNorm(use_running_average=not train)(z_temporal)
-        z_temporal = nn.elu(z_temporal)
-        z_temporal = nn.Dropout(rate=0.1, deterministic=not train)(z_temporal)
+        )(x_time_first)
+        z_temp = nn.BatchNorm(use_running_average=not train)(z_temp)
+        z_temp = nn.elu(z_temp)
+        z_temp = nn.Dropout(rate=0.2, deterministic=not train)(z_temp)
         
-        # PLIF 뉴런 발화
-        spikes = PLIFNode1D(v_th=0.5)(z_temporal) # (B, 481, 40)
+        # 🔥 수술 2: 깨끗한 주파수가 뽑힌 상태에서 공간 투영 (Spatial)
+        z_spatial = nn.Dense(features=40, use_bias=False)(z_temp)
+        z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
+        z_spatial = nn.elu(z_spatial)
+        z_spatial = nn.Dropout(rate=0.2, deterministic=not train)(z_spatial)
         
-        # 스파이크 총합 (Rate Coding)
-        spike_count = jnp.sum(spikes, axis=1) # (B, 40)
+        # PLIF 뉴런 스파이크 발화
+        spikes = PLIFNode1D(v_th=0.5)(z_spatial) # (B, 481, 40)
         
-        # 최종 융합 및 분류
-        z_feat = nn.Dropout(rate=0.2, deterministic=not train)(spike_count)
+        # 🔥 수술 3: LI 뉴런을 통한 전위 누적 및 DP-Pooling
+        potentials = LINode1D(tau=2.0)(spikes) # (B, 481, 40)
+        
+        # 24스텝(L_dp) 단위 윈도우 분할
+        L_dp, N_dp = 24, 12
+        B, T, F = potentials.shape
+        pad_len = (L_dp - (T % L_dp)) % L_dp
+        v_padded = jnp.pad(potentials, ((0,0), (0, pad_len), (0,0)))
+        num_windows = v_padded.shape[1] // L_dp # 21개 윈도우
+        
+        v_chunked = v_padded.reshape((B, num_windows, L_dp, F))
+        
+        # 앞부분 평균과 뒷부분 평균의 차이(Diff) 계산
+        first_part = jnp.mean(v_chunked[:, :, :N_dp, :], axis=2)
+        last_part = jnp.mean(v_chunked[:, :, -N_dp:, :], axis=2)
+        dp_out = last_part - first_part # (B, 21, 40)
+        
+        # 시간 어텐션 (Temporal Attention)
+        dp_flat = dp_out.reshape((B, -1)) # (B, 840)
+        ta_fc1 = nn.Dense(features=num_windows // 2)(dp_flat)
+        ta_relu = nn.relu(ta_fc1)
+        ta_fc2 = nn.Dense(features=num_windows)(ta_relu)
+        ta_weights = jax.nn.softmax(ta_fc2, axis=-1)
+        ta_weights_exp = jnp.expand_dims(ta_weights, axis=-1)
+        
+        # 중요한 윈도우 특징 증폭
+        attended_out = dp_out * ta_weights_exp # (B, 21, 40)
+        
+        # 최종 분류기 (파라미터 폭발 없이 안정적)
+        z_feat = attended_out.reshape((B, -1))
+        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
+        
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, spike_count
+        return logits, dp_flat # mmd_loss 호환용 리턴
+    
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)
 # =========================================================

@@ -145,8 +145,38 @@ class PLIFNode(nn.Module):
         return jnp.moveaxis(spikes, 0, 2)
 
 # =========================================================
-# 3. 하이브리드 SNN 아키텍처
+# 3. 하이브리드 SNN 아키텍처 (DP-Pooling 완전 이식)
 # =========================================================
+class DPPooling(nn.Module):
+    # 논문에 기재된 최적 파라미터 [L_DP, N_DP] = [24, 12]
+    L_dp: int = 24
+    N_dp: int = 12
+
+    @nn.compact
+    def __call__(self, x):
+        # x shape: (B, Spatial=64, Time=481, Features=16)
+        B, S, T, F = x.shape
+        
+        # 1. 시간축(T)을 L_dp(24)로 깔끔하게 나누기 위해 패딩
+        pad_len = (self.L_dp - (T % self.L_dp)) % self.L_dp
+        x_padded = jnp.pad(x, ((0,0), (0,0), (0, pad_len), (0,0)))
+        
+        T_new = x_padded.shape[2]
+        
+        # 2. 시간축을 윈도우(Chunk) 단위로 쪼개기
+        # (B, 64, 481+23, 16) -> (B, 64, 21개 윈도우, 24 길이, 16 피처)
+        x_chunked = x_padded.reshape((B, S, T_new // self.L_dp, self.L_dp, F))
+        
+        # 3. 논문의 핵심 수식: 앞부분 평균과 뒷부분 평균의 차이(Difference) 계산
+        first_part = jnp.mean(x_chunked[:, :, :, :self.N_dp, :], axis=3)
+        last_part = jnp.mean(x_chunked[:, :, :, -self.N_dp:, :], axis=3)
+        
+        # 파동의 변화량(Diff-Potential) 추출
+        dp_out = last_part - first_part # (B, 64, 21, 16)
+        
+        # 최종 분류기를 위해 1D 벡터로 평탄화
+        return dp_out.reshape((B, -1))
+
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 16
 
@@ -174,25 +204,23 @@ class Hybrid_SOTA_SNN(nn.Module):
     def __call__(self, x, train: bool = True):
         z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # 🔥 핵심 수술 2: 시간축 수용 영역(Receptive Field) 대폭 확장 (15 -> 64)
-        # 이제 모델이 한 번에 0.4초 분량의 뇌파 파동을 덩어리째 인식함
         z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        # LIF 대신 PLIF 투입
-        spikes = PLIFNode(v_th=0.5)(z_ann) 
+        # PLIF 뉴런 적용
+        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 16)
         
-        spike_count = jnp.sum(spikes, axis=2) 
-        z_feat = spike_count.reshape((spike_count.shape[0], -1))
+        # 🔥 단순 sum()을 지우고 SOTA의 핵심인 DP-Pooling 연결
+        z_feat = DPPooling(L_dp=24, N_dp=12)(spikes)
         
         z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, z_feat
-    
+        
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)
 # =========================================================

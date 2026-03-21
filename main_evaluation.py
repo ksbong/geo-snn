@@ -146,50 +146,47 @@ class PLIFNode1D(nn.Module):
 # =========================================================
 # 3. Latent Cortical SNN (수학적 결함 완벽 수정본)
 # =========================================================
+# =========================================================
+# 3. Latent Cortical SNN (용량 확장 및 Dropout 최적화)
+# =========================================================
 class LatentCorticalSNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # x shape: (B, 64, 481, 1)
-        x_squeeze = x[..., 0] # (B, 64, 481)
-        
-        # JAX의 시계열 처리를 위해 축 변경 -> (B, 481, 64)
+        x_squeeze = x[..., 0] 
         x_time_first = jnp.moveaxis(x_squeeze, 1, 2)
         
-        # 🔥 수정 1: Spatial Projection 후 비선형 함수(ELU) 추가! (선형 붕괴 방지)
-        z_spatial = nn.Dense(features=16, use_bias=False)(x_time_first)
+        # 🔥 수술 1: 가상 피질 피처를 40개로 넉넉하게 확장
+        z_spatial = nn.Dense(features=40, use_bias=False)(x_time_first)
         z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
         z_spatial = nn.elu(z_spatial) 
-        z_spatial = nn.Dropout(rate=0.5, deterministic=not train)(z_spatial)
+        # 🔥 수술 2: 가혹했던 Dropout 0.5 -> 0.1 로 완화
+        z_spatial = nn.Dropout(rate=0.1, deterministic=not train)(z_spatial)
         
         # Depthwise Temporal Conv (독립적 시간 필터링)
         z_temporal = nn.Conv(
-            features=16, 
+            features=40, 
             kernel_size=(64,), 
-            feature_group_count=16, 
+            feature_group_count=40, # 40개 피처 각각 독립적으로 필터링
             padding='SAME',
             use_bias=False
         )(z_spatial)
         z_temporal = nn.BatchNorm(use_running_average=not train)(z_temporal)
         z_temporal = nn.elu(z_temporal)
-        z_temporal = nn.Dropout(rate=0.5, deterministic=not train)(z_temporal)
+        z_temporal = nn.Dropout(rate=0.1, deterministic=not train)(z_temporal)
         
         # PLIF 뉴런 발화
-        spikes = PLIFNode1D(v_th=0.5)(z_temporal) # (B, 481, 16)
+        spikes = PLIFNode1D(v_th=0.5)(z_temporal) # (B, 481, 40)
         
-        # 🔥 수정 2: mean 대신 sum 사용! (기울기 소멸 완벽 차단)
-        spike_count = jnp.sum(spikes, axis=1) # (B, 16)
+        # 스파이크 총합 (기울기 소멸 방지)
+        spike_count = jnp.sum(spikes, axis=1) # (B, 40)
         
-        # 🔥 수정 3: 16개의 가상 피질 특징을 조합할 수 있는 가벼운 융합층 제공
-        z_feat = nn.LayerNorm()(spike_count)
-        z_feat = nn.Dense(features=64)(z_feat)
-        z_feat = nn.elu(z_feat)
-        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
+        # 🔥 수술 3: 불필요한 LayerNorm 제거, 과적합 방지용 약한 Dropout만 남김
+        z_feat = nn.Dropout(rate=0.2, deterministic=not train)(spike_count)
         
-        # 최종 분류기
+        # 최종 분류기 (파라미터: 40 * 4 = 160개)
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, spike_count
-    
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)
 # =========================================================

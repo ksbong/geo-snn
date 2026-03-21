@@ -154,7 +154,7 @@ class LINode1D(nn.Module):
         return jnp.moveaxis(potentials, 0, 1)
 
 # =========================================================
-# 3. 모델 아키텍처: Dynamic Graph + Temporal Conv + DP-Pooling
+# 3. 모델 아키텍처: Dynamic Graph + Windowed Rate Coding
 # =========================================================
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 40 
@@ -181,13 +181,12 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 1. 공간적 유기성 파악 (네 독창적 아이디어)
+        # 1. 공간적 유기성 (Dynamic Graph Attention)
         z_gcn, _ = DynamicGraphAttention(hidden_dim=40)(x)
-        
         z_gcn_squeeze = z_gcn[..., 0] 
         z_time_first = jnp.moveaxis(z_gcn_squeeze, 1, 2) # (B, 481, 64)
         
-        # 2. 시간 파동 필터링 (주파수 추출)
+        # 2. 시간 파동 필터링
         z_temp = nn.Conv(
             features=64, kernel_size=(64,), feature_group_count=64, 
             padding='SAME', use_bias=False
@@ -196,45 +195,47 @@ class Hybrid_SOTA_SNN(nn.Module):
         z_temp = nn.elu(z_temp)
         z_temp = nn.Dropout(rate=0.2, deterministic=not train)(z_temp)
         
-        # 3. 가상 피질 압축 (40 채널)
+        # 3. 가상 피질 압축
         z_spatial = nn.Dense(features=40, use_bias=False)(z_temp)
         z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
         z_spatial = nn.elu(z_spatial)
         z_spatial = nn.Dropout(rate=0.2, deterministic=not train)(z_spatial)
         
-        # 4. PLIF 발화 (v_th = 0.5, Hard Reset 적용됨)
-        spikes = PLIFNode1D(v_th=0.5)(z_spatial) 
+        # 4. PLIF 발화 (v_th = 0.5, Hard Reset)
+        spikes = PLIFNode1D(v_th=0.5)(z_spatial) # (B, 481, 40)
         
-        # 5. LI 누적 및 DP-Pooling (논문 디코더 완벽 이식)
-        potentials = LINode1D(tau=2.0)(spikes) 
+        # 5. 🔥 죽어버린 LINode 삭제, "Windowed Rate Coding" 도입
+        # 481스텝을 24스텝 단위 윈도우로 쪼개서 sum (기울기 100% 보존)
+        B, T, F = spikes.shape
+        window_size = 24
+        pad_len = (window_size - (T % window_size)) % window_size
+        spikes_padded = jnp.pad(spikes, ((0,0), (0, pad_len), (0,0)))
+        num_windows = spikes_padded.shape[1] // window_size
         
-        L_dp, N_dp = 24, 12
-        B, T, F = potentials.shape
-        pad_len = (L_dp - (T % L_dp)) % L_dp
-        v_padded = jnp.pad(potentials, ((0,0), (0, pad_len), (0,0)))
-        num_windows = v_padded.shape[1] // L_dp 
+        spikes_chunked = spikes_padded.reshape((B, num_windows, window_size, F))
+        window_spikes = jnp.sum(spikes_chunked, axis=2) # (B, 21, 40)
         
-        v_chunked = v_padded.reshape((B, num_windows, L_dp, F))
-        first_part = jnp.mean(v_chunked[:, :, :N_dp, :], axis=2)
-        last_part = jnp.mean(v_chunked[:, :, -N_dp:, :], axis=2)
-        dp_out = last_part - first_part 
-        
-        # 6. Temporal Attention
-        dp_flat = dp_out.reshape((B, -1)) 
-        ta_fc1 = nn.Dense(features=num_windows // 2)(dp_flat)
-        ta_relu = nn.relu(ta_fc1)
-        ta_fc2 = nn.Dense(features=num_windows)(ta_relu)
+        # 6. Temporal Attention (중요한 시간대 증폭)
+        window_flat = window_spikes.reshape((B, -1)) 
+        ta_fc1 = nn.Dense(features=num_windows // 2)(window_flat)
+        ta_elu = nn.elu(ta_fc1) # ReLU 대신 ELU로 안정화
+        ta_fc2 = nn.Dense(features=num_windows)(ta_elu)
         ta_weights = jax.nn.softmax(ta_fc2, axis=-1)
         ta_weights_exp = jnp.expand_dims(ta_weights, axis=-1)
         
-        attended_out = dp_out * ta_weights_exp 
+        attended_out = window_spikes * ta_weights_exp # (B, 21, 40)
         
-        # 7. 최종 분류기
+        # 7. 넉넉한 융합층과 최종 분류기
         z_feat = attended_out.reshape((B, -1))
         z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
+        
+        z_feat = nn.Dense(features=256)(z_feat)
+        z_feat = nn.elu(z_feat)
+        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
+        
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, dp_flat, spikes
+        return logits, window_flat, spikes
 
 # =========================================================
 # 4. 학습 루프

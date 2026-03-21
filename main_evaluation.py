@@ -103,9 +103,8 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
-
 # =========================================================
-# 2. JAX 기반 SNN 코어 (Surrogate Gradient & lax.scan)
+# 2. PLIF (Parametric LIF) 뉴런 도입
 # =========================================================
 @jax.custom_vjp
 def spike_fn(v):
@@ -122,18 +121,23 @@ def spike_fn_bwd(res, g):
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
-class LIFNode(nn.Module):
-    tau: float = 2.0
+class PLIFNode(nn.Module):
     v_th: float = 0.5
 
     @nn.compact
     def __call__(self, x):
-        x_seq = jnp.moveaxis(x, 2, 0) # 시간을 앞으로
+        x_seq = jnp.moveaxis(x, 2, 0) # 시간을 앞으로 (481, B, 64, 16)
         
+        # 🔥 핵심 수술 1: 채널별로 기억력(망각 곡선)을 스스로 학습하는 파라미터 생성
+        # 초기값을 2.0으로 주어 sigmoid(2.0) ≈ 0.88의 긴 기억력으로 시작 유도
+        decay_param = self.param('decay', nn.initializers.constant(2.0), (x.shape[-1],))
+
         def scan_fn(v, x_t):
-            v = v * (1.0 - 1.0/self.tau) + x_t
+            # Sigmoid를 통과시켜 0~1 사이의 안정적인 망각률 보장
+            decay = jax.nn.sigmoid(decay_param)
+            v = v * decay + x_t
             s = spike_fn(v - self.v_th)
-            v = v - s * self.v_th
+            v = v - s * self.v_th # Hard reset
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
@@ -170,15 +174,16 @@ class Hybrid_SOTA_SNN(nn.Module):
     def __call__(self, x, train: bool = True):
         z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # 패딩 문제 해결
-        z_ann = nn.Conv(features=16, kernel_size=(1, 15), padding='SAME')(z_gcn)
+        # 🔥 핵심 수술 2: 시간축 수용 영역(Receptive Field) 대폭 확장 (15 -> 64)
+        # 이제 모델이 한 번에 0.4초 분량의 뇌파 파동을 덩어리째 인식함
+        z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
         z_ann = nn.elu(z_ann)
         z_ann = nn.Dropout(rate=0.5, deterministic=not train)(z_ann)
         
-        spikes = LIFNode(tau=2.0, v_th=0.5)(z_ann) 
+        # LIF 대신 PLIF 투입
+        spikes = PLIFNode(v_th=0.5)(z_ann) 
         
-        # 기울기 증폭 및 안정화
         spike_count = jnp.sum(spikes, axis=2) 
         z_feat = spike_count.reshape((spike_count.shape[0], -1))
         
@@ -187,7 +192,7 @@ class Hybrid_SOTA_SNN(nn.Module):
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, z_feat
-
+    
 # =========================================================
 # 4. 학습 루프 (JIT 최적화)
 # =========================================================

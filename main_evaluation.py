@@ -142,31 +142,52 @@ class PLIFNode1D(nn.Module):
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
         return jnp.moveaxis(spikes, 0, 1) # (Batch, Time, Features) 복구
+# =========================================================
+# 3. Dynamic Graph SNN (완전체 귀환)
+# =========================================================
+class DynamicGraphAttention(nn.Module):
+    hidden_dim: int = 40 # 가상 피질 수에 맞춤
 
-# =========================================================
-# 3. Latent Cortical SNN (수학적 결함 완벽 수정본)
-# =========================================================
-# =========================================================
-# 3. Latent Cortical SNN (용량 확장 및 Dropout 최적화)
-# =========================================================
+    @nn.compact
+    def __call__(self, x):
+        x_squeeze = x[..., 0] 
+        x_energy = jnp.var(x_squeeze, axis=-1, keepdims=True) 
+        
+        Q = nn.Dense(self.hidden_dim)(x_energy) 
+        K = nn.Dense(self.hidden_dim)(x_energy) 
+        
+        scale = self.hidden_dim ** -0.5
+        attn = jnp.einsum('b i h, b j h -> b i j', Q, K) * scale
+        
+        eye = jnp.eye(64, dtype=bool)
+        attn = jnp.where(eye, -1e9, attn)
+        attn_weights = jax.nn.softmax(attn, axis=-1)
+        
+        out = jnp.einsum('b i j, b j t -> b i t', attn_weights, x_squeeze)
+        # Residual Connection
+        out = jnp.expand_dims(out, -1) + x 
+        return out, attn_weights
+
 class LatentCorticalSNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        x_squeeze = x[..., 0] 
-        x_time_first = jnp.moveaxis(x_squeeze, 1, 2)
+        # 🔥 네 노벨티의 핵심: Dynamic Graph Attention 복구
+        z_gcn, attn_weights = DynamicGraphAttention(hidden_dim=40)(x)
         
-        # 🔥 수술 1: 가상 피질 피처를 40개로 넉넉하게 확장
-        z_spatial = nn.Dense(features=40, use_bias=False)(x_time_first)
+        z_gcn_squeeze = z_gcn[..., 0]
+        z_time_first = jnp.moveaxis(z_gcn_squeeze, 1, 2) # (B, 481, 64)
+        
+        # 공간 피처를 40개로 압축 (선형 붕괴 방지)
+        z_spatial = nn.Dense(features=40, use_bias=False)(z_time_first)
         z_spatial = nn.BatchNorm(use_running_average=not train)(z_spatial)
         z_spatial = nn.elu(z_spatial) 
-        # 🔥 수술 2: 가혹했던 Dropout 0.5 -> 0.1 로 완화
         z_spatial = nn.Dropout(rate=0.1, deterministic=not train)(z_spatial)
         
         # Depthwise Temporal Conv (독립적 시간 필터링)
         z_temporal = nn.Conv(
             features=40, 
             kernel_size=(64,), 
-            feature_group_count=40, # 40개 피처 각각 독립적으로 필터링
+            feature_group_count=40, 
             padding='SAME',
             use_bias=False
         )(z_spatial)
@@ -177,13 +198,11 @@ class LatentCorticalSNN(nn.Module):
         # PLIF 뉴런 발화
         spikes = PLIFNode1D(v_th=0.5)(z_temporal) # (B, 481, 40)
         
-        # 스파이크 총합 (기울기 소멸 방지)
+        # 스파이크 총합 (Rate Coding)
         spike_count = jnp.sum(spikes, axis=1) # (B, 40)
         
-        # 🔥 수술 3: 불필요한 LayerNorm 제거, 과적합 방지용 약한 Dropout만 남김
+        # 최종 융합 및 분류
         z_feat = nn.Dropout(rate=0.2, deterministic=not train)(spike_count)
-        
-        # 최종 분류기 (파라미터: 40 * 4 = 160개)
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, spike_count

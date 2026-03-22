@@ -103,7 +103,7 @@ train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_tr
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
 # =========================================================
-# 2. SNN 코어 (상봉의 통찰 적용: 이종 매개변수 학습형 PLIF)
+# 2. SNN 코어 (절대 죽지 않는 무한 꼬리 ATan + 이종 PLIF)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -113,9 +113,10 @@ def spike_fn_fwd(x):
     return spike_fn(x), x
 
 def spike_fn_bwd(res, g):
-    x = res 
-    # KIST 논문 검증 Triangle Surrogate (alpha=0.5)
-    grad = jnp.maximum(0.0, 1.0 - jnp.abs(x) / 0.5)
+    x = res # x는 (v - v_th)
+    alpha = 2.0
+    # 🔥 Triangle처럼 0으로 죽어버리지 않는 SuperSpike(ATan) 기울기
+    grad = 1.0 / (1.0 + jnp.square(alpha * x))
     return (g * grad,)
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
@@ -126,29 +127,26 @@ class PLIFNodeHetero(nn.Module):
         x_seq = jnp.moveaxis(x, 2, 0) # (T, B, Space, Features)
         feat_dim = x.shape[-1]
         
-        # 🔥 네 아이디어의 핵심: 피처별로 뉴런의 스펙을 다르게 학습!
-        # 감쇠계수(Decay) 학습 파라미터
-        decay_param = self.param('decay', nn.initializers.constant(0.0), (feat_dim,))
-        # 임계값(Threshold) 학습 파라미터
+        # 🔥 60스텝 BPTT 생존을 위해 초기 기억력을 0.88 수준으로 짱짱하게 세팅
+        decay_param = self.param('decay', nn.initializers.constant(2.0), (feat_dim,))
+        # 임계값은 0.5를 중심으로 학습을 시작하도록 세팅
         vth_param = self.param('v_th', nn.initializers.constant(0.0), (feat_dim,))
 
         def scan_fn(v, x_t):
-            # 시그모이드로 0~1 사이의 안전한 범위 내에서 각자 다른 스펙을 가짐
             decay = jax.nn.sigmoid(decay_param) 
-            # 임계값도 0.1 ~ 1.1 사이에서 뉴런마다 다르게 세팅됨
-            v_th = jax.nn.sigmoid(vth_param) + 0.1 
+            v_th = jax.nn.sigmoid(vth_param) 
             
             v = v * decay + x_t
             s = spike_fn(v - v_th)
             
-            # 미분 가능한 Hard Reset (stop_gradient 적용)
+            # 방전 시 역전파 꼬임 차단 (stop_gradient)
             v = v * (1.0 - jax.lax.stop_gradient(s)) 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
         _, spikes = jax.lax.scan(scan_fn, v_init, x_seq)
         return jnp.moveaxis(spikes, 0, 2)
-
+    
 # =========================================================
 # 3. 모델 아키텍처 (공간 보존 + 이종 PLIF)
 # =========================================================

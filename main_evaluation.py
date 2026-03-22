@@ -102,8 +102,8 @@ print(f"✅ 로딩 완료! Train: {X_train.shape}, Test: {X_test.shape}")
 train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_train)), batch_size=128, shuffle=True)
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
-    # =========================================================
-# 2. SNN 코어 (기생 기울기 완벽 차단!)
+# =========================================================
+# 2. SNN 코어 (장기 기억 + 기생 기울기 차단)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(v):
@@ -115,7 +115,6 @@ def spike_fn_fwd(v):
 def spike_fn_bwd(res, g):
     v = res
     alpha = 2.0
-    # SuperSpike 대리 기울기
     grad = g / (1.0 + jnp.abs(alpha * v)) ** 2
     return (grad,)
 
@@ -127,14 +126,17 @@ class PLIFNode(nn.Module):
     @nn.compact
     def __call__(self, x):
         x_seq = jnp.moveaxis(x, 2, 0) 
+        
+        # 🔥 481스텝 역전파를 버티기 위해 초기 Decay를 매우 높게(0.98) 설정
+        decay_param = self.param('decay', nn.initializers.constant(4.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
-            # 안정적인 0.8 Decay
-            v = v * 0.8 + x_t
+            decay = jax.nn.sigmoid(decay_param)
+            v = v * decay + x_t
             s = spike_fn(v - self.v_th)
             
-            # 🔥 기적의 1줄: stop_gradient로 역전파 충돌(기생 기울기) 완벽 차단
-            v = v * (1.0 - jax.lax.stop_gradient(s))
+            # stop_gradient로 방전 시 역전파 꼬임 완벽 차단
+            v = v * (1.0 - jax.lax.stop_gradient(s)) 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
@@ -142,7 +144,7 @@ class PLIFNode(nn.Module):
         return jnp.moveaxis(spikes, 0, 2)
 
 # =========================================================
-# 3. 모델 아키텍처 (ReLU 양수 강제 + Temporal Pooling)
+# 3. 모델 아키텍처: 풀링 삭제 및 주파수 100% 보존
 # =========================================================
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 16 
@@ -169,35 +171,35 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
+        # 1. 공간 유기성
         z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
         
-        z_ann = nn.Conv(features=16, kernel_size=(1, 64), padding='SAME')(z_gcn)
+        # 2. 시간 파동 추출 (Mu, Beta 대역을 정밀하게 타격하는 커널)
+        z_ann = nn.Conv(features=16, kernel_size=(1, 32), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
-        
-        # 🔥 핵심 1: ELU 대신 ReLU 사용! SNN에 무조건 양수(+) 전류만 공급하여 뇌사 방지
         z_ann = nn.relu(z_ann)
+        z_ann = nn.Dropout(rate=0.4, deterministic=not train)(z_ann)
         
-        # Temporal Pooling으로 BPTT 시간축 압축
-        z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8))
+        # 🔥 주파수를 믹서기에 갈아버리던 풀링 레이어 완전 삭제! 원본 160Hz 보존
         
-        # SNN 발화
-        spikes = PLIFNode(v_th=0.5)(z_pooled) 
+        # 3. SNN 발화 (481스텝 전체 처리)
+        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 16)
         
-        # 단순 합산(Rate Coding)
+        # 4. 단순 합산 (Rate Coding)
         spike_count = jnp.sum(spikes, axis=2) 
         z_feat = spike_count.reshape((spike_count.shape[0], -1)) 
         
+        # 5. 분류기
         z_feat = nn.LayerNorm()(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
         z_feat = nn.Dense(features=128)(z_feat)
-        z_feat = nn.elu(z_feat) # 여긴 SNN 뒤니까 ELU 써도 됨
+        z_feat = nn.elu(z_feat)
         z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, z_feat, spikes
-    
 # =========================================================
 # 4. 학습 루프
 # =========================================================

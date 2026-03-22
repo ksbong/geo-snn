@@ -103,40 +103,37 @@ train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_tr
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
 # =========================================================
-# 2. SNN 코어 (장기 기억 + 기생 기울기 차단)
+# 2. SNN 코어 (논문 검증 순정 Triangle 대리 기울기 + 고정 LIF)
 # =========================================================
 @jax.custom_vjp
-def spike_fn(v):
-    return jnp.where(v > 0, 1.0, 0.0)
+def spike_fn(x):
+    return jnp.where(x > 0, 1.0, 0.0)
 
-def spike_fn_fwd(v):
-    return spike_fn(v), v
+def spike_fn_fwd(x):
+    return spike_fn(x), x
 
 def spike_fn_bwd(res, g):
-    v = res
-    alpha = 2.0
-    grad = g / (1.0 + jnp.abs(alpha * v)) ** 2
-    return (grad,)
+    x = res # x는 (v - v_th)
+    # 🔥 논문에서 입증된 가장 강력하고 심플한 Triangle Surrogate Gradient
+    grad = jnp.maximum(0.0, 1.0 - jnp.abs(x))
+    return (g * grad,)
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
-class PLIFNode(nn.Module):
+class LIFNode(nn.Module):
     v_th: float = 0.5 
+    decay: float = 0.5 # 전압 폭발과 기울기 소멸을 막는 가장 안정적인 상수
 
     @nn.compact
     def __call__(self, x):
         x_seq = jnp.moveaxis(x, 2, 0) 
-        
-        # 🔥 481스텝 역전파를 버티기 위해 초기 Decay를 매우 높게(0.98) 설정
-        decay_param = self.param('decay', nn.initializers.constant(4.0), (x.shape[-1],))
 
         def scan_fn(v, x_t):
-            decay = jax.nn.sigmoid(decay_param)
-            v = v * decay + x_t
+            v = v * self.decay + x_t
             s = spike_fn(v - self.v_th)
             
-            # stop_gradient로 방전 시 역전파 꼬임 완벽 차단
-            v = v * (1.0 - jax.lax.stop_gradient(s)) 
+            # 순정 Soft Reset
+            v = v - s * self.v_th 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
@@ -144,7 +141,7 @@ class PLIFNode(nn.Module):
         return jnp.moveaxis(spikes, 0, 2)
 
 # =========================================================
-# 3. 모델 아키텍처: 풀링 삭제 및 주파수 100% 보존
+# 3. 모델 아키텍처: Dynamic Graph + Temporal Pooling 복구
 # =========================================================
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 16 
@@ -174,16 +171,18 @@ class Hybrid_SOTA_SNN(nn.Module):
         # 1. 공간 유기성
         z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # 2. 시간 파동 추출 (Mu, Beta 대역을 정밀하게 타격하는 커널)
+        # 2. 시간 파동 추출
         z_ann = nn.Conv(features=16, kernel_size=(1, 32), padding='SAME')(z_gcn)
         z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
+        
+        # 🔥 뉴런 뇌사 방지용 ReLU (무조건 양수 전류 공급)
         z_ann = nn.relu(z_ann)
-        z_ann = nn.Dropout(rate=0.4, deterministic=not train)(z_ann)
         
-        # 🔥 주파수를 믹서기에 갈아버리던 풀링 레이어 완전 삭제! 원본 160Hz 보존
+        # 🔥 기울기 소멸 방지용 Temporal Pooling (481스텝 -> 약 60스텝 압축)
+        z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8))
         
-        # 3. SNN 발화 (481스텝 전체 처리)
-        spikes = PLIFNode(v_th=0.5)(z_ann) # (B, 64, 481, 16)
+        # 3. SNN 발화
+        spikes = LIFNode(v_th=0.5, decay=0.5)(z_pooled) 
         
         # 4. 단순 합산 (Rate Coding)
         spike_count = jnp.sum(spikes, axis=2) 
@@ -200,6 +199,7 @@ class Hybrid_SOTA_SNN(nn.Module):
         logits = nn.Dense(features=4)(z_feat)
         
         return logits, z_feat, spikes
+    
 # =========================================================
 # 4. 학습 루프
 # =========================================================

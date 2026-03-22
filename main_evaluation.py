@@ -103,7 +103,7 @@ train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(Y_tr
 test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(Y_test)), batch_size=128, shuffle=False)
 
 # =========================================================
-# 2. SNN 코어 (논문 검증 순정 Triangle 대리 기울기 + 고정 LIF)
+# 2. SNN 코어 (상봉의 통찰 적용: 이종 매개변수 학습형 PLIF)
 # =========================================================
 @jax.custom_vjp
 def spike_fn(x):
@@ -113,27 +113,36 @@ def spike_fn_fwd(x):
     return spike_fn(x), x
 
 def spike_fn_bwd(res, g):
-    x = res # x는 (v - v_th)
-    # 🔥 논문에서 입증된 가장 강력하고 심플한 Triangle Surrogate Gradient
-    grad = jnp.maximum(0.0, 1.0 - jnp.abs(x))
+    x = res 
+    # KIST 논문 검증 Triangle Surrogate (alpha=0.5)
+    grad = jnp.maximum(0.0, 1.0 - jnp.abs(x) / 0.5)
     return (g * grad,)
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
-class LIFNode(nn.Module):
-    v_th: float = 0.5 
-    decay: float = 0.5 # 전압 폭발과 기울기 소멸을 막는 가장 안정적인 상수
-
+class PLIFNodeHetero(nn.Module):
     @nn.compact
     def __call__(self, x):
-        x_seq = jnp.moveaxis(x, 2, 0) 
+        x_seq = jnp.moveaxis(x, 2, 0) # (T, B, Space, Features)
+        feat_dim = x.shape[-1]
+        
+        # 🔥 네 아이디어의 핵심: 피처별로 뉴런의 스펙을 다르게 학습!
+        # 감쇠계수(Decay) 학습 파라미터
+        decay_param = self.param('decay', nn.initializers.constant(0.0), (feat_dim,))
+        # 임계값(Threshold) 학습 파라미터
+        vth_param = self.param('v_th', nn.initializers.constant(0.0), (feat_dim,))
 
         def scan_fn(v, x_t):
-            v = v * self.decay + x_t
-            s = spike_fn(v - self.v_th)
+            # 시그모이드로 0~1 사이의 안전한 범위 내에서 각자 다른 스펙을 가짐
+            decay = jax.nn.sigmoid(decay_param) 
+            # 임계값도 0.1 ~ 1.1 사이에서 뉴런마다 다르게 세팅됨
+            v_th = jax.nn.sigmoid(vth_param) + 0.1 
             
-            # 순정 Soft Reset
-            v = v - s * self.v_th 
+            v = v * decay + x_t
+            s = spike_fn(v - v_th)
+            
+            # 미분 가능한 Hard Reset (stop_gradient 적용)
+            v = v * (1.0 - jax.lax.stop_gradient(s)) 
             return v, s
 
         v_init = jnp.zeros_like(x_seq[0])
@@ -141,7 +150,7 @@ class LIFNode(nn.Module):
         return jnp.moveaxis(spikes, 0, 2)
 
 # =========================================================
-# 3. 모델 아키텍처: Deep SNN (다중 PLIF 계층 도입)
+# 3. 모델 아키텍처 (공간 보존 + 이종 PLIF)
 # =========================================================
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 16 
@@ -171,51 +180,32 @@ class Hybrid_SOTA_SNN(nn.Module):
         # 1. 공간 유기성 파악
         z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # ==========================================
-        # 블록 1: Temporal Conv + SNN (저수준 특징 추출)
-        # ==========================================
-        z_conv1 = nn.Conv(features=16, kernel_size=(1, 32), padding='SAME')(z_gcn)
-        z_conv1 = nn.BatchNorm(use_running_average=not train)(z_conv1)
-        z_conv1 = nn.relu(z_conv1)
+        # 2. 시간 파동 추출 (피처 32개로 넉넉하게 확장)
+        z_ann = nn.Conv(features=32, kernel_size=(1, 32), padding='SAME')(z_gcn)
+        z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
+        z_ann = nn.relu(z_ann) # 양수 강제 주입
         
-        # BPTT 기울기 소멸 방지용 Temporal Pooling (481스텝 -> 약 60스텝)
-        z_pooled1 = nn.avg_pool(z_conv1, window_shape=(1, 8), strides=(1, 8))
+        # BPTT 압축 (481스텝 -> 약 60스텝)
+        z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8))
         
-        # 첫 번째 SNN 발화
-        spikes1 = LIFNode(v_th=0.5, decay=0.8)(z_pooled1) # (B, 64, 60, 16)
+        # 3. 🔥 이종 PLIF 스파이크 발화 (뉴런 32그룹이 각자 다른 예민도/기억력으로 뇌파 분석)
+        spikes = PLIFNodeHetero()(z_pooled) # (B, 64, 60, 32)
         
-        # ==========================================
-        # 블록 2: 깊이 추가 + 채널 확장 (고수준 특징 추출)
-        # ==========================================
-        # 🔥 여기서 공간 차원(64)을 평균 내어 파라미터 폭발을 막음
-        z_spat_pool = jnp.mean(spikes1, axis=1, keepdims=True) # (B, 1, 60, 16)
+        # 4. 단순 합산 (공간 64채널 절대 뭉개지 않음!)
+        spike_count = jnp.sum(spikes, axis=2) # (B, 64, 32)
+        z_feat = spike_count.reshape((spike_count.shape[0], -1)) # (B, 2048)
         
-        # 두 번째 Temporal Conv (채널을 32개로 확장하여 표현력 강화)
-        z_conv2 = nn.Conv(features=32, kernel_size=(1, 16), padding='SAME')(z_spat_pool)
-        z_conv2 = nn.BatchNorm(use_running_average=not train)(z_conv2)
-        z_conv2 = nn.relu(z_conv2)
-        
-        # 두 번째 SNN 발화
-        spikes2 = LIFNode(v_th=0.5, decay=0.8)(z_conv2) # (B, 1, 60, 32)
-        
-        # ==========================================
-        # 4. 단순 합산 (Rate Coding) 및 분류
-        # ==========================================
-        # 최종 깊은 계층의 스파이크 합산
-        spike_count = jnp.sum(spikes2, axis=2) # (B, 1, 32)
-        z_feat = spike_count.reshape((spike_count.shape[0], -1)) # (B, 32)
-        
-        # 5. 분류기 (체급에 맞게 노드 수 조절)
+        # 5. 분류기
         z_feat = nn.LayerNorm()(z_feat)
-        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
+        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
-        z_feat = nn.Dense(features=64)(z_feat)
+        z_feat = nn.Dense(features=128)(z_feat)
         z_feat = nn.elu(z_feat)
-        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
+        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
         
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, z_feat, spikes2
+        return logits, z_feat, spikes
     
 # =========================================================
 # 4. 학습 루프

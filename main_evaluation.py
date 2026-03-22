@@ -141,7 +141,7 @@ class LIFNode(nn.Module):
         return jnp.moveaxis(spikes, 0, 2)
 
 # =========================================================
-# 3. 모델 아키텍처: Dynamic Graph + Temporal Pooling 복구
+# 3. 모델 아키텍처: Deep SNN (다중 PLIF 계층 도입)
 # =========================================================
 class DynamicGraphAttention(nn.Module):
     hidden_dim: int = 16 
@@ -168,37 +168,54 @@ class DynamicGraphAttention(nn.Module):
 class Hybrid_SOTA_SNN(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
-        # 1. 공간 유기성
+        # 1. 공간 유기성 파악
         z_gcn, _ = DynamicGraphAttention(hidden_dim=16)(x)
         
-        # 2. 시간 파동 추출
-        z_ann = nn.Conv(features=16, kernel_size=(1, 32), padding='SAME')(z_gcn)
-        z_ann = nn.BatchNorm(use_running_average=not train)(z_ann)
+        # ==========================================
+        # 블록 1: Temporal Conv + SNN (저수준 특징 추출)
+        # ==========================================
+        z_conv1 = nn.Conv(features=16, kernel_size=(1, 32), padding='SAME')(z_gcn)
+        z_conv1 = nn.BatchNorm(use_running_average=not train)(z_conv1)
+        z_conv1 = nn.relu(z_conv1)
         
-        # 🔥 뉴런 뇌사 방지용 ReLU (무조건 양수 전류 공급)
-        z_ann = nn.relu(z_ann)
+        # BPTT 기울기 소멸 방지용 Temporal Pooling (481스텝 -> 약 60스텝)
+        z_pooled1 = nn.avg_pool(z_conv1, window_shape=(1, 8), strides=(1, 8))
         
-        # 🔥 기울기 소멸 방지용 Temporal Pooling (481스텝 -> 약 60스텝 압축)
-        z_pooled = nn.avg_pool(z_ann, window_shape=(1, 8), strides=(1, 8))
+        # 첫 번째 SNN 발화
+        spikes1 = LIFNode(v_th=0.5, decay=0.8)(z_pooled1) # (B, 64, 60, 16)
         
-        # 3. SNN 발화
-        spikes = LIFNode(v_th=0.5, decay=0.5)(z_pooled) 
+        # ==========================================
+        # 블록 2: 깊이 추가 + 채널 확장 (고수준 특징 추출)
+        # ==========================================
+        # 🔥 여기서 공간 차원(64)을 평균 내어 파라미터 폭발을 막음
+        z_spat_pool = jnp.mean(spikes1, axis=1, keepdims=True) # (B, 1, 60, 16)
         
-        # 4. 단순 합산 (Rate Coding)
-        spike_count = jnp.sum(spikes, axis=2) 
-        z_feat = spike_count.reshape((spike_count.shape[0], -1)) 
+        # 두 번째 Temporal Conv (채널을 32개로 확장하여 표현력 강화)
+        z_conv2 = nn.Conv(features=32, kernel_size=(1, 16), padding='SAME')(z_spat_pool)
+        z_conv2 = nn.BatchNorm(use_running_average=not train)(z_conv2)
+        z_conv2 = nn.relu(z_conv2)
         
-        # 5. 분류기
+        # 두 번째 SNN 발화
+        spikes2 = LIFNode(v_th=0.5, decay=0.8)(z_conv2) # (B, 1, 60, 32)
+        
+        # ==========================================
+        # 4. 단순 합산 (Rate Coding) 및 분류
+        # ==========================================
+        # 최종 깊은 계층의 스파이크 합산
+        spike_count = jnp.sum(spikes2, axis=2) # (B, 1, 32)
+        z_feat = spike_count.reshape((spike_count.shape[0], -1)) # (B, 32)
+        
+        # 5. 분류기 (체급에 맞게 노드 수 조절)
         z_feat = nn.LayerNorm()(z_feat)
-        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
+        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
         
-        z_feat = nn.Dense(features=128)(z_feat)
+        z_feat = nn.Dense(features=64)(z_feat)
         z_feat = nn.elu(z_feat)
-        z_feat = nn.Dropout(rate=0.5, deterministic=not train)(z_feat)
+        z_feat = nn.Dropout(rate=0.4, deterministic=not train)(z_feat)
         
         logits = nn.Dense(features=4)(z_feat)
         
-        return logits, z_feat, spikes
+        return logits, z_feat, spikes2
     
 # =========================================================
 # 4. 학습 루프

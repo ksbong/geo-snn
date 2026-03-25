@@ -20,7 +20,7 @@ from flax.jax_utils import replicate, unreplicate
 
 mne.set_log_level('ERROR')
 # 경로 주의: Runpod 환경에 맞게 수정해! (예: /workspace/...)
-DATA_DIR = '/workspace/07_Data/07_Data'
+DATA_DIR = './07_Data'
 CACHE_FILE = '/workspace/geo-snn/ra_multitacip_2d_cache_spectrum_105.npz'
 
 # =========================================================

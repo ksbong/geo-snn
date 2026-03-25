@@ -195,7 +195,8 @@ class AutoHRSNN(nn.Module):
             v = v * self.hps['decay_out'] + x_t
             return v, v
         
-        _, v_out = jax.lax.scan(li_scan, jnp.zeros_like(dense_out[0]), jnp.moveaxis(dense_out, 1, 0))
+        # 🔥 dense_out[:, 0, :] 로 바꿔서 (Batch, 4) 형태를 맞춰줌!
+        _, v_out = jax.lax.scan(li_scan, jnp.zeros_like(dense_out[:, 0, :]), jnp.moveaxis(dense_out, 1, 0))
         out_logits = jnp.mean(v_out, axis=0) 
         
         return out_logits, (spk1, spk2)

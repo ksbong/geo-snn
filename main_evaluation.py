@@ -20,7 +20,7 @@ from flax.jax_utils import replicate, unreplicate
 
 mne.set_log_level('ERROR')
 # 경로 주의: Runpod 환경에 맞게 수정해! (예: /workspace/...)
-DATA_DIR = './07_Data'
+DATA_DIR = './07_Data/07_Data'
 CACHE_FILE = 'ra_multitacip_2d_cache_spectrum_105.npz'
 
 # =========================================================
@@ -388,7 +388,7 @@ hp_keys = ['lr', 'wd', 'cd_rate', 'drop1', 'drop2',
 hp_history_dict = {k: np.array([[gen_hp[w][k] for w in range(20)] for gen_hp in history_hps]) for k in hp_keys}
 
 # 저장 경로 조심해! Runpod이면 '/workspace/...' 이런 식이어야 해.
-save_path = '/kaggle/working/pbt_evolution_data_hr_snn.npz' 
+save_path = 'pbt_evolution_data_hr_snn.npz'
 np.savez(save_path,
          acc_history=np.array(history_accs),            # shape: (10, 20)
          train_acc_history=np.array(history_train_accs),# shape: (10, 20)

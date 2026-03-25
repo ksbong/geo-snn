@@ -291,9 +291,10 @@ def train_step(state, x, y, cd_rng, hp):
 
 @partial(jax.pmap, axis_name='batch')
 def eval_step(state, x, y):
-    (logits, _), _ = state.apply_fn(
+    # 리턴값이 (출력, 스파이크) 1개 튜플이므로 언패킹 구조 수정
+    logits, _ = state.apply_fn(
         {'params': state.params, 'batch_stats': state.batch_stats}, 
-        x, train=False, mutable=False
+        x, train=False
     )
     return jnp.mean(jnp.argmax(logits, -1) == y)
 

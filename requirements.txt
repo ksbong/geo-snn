@@ -9,3 +9,4 @@ jax[cuda12]
 flax
 optax
 snntorch
+pyriemann

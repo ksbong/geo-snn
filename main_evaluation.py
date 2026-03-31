@@ -194,6 +194,7 @@ class RG_SNN_PureOriginal(nn.Module):
         return out_logits, (spk1, spk2, spk3)
 
 # 🔥 타겟팅된 PBT 최적 범위
+# 🔥 숨통 틔워준 오리지널 PBT 최적 범위 (이 부분만 덮어쓰기)
 class PBTManager:
     def __init__(self, num_workers=20, alpha=1.0):
         self.num_workers = num_workers
@@ -201,22 +202,22 @@ class PBTManager:
         self.worker_hps = []
         for _ in range(num_workers):
             self.worker_hps.append({
-                'lr': 10**np.random.uniform(-3.5, -2.5),
-                'drop1': np.random.uniform(0.35, 0.55),      
-                'drop2': np.random.uniform(0.35, 0.50),
-                'drop3': np.random.uniform(0.20, 0.40),
-                'v1_m': np.random.uniform(0.4, 0.7), 'v1_s': np.random.uniform(0.3, 0.5),
-                'd1_m': np.random.uniform(0.9, 1.3), 'd1_s': np.random.uniform(0.2, 0.5),
-                'a1': np.random.uniform(2.0, 3.5),
-                'v2_m': np.random.uniform(0.3, 0.6), 'v2_s': np.random.uniform(0.3, 0.6),
-                'd2_m': np.random.uniform(1.4, 1.9), 'd2_s': np.random.uniform(0.05, 0.25),
-                'a2': np.random.uniform(2.0, 3.5),
-                'alif_d': np.random.uniform(0.7, 0.85),      
-                'alif_adp': np.random.uniform(0.75, 0.95),   
-                'alif_beta': np.random.uniform(0.9, 1.3),   
-                'a3': np.random.uniform(1.5, 2.5),           
-                'decay_out': np.random.uniform(0.5, 0.75),
-                'reg_spike': 10**np.random.uniform(-2.5, -1.5) 
+                'lr': 10**np.random.uniform(-4.0, -2.5),
+                'drop1': np.random.uniform(0.2, 0.45),      
+                'drop2': np.random.uniform(0.2, 0.45),
+                'drop3': np.random.uniform(0.2, 0.45),
+                'v1_m': np.random.uniform(0.5, 1.5), 'v1_s': np.random.uniform(0.1, 0.5),
+                'd1_m': np.random.uniform(1.0, 3.0), 'd1_s': np.random.uniform(0.1, 0.5),
+                'a1': np.random.uniform(2.0, 5.0),
+                'v2_m': np.random.uniform(0.5, 1.5), 'v2_s': np.random.uniform(0.1, 0.5),
+                'd2_m': np.random.uniform(1.0, 3.0), 'd2_s': np.random.uniform(0.1, 0.5),
+                'a2': np.random.uniform(2.0, 5.0),
+                'alif_d': np.random.uniform(0.7, 0.95),      
+                'alif_adp': np.random.uniform(0.9, 0.99),   
+                'alif_beta': np.random.uniform(0.01, 0.3),   
+                'a3': np.random.uniform(2.0, 5.0),           
+                'decay_out': np.random.uniform(0.5, 0.99),
+                'reg_spike': 10**np.random.uniform(-5, -4) 
             })
             
     def exploit_and_explore(self, states, fitness_scores):
@@ -227,15 +228,16 @@ class PBTManager:
         for b, t in zip(bottom_idx, top_idx):
             new_hp = self.worker_hps[t].copy()
             for k in new_hp:
-                mutation_factor = np.random.uniform(0.85, 1.15)
+                mutation_factor = np.random.uniform(0.8, 1.2)
                 new_val = new_hp[k] * mutation_factor
                 
-                if 'drop' in k: new_hp[k] = jnp.clip(new_val, 0.1, 0.6) 
+                # 변이 범위는 넓게 허용해서 PBT가 만렙 수치까지 갈 수 있게 열어둠
+                if 'drop' in k: new_hp[k] = jnp.clip(new_val, 0.1, 0.55) 
                 elif k in ['decay_out', 'alif_d']: new_hp[k] = jnp.clip(new_val, 0.5, 0.999)
-                elif k == 'alif_adp': new_hp[k] = jnp.clip(new_val, 0.5, 0.999) 
-                elif k == 'alif_beta': new_hp[k] = jnp.clip(new_val, 0.1, 2.0)
-                elif 's' in k: new_hp[k] = jnp.clip(new_val, 0.01, 1.0) 
-                elif 'a' in k: new_hp[k] = jnp.clip(new_val, 1.0, 10.0) 
+                elif k == 'alif_adp': new_hp[k] = jnp.clip(new_val, 0.85, 0.999) 
+                elif k == 'alif_beta': new_hp[k] = jnp.clip(new_val, 0.01, 1.5) 
+                elif 's' in k: new_hp[k] = jnp.clip(new_val, 0.01, 2.0) 
+                elif 'a' in k: new_hp[k] = jnp.clip(new_val, 1.0, 20.0) 
                 else: new_hp[k] = new_val
             self.worker_hps[b] = new_hp
 
@@ -244,7 +246,7 @@ class PBTManager:
             states[b] = states[t].replace(opt_state=new_opt_state)
             
         return states
-
+    
 all_subjs = [f'S{i:03d}' for i in range(1, 110)]
 exclude = ['S088', 'S092', 'S100', 'S104'] 
 subjects = sorted([s for s in all_subjs if s not in exclude])

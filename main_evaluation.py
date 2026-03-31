@@ -1,3 +1,4 @@
+
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import numpy as np
@@ -5,46 +6,36 @@ import mne
 from pyriemann.estimation import Covariances
 from pyriemann.utils.mean import mean_covariance
 from pyriemann.utils.base import invsqrtm
+from sklearn.model_selection import KFold, train_test_split
 
 import jax
 import jax.numpy as jnp
+
+try:
+    import jax.tools.colab_tpu
+    jax.tools.colab_tpu.setup_tpu()
+    print("TPU 준비 완료")
+except Exception as e:
+    print("TPU 환경 아님")
+
 from jax import random as jrandom
 import flax.linen as nn
 from flax.training import train_state
 import optax
-from torch.utils.data import DataLoader, TensorDataset
-import torch
 from functools import partial
 from typing import Any
 from flax.jax_utils import replicate, unreplicate
+from flax.core import unfreeze
 
 mne.set_log_level('ERROR')
-# 경로 주의: Runpod 환경에 맞게 수정해! (예: /workspace/...)
+
 DATA_DIR = './07_Data'
-CACHE_FILE = '/workspace/geo-snn/ra_multitacip_2d_cache_spectrum_105.npz'
 
-# =========================================================
-# 1. 고속 다중 대역 TACIP & 데이터 로더 
-# =========================================================
-def fast_multiband_tacip(trial, motifs, motif_norms, window=32):
-    C, T = trial.shape
-    F = motifs.shape[0]
-    res = np.zeros((C, T, F))
-    for c in range(C):
-        sig = trial[c]
-        stride = sig.strides[0]
-        chunks = np.lib.stride_tricks.as_strided(sig, shape=(T-window+1, window), strides=(stride, stride))
-        res[c, window-1:, :] = np.dot(chunks, motifs.T) / motif_norms[None, :]
-    return res
-
-def load_balanced_ra_2d(subj_list, desc="Loading"):
-    print(f"⏳ {desc} 로딩 시작 (총 {len(subj_list)}명)...")
+def load_balanced_ra_2d(subj_list, desc="Loading", verbose=True):
+    if not os.path.exists(DATA_DIR):
+        raise FileNotFoundError(f"데이터 경로 오류")
+        
     X_out, Y_out = [], []
-    fs, window = 160.0, 32
-    t = np.arange(window) / fs
-    freqs = [10, 15, 20, 25]
-    motifs = np.array([np.sin(2 * np.pi * f * t) * np.hanning(window) for f in freqs])
-    motif_norms = np.linalg.norm(motifs, axis=1) + 1e-8
 
     for s in subj_list:
         subj_dir = os.path.join(DATA_DIR, s)
@@ -90,40 +81,27 @@ def load_balanced_ra_2d(subj_list, desc="Loading"):
         covs = Covariances(estimator='scm').fit_transform(X_bal)
         C_ref = mean_covariance(covs, metric='riemann')
         whiten = invsqrtm(C_ref)
-        X_ra = np.array([np.dot(whiten, trial) for trial in X_bal])
         
-        X_tacip = np.array([fast_multiband_tacip(trial, motifs, motif_norms) for trial in X_ra])
-        X_out.append(np.moveaxis(X_tacip, 1, 2)) 
+        X_ra = np.array([np.dot(whiten, trial) for trial in X_bal])
+        X_ra_transposed = np.transpose(X_ra, (0, 2, 1))[:, :, :, np.newaxis]
+        
+        X_out.append(X_ra_transposed) 
         Y_out.extend(Y_bal)
         
-    print(f"✅ {desc} 전처리 완벽하게 끝!")
-    return np.concatenate(X_out), np.array(Y_out)
+    return np.concatenate(X_out) if len(X_out) > 0 else np.array([]), np.array(Y_out)
 
-print("⚙️ 데이터 준비 중...")
-if os.path.exists(CACHE_FILE):
-    data = np.load(CACHE_FILE)
-    X_train, Y_train = data['X_train'], data['Y_train']
-    X_test, Y_test = data['X_test'], data['Y_test']
-else:
-    all_subjs = [f'S{i:03d}' for i in range(1, 110)]
-    exclude = ['S088', 'S092', 'S100', 'S104'] 
-    subjects = sorted([s for s in all_subjs if s not in exclude])
-    split_idx = int(len(subjects) * 0.8) 
-    train_subjs, test_subjs = subjects[:split_idx], subjects[split_idx:] 
-    
-    X_train, Y_train = load_balanced_ra_2d(train_subjs, "Train Data")
-    X_test, Y_test = load_balanced_ra_2d(test_subjs, "Test Data")
-    np.savez_compressed(CACHE_FILE, X_train=X_train, Y_train=Y_train, X_test=X_test, Y_test=Y_test)
+num_devices = jax.device_count() 
+batch_size = 32 
+per_device = batch_size // num_devices
 
-train_loader = DataLoader(TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(Y_train, dtype=torch.long)), batch_size=32, shuffle=True, drop_last=True)
-test_loader = DataLoader(TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(Y_test, dtype=torch.long)), batch_size=32, shuffle=False, drop_last=False)
-
-# =========================================================
-# 2. 정규화 및 커스텀 스파이크 함수 (Alpha 적용)
-# =========================================================
-def apply_coordinated_dropout(x, rng, rate):
-    mask = jrandom.bernoulli(rng, p=1-rate, shape=x.shape)
-    return x * mask * (1.0 / (1.0 - rate)), mask
+def prepare_gpu_data(X, Y, num_batches, shuffle=True):
+    if shuffle:
+        perm = np.random.permutation(len(X))
+        X = X[perm]
+        Y = Y[perm]
+    X_b = X[:num_batches * batch_size].astype(np.float32).reshape(num_batches, num_devices, per_device, *X.shape[1:])
+    Y_b = Y[:num_batches * batch_size].astype(np.int32).reshape(num_batches, num_devices, per_device)
+    return jax.device_put(X_b), jax.device_put(Y_b)
 
 @jax.custom_vjp
 def spike_fn(x, alpha):
@@ -139,266 +117,304 @@ def spike_fn_bwd(res, g):
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
-# =========================================================
-# 3. 모델 정의 (HR-SNN 뉴런 + LI 출력층)
-# =========================================================
 class TrainState(train_state.TrainState):
-    batch_stats: Any 
+    batch_stats: Any
 
 class HR_HLIFLayer2D(nn.Module):
-    vth_m: float; vth_s: float
-    decay_m: float; decay_s: float
-    alpha: float
-
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, hp_v_m, hp_v_s, hp_d_m, hp_d_s, hp_alpha):
         x_seq = jnp.moveaxis(x, 1, 0)
         shape = x.shape[2:]
-        
         raw_vth = self.param('vth_raw', nn.initializers.normal(stddev=1.0), shape)
         raw_decay = self.param('decay_raw', nn.initializers.normal(stddev=1.0), shape)
-        
-        vth = jax.nn.softplus(raw_vth * self.vth_s + self.vth_m) + 0.01
-        decay = jnp.clip(jax.nn.sigmoid(raw_decay * self.decay_s + self.decay_m), 0.0, 0.99)
-        
+        vth = jax.nn.softplus(raw_vth * hp_v_s + hp_v_m) + 0.5
+        decay = jnp.clip(jax.nn.sigmoid(raw_decay * hp_d_s + hp_d_m), 0.0, 0.99)
         def scan_fn(v, x_t):
             v = v * decay + x_t
-            s = spike_fn(v - vth, self.alpha)
+            s = spike_fn(v - vth, hp_alpha)
             return v - jax.lax.stop_gradient(s) * vth, s
         _, spikes = jax.lax.scan(scan_fn, jnp.zeros_like(x_seq[0]), x_seq)
         return jnp.moveaxis(spikes, 0, 1)
 
-class AutoHRSNN(nn.Module):
-    hps: dict
+class ALIFLayer2D(nn.Module):
     @nn.compact
-    def __call__(self, x, train=True):
-        x = nn.Conv(32, (16, 1), padding='SAME', use_bias=False)(x)
-        x = nn.BatchNorm(use_running_average=not train)(x)
-        spk1 = HR_HLIFLayer2D(
-            vth_m=self.hps['v1_m'], vth_s=self.hps['v1_s'],
-            decay_m=self.hps['d1_m'], decay_s=self.hps['d1_s'], alpha=self.hps['a1']
-        )(x)
-        x = nn.Dropout(self.hps['drop1'], deterministic=not train)(spk1)
+    def __call__(self, x, hp_alif_d, hp_alif_adp, hp_alif_beta, hp_alpha):
+        x_seq = jnp.moveaxis(x, 1, 0)
+        def scan_fn(carry, x_t):
+            v, theta, prev_s = carry
+            theta_next = theta * hp_alif_adp + prev_s * hp_alif_beta
+            v_next = v * hp_alif_d + x_t
+            vth_t = 0.5 + theta_next
+            s = spike_fn(v_next - vth_t, hp_alpha)
+            v_next = v_next - jax.lax.stop_gradient(s) * vth_t
+            return (v_next, theta_next, jax.lax.stop_gradient(s)), s
+        init_carry = (jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]))
+        _, spikes = jax.lax.scan(scan_fn, init_carry, x_seq)
+        return jnp.moveaxis(spikes, 0, 1)
+
+class RG_SNN_PureOriginal(nn.Module):
+    @nn.compact
+    def __call__(self, x, hp, train=True):
+        x1 = nn.Conv(64, kernel_size=(1, 64), padding='VALID', use_bias=False)(x)
+        x1 = nn.BatchNorm(use_running_average=not train)(x1)
+        if train:
+            x1 = x1 * jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop1'], shape=x1.shape) * (1.0 / (1.0 - hp['drop1'] + 1e-8))
+        spk1 = HR_HLIFLayer2D()(x1, hp['v1_m'], hp['v1_s'], hp['d1_m'], hp['d1_s'], hp['a1'])
+
+        x2 = nn.Conv(128, kernel_size=(32, 1), kernel_dilation=(4, 1), padding='SAME', use_bias=False)(spk1)
+        x2 = nn.BatchNorm(use_running_average=not train)(x2)
+        if train:
+            x2 = x2 * jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop2'], shape=x2.shape) * (1.0 / (1.0 - hp['drop2'] + 1e-8))
+        spk2 = HR_HLIFLayer2D()(x2, hp['v2_m'], hp['v2_s'], hp['d2_m'], hp['d2_s'], hp['a2'])
+
+        x3 = nn.Conv(128, kernel_size=(32, 1), kernel_dilation=(12, 1), padding='SAME', use_bias=False)(spk2)
+        x3 = nn.BatchNorm(use_running_average=not train)(x3)
+        if train:
+            x3 = x3 * jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop3'], shape=x3.shape) * (1.0 / (1.0 - hp['drop3'] + 1e-8))
+        spk3 = ALIFLayer2D()(x3, hp['alif_d'], hp['alif_adp'], hp['alif_beta'], hp['a3'])
         
-        x = nn.Conv(64, (1, 64), padding='VALID', feature_group_count=32, use_bias=False)(x)
-        x = nn.BatchNorm(use_running_average=not train)(x)
-        spk2 = HR_HLIFLayer2D(
-            vth_m=self.hps['v2_m'], vth_s=self.hps['v2_s'],
-            decay_m=self.hps['d2_m'], decay_s=self.hps['d2_s'], alpha=self.hps['a2']
-        )(x)
-        x = nn.Dropout(self.hps['drop2'], deterministic=not train)(spk2)
-        
-        x = jnp.mean(x, axis=2) 
-        dense_out = nn.Dense(4)(x) 
+        x_pool = jnp.mean(spk3, axis=2) 
+        dense_out = nn.Dense(4)(x_pool) 
         
         def li_scan(v, x_t):
-            v = v * self.hps['decay_out'] + x_t
+            decay = hp['decay_out']
+            v = v * decay + x_t * (1.0 - decay)
             return v, v
+            
+        _, v_seq = jax.lax.scan(li_scan, jnp.zeros_like(dense_out[:, 0, :]), jnp.moveaxis(dense_out, 1, 0))
+        v_seq = jnp.moveaxis(v_seq, 0, 1) 
         
-        # 🔥 dense_out[:, 0, :] 로 바꿔서 (Batch, 4) 형태를 맞춰줌!
-        _, v_out = jax.lax.scan(li_scan, jnp.zeros_like(dense_out[:, 0, :]), jnp.moveaxis(dense_out, 1, 0))
-        out_logits = jnp.mean(v_out, axis=0) 
+        v_reshaped = jnp.reshape(v_seq, (v_seq.shape[0], 20, 24, 4))
+        dp_features = jnp.mean(v_reshaped[:, :, -12:, :], axis=2) - jnp.mean(v_reshaped[:, :, :12, :], axis=2) 
         
-        return out_logits, (spk1, spk2)
+        attn_w = nn.Dense(1)(jax.nn.relu(nn.Dense(8)(dp_features)))
+        attn_w = jax.nn.softmax(attn_w, axis=1)
+        out_logits = jnp.sum(dp_features * attn_w, axis=1)
+        
+        return out_logits, (spk1, spk2, spk3)
 
-# =========================================================
-# 4. PBT Manager (17개 HP)
-# =========================================================
+# 🔥 타겟팅된 PBT 최적 범위
 class PBTManager:
-    def __init__(self, num_workers=20): 
+    def __init__(self, num_workers=20, alpha=1.0):
         self.num_workers = num_workers
+        self.alpha = alpha
         self.worker_hps = []
         for _ in range(num_workers):
             self.worker_hps.append({
-                'lr': 10**np.random.uniform(-4, -2.5),
-                'wd': 10**np.random.uniform(-5, -3),
-                'cd_rate': np.random.uniform(0.01, 0.15),
-                'drop1': np.random.uniform(0.1, 0.5),
-                'drop2': np.random.uniform(0.1, 0.5),
-                'v1_m': np.random.uniform(0.5, 1.5), 'v1_s': np.random.uniform(0.1, 0.5),
-                'd1_m': np.random.uniform(0.0, 2.0), 'd1_s': np.random.uniform(0.1, 0.5),
-                'a1': np.random.uniform(1.0, 3.0),
-                'v2_m': np.random.uniform(0.5, 1.5), 'v2_s': np.random.uniform(0.1, 0.5),
-                'd2_m': np.random.uniform(0.0, 2.0), 'd2_s': np.random.uniform(0.1, 0.5),
-                'a2': np.random.uniform(1.0, 3.0),
-                'decay_out': np.random.uniform(0.5, 0.99),
-                'reg_spike': 10**np.random.uniform(-5, -3) 
+                'lr': 10**np.random.uniform(-3.5, -2.5),
+                'drop1': np.random.uniform(0.35, 0.55),      
+                'drop2': np.random.uniform(0.35, 0.50),
+                'drop3': np.random.uniform(0.20, 0.40),
+                'v1_m': np.random.uniform(0.4, 0.7), 'v1_s': np.random.uniform(0.3, 0.5),
+                'd1_m': np.random.uniform(0.9, 1.3), 'd1_s': np.random.uniform(0.2, 0.5),
+                'a1': np.random.uniform(2.0, 3.5),
+                'v2_m': np.random.uniform(0.3, 0.6), 'v2_s': np.random.uniform(0.3, 0.6),
+                'd2_m': np.random.uniform(1.4, 1.9), 'd2_s': np.random.uniform(0.05, 0.25),
+                'a2': np.random.uniform(2.0, 3.5),
+                'alif_d': np.random.uniform(0.7, 0.85),      
+                'alif_adp': np.random.uniform(0.75, 0.95),   
+                'alif_beta': np.random.uniform(0.9, 1.3),   
+                'a3': np.random.uniform(1.5, 2.5),           
+                'decay_out': np.random.uniform(0.5, 0.75),
+                'reg_spike': 10**np.random.uniform(-2.5, -1.5) 
             })
             
-    def exploit_and_explore(self, states, accs):
-        sorted_idx = np.argsort(accs)
+    def exploit_and_explore(self, states, fitness_scores):
+        sorted_idx = np.argsort(fitness_scores)
         bottom_idx = sorted_idx[:self.num_workers//4] 
         top_idx = sorted_idx[-self.num_workers//4:]   
         
         for b, t in zip(bottom_idx, top_idx):
             new_hp = self.worker_hps[t].copy()
             for k in new_hp:
-                new_val = new_hp[k] * np.random.uniform(0.8, 1.2)
-                if k in ['cd_rate', 'drop1', 'drop2']: new_hp[k] = np.clip(new_val, 0.01, 0.5) 
-                elif k == 'decay_out': new_hp[k] = np.clip(new_val, 0.1, 0.99)
-                elif 's' in k: new_hp[k] = np.clip(new_val, 0.01, 1.5) 
+                mutation_factor = np.random.uniform(0.85, 1.15)
+                new_val = new_hp[k] * mutation_factor
+                
+                if 'drop' in k: new_hp[k] = jnp.clip(new_val, 0.1, 0.6) 
+                elif k in ['decay_out', 'alif_d']: new_hp[k] = jnp.clip(new_val, 0.5, 0.999)
+                elif k == 'alif_adp': new_hp[k] = jnp.clip(new_val, 0.5, 0.999) 
+                elif k == 'alif_beta': new_hp[k] = jnp.clip(new_val, 0.1, 2.0)
+                elif 's' in k: new_hp[k] = jnp.clip(new_val, 0.01, 1.0) 
+                elif 'a' in k: new_hp[k] = jnp.clip(new_val, 1.0, 10.0) 
                 else: new_hp[k] = new_val
             self.worker_hps[b] = new_hp
 
-            new_model = AutoHRSNN(hps=new_hp)
-            new_tx = optax.adamw(new_hp['lr'], weight_decay=new_hp['wd'])
+            new_hyperparams = {'learning_rate': jnp.array(new_hp['lr'], dtype=jnp.float32)}
+            new_opt_state = states[t].opt_state._replace(hyperparams=new_hyperparams)
+            states[b] = states[t].replace(opt_state=new_opt_state)
             
-            states[b] = TrainState.create(
-                apply_fn=new_model.apply, params=states[t].params, 
-                tx=new_tx, batch_stats=states[t].batch_stats 
-            )
         return states
 
-# =========================================================
-# 5. 분산 학습 루프 (A5000 체급 + 히스토리 로깅 복구)
-# =========================================================
-pbt = PBTManager(num_workers=20)
-rng = jrandom.PRNGKey(42)
+all_subjs = [f'S{i:03d}' for i in range(1, 110)]
+exclude = ['S088', 'S092', 'S100', 'S104'] 
+subjects = sorted([s for s in all_subjs if s not in exclude])
 
-population_states = []
-for i in range(20):
-    hp = pbt.worker_hps[i]
-    model = AutoHRSNN(hps=hp)
-    var = model.init(rng, jnp.ones((1, 480, 64, 4)), train=False)
-    tx = optax.adamw(hp['lr'], weight_decay=hp['wd'])
-    population_states.append(TrainState.create(
-        apply_fn=model.apply, params=var['params'], tx=tx, batch_stats=var['batch_stats']
-    ))
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+splits = list(kf.split(subjects))
 
-def shard(x): return jnp.reshape(x, (jax.local_device_count(), -1) + x.shape[1:])
+for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
+    # 요청대로 FOLD 0만 재실행
+    if FOLD_IDX != 0: continue
 
-@partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, 0, None))
-def train_step(state, x, y, cd_rng, hp):
-    x_cd, _ = apply_coordinated_dropout(x, cd_rng, rate=hp['cd_rate'])
+    print(f"\n{'='*60}\n[FOLD {FOLD_IDX}/5] targeted PBT evo 시작 \n{'='*60}")
     
-    def loss_fn(params):
-        (logits, (spk1, spk2)), new_vars = state.apply_fn(
-            {'params': params, 'batch_stats': state.batch_stats}, 
-            x_cd, train=True, rngs={'dropout': cd_rng}, mutable=['batch_stats']
+    CACHE_FILE = f'/workspace/geo-snn/raw_eeg_cache_fold{FOLD_IDX}_tpu.npz'
+    save_path = f'/workspace/geo-snn/rg_snn_pure_fold{FOLD_IDX}_tpu_rerun.npz'
+    
+    val_subject_data = []
+
+    if os.path.exists(CACHE_FILE):
+        data = np.load(CACHE_FILE, allow_pickle=True)
+        X_tr, Y_tr = data['X_tr'], data['Y_tr']
+        X_test, Y_test = data['X_test'], data['Y_test']
+        val_subject_data = data['val_subject_data'].tolist()
+        print(f"-- 데이터 캐시 로딩 완료 (Val: {len(val_subject_data)}명)")
+    else:
+        print(f"-- 전체 데이터 로딩 및 전처리 시작...")
+        train_subjs_full = [subjects[i] for i in train_idx]
+        test_subjs = [subjects[i] for i in test_idx]
+        train_subjs, val_subjs = train_test_split(train_subjs_full, test_size=0.25, random_state=42)
+        
+        X_tr, Y_tr = load_balanced_ra_2d(train_subjs, f"Train Data")
+        X_test, Y_test = load_balanced_ra_2d(test_subjs, f"Test Data")
+        
+        print(f"-- Validation Data 로딩 시작...")
+        for s in val_subjs:
+            vx, vy = load_balanced_ra_2d([s], desc=f"Val Subj {s}", verbose=False)
+            if len(vx) > 0:
+                val_subject_data.append((vx, vy))
+        
+        np.savez_compressed(CACHE_FILE, X_tr=X_tr, Y_tr=Y_tr, X_test=X_test, Y_test=Y_test, val_subject_data=np.array(val_subject_data, dtype=object))
+
+    num_train_batches = len(X_tr) // batch_size
+    num_test_batches = len(X_test) // batch_size
+    X_test_gpu, Y_test_gpu = prepare_gpu_data(X_test, Y_test, num_test_batches, shuffle=False)
+
+    pbt = PBTManager(num_workers=20, alpha=1.0)
+    rng = jrandom.PRNGKey(42 + FOLD_IDX)
+    global_model = RG_SNN_PureOriginal()
+    global_tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.001, weight_decay=0.001)
+
+    population_states = []
+    init_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in pbt.worker_hps[0].items()}
+    var = global_model.init(rng, jnp.ones((1, 480, 64, 1)), init_hp, train=False)
+
+    for i in range(20):
+        hp = pbt.worker_hps[i]
+        state = TrainState.create(
+            apply_fn=global_model.apply, params=var['params'], tx=global_tx, batch_stats=var['batch_stats']
         )
-        smooth_y = optax.smooth_labels(jax.nn.one_hot(y, 4), 0.1)
-        ce_loss = jnp.mean(optax.softmax_cross_entropy(logits, smooth_y))
-        
-        spike_loss = hp['reg_spike'] * (jnp.mean(spk1) + jnp.mean(spk2))
-        total_loss = ce_loss + spike_loss
-        
-        acc = jnp.mean(jnp.argmax(logits, -1) == y)
-        return total_loss, (logits, new_vars['batch_stats'], acc, total_loss)
-        
-    grads, (logits, new_bs, tr_acc, tr_loss) = jax.grad(loss_fn, has_aux=True)(state.params)
-    state = state.apply_gradients(grads=jax.lax.pmean(grads, 'batch'), batch_stats=jax.lax.pmean(new_bs, 'batch'))
-    return state, jax.lax.pmean(tr_acc, 'batch'), jax.lax.pmean(tr_loss, 'batch')
+        new_hyperparams = {'learning_rate': jnp.array(hp['lr'], dtype=jnp.float32)}
+        state = state.replace(opt_state=state.opt_state._replace(hyperparams=new_hyperparams))
+        population_states.append(state)
 
-@partial(jax.pmap, axis_name='batch')
-def eval_step(state, x, y):
-    # 리턴값이 (출력, 스파이크) 1개 튜플이므로 언패킹 구조 수정
-    logits, _ = state.apply_fn(
-        {'params': state.params, 'batch_stats': state.batch_stats}, 
-        x, train=False
-    )
-    return jnp.mean(jnp.argmax(logits, -1) == y)
+    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, 0, None))
+    def train_step(state, x, y, drop_rng, hp):
+        def loss_fn(params):
+            (logits, (spk1, spk2, spk3)), new_vars = state.apply_fn(
+                {'params': params, 'batch_stats': state.batch_stats}, 
+                x, hp, train=True, rngs={'dropout': drop_rng}, mutable=['batch_stats']
+            )
+            smooth_y = optax.smooth_labels(jax.nn.one_hot(y, 4), 0.1)
+            ce_loss = jnp.mean(optax.softmax_cross_entropy(logits, smooth_y))
+            spike_loss = hp['reg_spike'] * (jnp.mean(spk1) + jnp.mean(spk2) + jnp.mean(spk3))
+            total_loss = ce_loss + spike_loss
+            acc = jnp.mean(jnp.argmax(logits, -1) == y)
+            return total_loss, (logits, new_vars['batch_stats'], acc, total_loss)
+            
+        grads, (logits, new_bs, tr_acc, tr_loss) = jax.grad(loss_fn, has_aux=True)(state.params)
+        state = state.apply_gradients(grads=jax.lax.pmean(grads, 'batch'), batch_stats=jax.lax.pmean(new_bs, 'batch'))
+        return state, jax.lax.pmean(tr_acc, 'batch'), jax.lax.pmean(tr_loss, 'batch')
 
-print(f"\n🚀 A5000-Ready HR-SNN 진화 시작 (Workers: 20, 10세대)")
+    @jax.jit
+    def eval_step_single(state, x, y, hp):
+        logits, _ = state.apply_fn({'params': state.params, 'batch_stats': state.batch_stats}, x, hp, train=False)
+        return jnp.mean(jnp.argmax(logits, -1) == y)
 
-# 🔥 기록용 리스트 부활
-history_accs, history_hps = [], []
-history_train_accs, history_train_losses = [], []
-
-for gen in range(1, 11): 
-    worker_test_results = []
-    current_gen_hps = []
-    gen_train_accs, gen_train_losses = [], []
+    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, None))
+    def eval_step_pmap(state, x, y, hp):
+        logits, _ = state.apply_fn({'params': state.params, 'batch_stats': state.batch_stats}, x, hp, train=False)
+        return jnp.mean(jnp.argmax(logits, -1) == y)
     
-    for w_idx in range(20):
-        hp = pbt.worker_hps[w_idx]
-        current_gen_hps.append(hp.copy())
-        p_state = replicate(population_states[w_idx]) 
-        
-        tr_accs_epoch, tr_losses_epoch = [], []
-        for _ in range(15): 
-            for xb, yb in train_loader:
-                rng, cd_rng = jrandom.split(rng)
-                cd_rngs = jrandom.split(cd_rng, jax.local_device_count())
-                p_state, t_acc, t_loss = train_step(p_state, shard(jnp.array(xb)), shard(jnp.array(yb)), cd_rngs, hp)
-                tr_accs_epoch.append(t_acc[0])
-                tr_losses_epoch.append(t_loss[0])
-                
-        v_accs = []
-        for xt, yt in test_loader:
-            if len(xt) % jax.local_device_count() == 0:
-                acc = eval_step(p_state, shard(jnp.array(xt)), shard(jnp.array(yt)))
-                v_accs.append(acc[0])
-                
-        test_acc_mean = np.mean(v_accs)
-        train_acc_mean = np.mean(tr_accs_epoch)
-        train_loss_mean = np.mean(tr_losses_epoch)
-        
-        population_states[w_idx] = unreplicate(p_state)
-        worker_test_results.append(test_acc_mean)
-        gen_train_accs.append(train_acc_mean)
-        gen_train_losses.append(train_loss_mean)
-        
-        print(f"Gen {gen:02d}|W_{w_idx:02d} | Test: {test_acc_mean*100:.1f}% | Train: {train_acc_mean*100:.1f}% (Loss: {train_loss_mean:.3f}) | V1_m/s: {hp['v1_m']:.2f}/{hp['v1_s']:.2f} | Alpha: {hp['a1']:.1f}")
-
-    population_accs = np.array(worker_test_results)
+    history_test_acc = []
     
-    # 🔥 현재 세대 데이터 기록
-    history_accs.append(population_accs)
-    history_hps.append(current_gen_hps)
-    history_train_accs.append(np.array(gen_train_accs))
-    history_train_losses.append(np.array(gen_train_losses))
-    
-    population_states = pbt.exploit_and_explore(population_states, population_accs)
-    print(f"🎯 Gen {gen:02d} 완료 (Best Test Acc: {np.max(population_accs)*100:.1f}%) -----------------")
+    for gen in range(1, 31): 
+        print(f"Gen {gen:02d} | Fold {FOLD_IDX} Train 데이터 shuffle & TPU uploading...")
+        X_tr_gpu, Y_tr_gpu = prepare_gpu_data(X_tr, Y_tr, num_train_batches, shuffle=True)
+        
+        worker_fitnesses, worker_val_means, worker_val_stds = [], [], []
+        
+        for w_idx in range(20):
+            hp = pbt.worker_hps[w_idx]
+            p_state = replicate(population_states[w_idx]) 
+            dynamic_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in hp.items()}
+            
+            for _ in range(5): 
+                for b in range(num_train_batches):
+                    rng, drop_rng = jrandom.split(rng)
+                    drop_rngs = jrandom.split(drop_rng, num_devices)
+                    p_state, _, _ = train_step(p_state, X_tr_gpu[b], Y_tr_gpu[b], drop_rngs, dynamic_hp)
+                    
+            unrep_state = unreplicate(p_state)
+            subj_accs = []
+            
+            for vx, vy in val_subject_data:
+                chunk_accs = []
+                for i in range(0, len(vx), 32):
+                    bx = jnp.array(vx[i:i+32])
+                    by = jnp.array(vy[i:i+32])
+                    acc = eval_step_single(unrep_state, bx, by, dynamic_hp)
+                    chunk_accs.append(acc)
+                if chunk_accs:
+                    subj_accs.append(np.mean(chunk_accs))
+                    
+            val_acc_mean = np.mean(subj_accs)
+            val_acc_std = np.std(subj_accs)
+            fitness = val_acc_mean - (pbt.alpha * val_acc_std)
+            
+            population_states[w_idx] = unrep_state
+            worker_fitnesses.append(fitness)
+            worker_val_means.append(val_acc_mean)
+            worker_val_stds.append(val_acc_std)
+            
+        population_fitnesses = np.array(worker_fitnesses)
+        best_w_idx_gen = int(np.argmax(population_fitnesses))
+        best_hp_temp = pbt.worker_hps[best_w_idx_gen]
+        
+        print(f"* Gen {gen:02d} 완료 | 1st worker performance: [Mean: {worker_val_means[best_w_idx_gen]*100:.1f}% | Std: {worker_val_stds[best_w_idx_gen]*100:.1f}% | Fitness: {population_fitnesses[best_w_idx_gen]*100:.1f}]")
+        
+        best_state_gen = replicate(population_states[best_w_idx_gen])
+        best_hp_gen = {k: jnp.array(v, dtype=jnp.float32) for k, v in best_hp_temp.items()}
+        
+        test_accs_gen = []
+        for b in range(num_test_batches):
+            acc = eval_step_pmap(best_state_gen, X_test_gpu[b], Y_test_gpu[b], best_hp_gen)
+            test_accs_gen.append(np.mean(acc))
+            
+        history_test_acc.append(np.mean(test_accs_gen))
+        print(f"# [monitoring] 현재 1등 워커의 실시간 Test Acc: {np.mean(test_accs_gen)*100:.1f}%")
 
-# =========================================================
-# 6. 최종 챔피언 분석 및 Figure용 전체 데이터 Save (🔥 완벽 복구)
-# =========================================================
-best_idx = int(np.argmax(population_accs)) 
-best_hp = pbt.worker_hps[best_idx]
-best_state = population_states[best_idx]
+        population_states = pbt.exploit_and_explore(population_states, population_fitnesses)
 
-# 최상위 모델의 실제 파라미터를 꺼내서 수식에 넣어 실제 배열값을 계산
-params = best_state.params
-# Layer 1
-raw_v1 = params['HR_HLIFLayer2D_0']['vth_raw']
-raw_d1 = params['HR_HLIFLayer2D_0']['decay_raw']
-l1_vth = np.array(jax.nn.softplus(raw_v1 * best_hp['v1_s'] + best_hp['v1_m']) + 0.01).flatten()
-l1_decay = np.array(jnp.clip(jax.nn.sigmoid(raw_d1 * best_hp['d1_s'] + best_hp['d1_m']), 0.0, 0.99)).flatten()
+    best_w_idx = int(np.argmax(population_fitnesses))
+    best_final_state = replicate(population_states[best_w_idx])
+    best_final_hp = pbt.worker_hps[best_w_idx]
+    best_final_hp_jax = {k: jnp.array(v, dtype=jnp.float32) for k, v in best_final_hp.items()}
 
-# Layer 2
-raw_v2 = params['HR_HLIFLayer2D_1']['vth_raw']
-raw_d2 = params['HR_HLIFLayer2D_1']['decay_raw']
-l2_vth = np.array(jax.nn.softplus(raw_v2 * best_hp['v2_s'] + best_hp['v2_m']) + 0.01).flatten()
-l2_decay = np.array(jnp.clip(jax.nn.sigmoid(raw_d2 * best_hp['d2_s'] + best_hp['d2_m']), 0.0, 0.99)).flatten()
+    final_test_accs = []
+    for b in range(num_test_batches):
+        acc = eval_step_pmap(best_final_state, X_test_gpu[b], Y_test_gpu[b], best_final_hp_jax)
+        final_test_accs.append(np.mean(acc))
+        
+    final_test_score = np.mean(final_test_accs) * 100
+    print(f"\n[FOLD {FOLD_IDX} 최종 결과] RG-SNN Test Accuracy: {final_test_score:.2f}% 🎯\n")
 
-np.set_printoptions(precision=4, suppress=True, linewidth=120)
+    final_params = unfreeze(best_final_state.params)
 
-print(f"\n🏆 [최종 챔피언] Worker {best_idx:02d} (최종 Test Acc: {population_accs[best_idx]*100:.1f}%)")
-print("="*80)
-print(f"▶ Layer 1 (Temporal, 32 뉴런) 실제 Vth 값:\n{l1_vth}")
-print(f"\n▶ Layer 1 (Temporal, 32 뉴런) 실제 Decay 값:\n{l1_decay}")
-print(f"\n▶ Layer 2 (Spatial,  64 뉴런) 실제 Vth 값:\n{l2_vth}")
-print(f"\n▶ Layer 2 (Spatial,  64 뉴런) 실제 Decay 값:\n{l2_decay}")
-print("="*80)
-
-# 🔥 17개 HP 전부 저장!
-hp_keys = ['lr', 'wd', 'cd_rate', 'drop1', 'drop2', 
-           'v1_m', 'v1_s', 'd1_m', 'd1_s', 'a1', 
-           'v2_m', 'v2_s', 'd2_m', 'd2_s', 'a2', 
-           'decay_out', 'reg_spike']
-hp_history_dict = {k: np.array([[gen_hp[w][k] for w in range(20)] for gen_hp in history_hps]) for k in hp_keys}
-
-# 저장 경로 조심해! Runpod이면 '/workspace/...' 이런 식이어야 해.
-save_path = 'pbt_evolution_data_hr_snn.npz'
-np.savez(save_path,
-         acc_history=np.array(history_accs),            # shape: (10, 20)
-         train_acc_history=np.array(history_train_accs),# shape: (10, 20)
-         train_loss_history=np.array(history_train_losses), # shape: (10, 20)
-         l1_vth_final=l1_vth,                           # shape: (32,)
-         l1_decay_final=l1_decay,                       # shape: (32,)
-         l2_vth_final=l2_vth,                           # shape: (64,)
-         l2_decay_final=l2_decay,                       # shape: (64,)
-         **hp_history_dict)                             # 각 HP별 shape: (10, 20)
-
-print(f"\n✅ 논문 Figure용 전체 데이터 저장 완료 (총 17개 HP 포함): {save_path}")
+    np.savez(save_path, 
+             final_test_score=final_test_score,
+             best_final_hp=best_final_hp, 
+             history_test_acc=history_test_acc,
+             model_params=np.array(final_params, dtype=object))
+             
+    print(f"Fold {FOLD_IDX} 저장 완료: {save_path}")

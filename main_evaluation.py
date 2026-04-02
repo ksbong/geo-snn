@@ -1,4 +1,5 @@
 
+
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import numpy as np
@@ -14,13 +15,14 @@ import jax.numpy as jnp
 try:
     import jax.tools.colab_tpu
     jax.tools.colab_tpu.setup_tpu()
-    print("TPU 준비 완료")
+    print("✅ TPU 환경 감지")
 except Exception as e:
-    print("TPU 환경 아님")
+    print(f"✅ GPU/CPU 환경 가동 (디바이스 수: {jax.device_count()}) - RSNN 모드")
 
 from jax import random as jrandom
 import flax.linen as nn
 from flax.training import train_state
+import flax.traverse_util
 import optax
 from functools import partial
 from typing import Any
@@ -28,12 +30,26 @@ from flax.jax_utils import replicate, unreplicate
 from flax.core import unfreeze
 
 mne.set_log_level('ERROR')
-
 DATA_DIR = './07_Data'
 
-def load_balanced_ra_2d(subj_list, desc="Loading", verbose=True):
+def apply_ra(X_train, X_test=None):
+    # 🔥 lwf 적용: 퓨샷(Few-shot) 데이터 행렬 붕괴 원천 차단
+    covs = Covariances(estimator='lwf').fit_transform(X_train)
+    C_ref = mean_covariance(covs, metric='riemann')
+    whiten = invsqrtm(C_ref)
+    
+    X_train_ra = np.array([np.dot(whiten, trial) for trial in X_train])
+    X_train_out = np.transpose(X_train_ra, (0, 2, 1))[:, :, :, np.newaxis]
+    
+    if X_test is not None and len(X_test) > 0:
+        X_test_ra = np.array([np.dot(whiten, trial) for trial in X_test])
+        X_test_out = np.transpose(X_test_ra, (0, 2, 1))[:, :, :, np.newaxis]
+        return X_train_out, X_test_out
+    return X_train_out
+
+def load_balanced_data(subj_list, desc="Loading", verbose=False):
     if not os.path.exists(DATA_DIR):
-        raise FileNotFoundError(f"데이터 경로 오류")
+        raise FileNotFoundError(f"🚨 데이터 경로 오류!")
         
     X_out, Y_out = [], []
 
@@ -76,32 +92,34 @@ def load_balanced_ra_2d(subj_list, desc="Loading", verbose=True):
         np.random.shuffle(idx_2); np.random.shuffle(idx_3)
         bal_idx = np.concatenate([idx_0[:min_cnt], idx_1[:min_cnt], idx_2[:min_cnt], idx_3[:min_cnt]])
         np.random.shuffle(bal_idx)
-        X_bal, Y_bal = X_raw[bal_idx], Y_raw[bal_idx]
         
-        covs = Covariances(estimator='scm').fit_transform(X_bal)
-        C_ref = mean_covariance(covs, metric='riemann')
-        whiten = invsqrtm(C_ref)
+        X_out.append(X_raw[bal_idx])
+        Y_out.extend(Y_raw[bal_idx])
         
-        X_ra = np.array([np.dot(whiten, trial) for trial in X_bal])
-        X_ra_transposed = np.transpose(X_ra, (0, 2, 1))[:, :, :, np.newaxis]
-        
-        X_out.append(X_ra_transposed) 
-        Y_out.extend(Y_bal)
-        
-    return np.concatenate(X_out) if len(X_out) > 0 else np.array([]), np.array(Y_out)
+    if len(X_out) == 0: return np.array([]), np.array([])
+    return np.concatenate(X_out), np.array(Y_out)
 
 num_devices = jax.device_count() 
 batch_size = 32 
-per_device = batch_size // num_devices
+per_device = max(1, batch_size // num_devices)
+batch_size = per_device * num_devices 
 
-def prepare_gpu_data(X, Y, num_batches, shuffle=True):
+def prepare_gpu_data(X, Y, batch_size, shuffle=True):
+    num_batches = int(np.ceil(len(X) / batch_size))
+    pad_size = (num_batches * batch_size) - len(X)
+    
+    if pad_size > 0:
+        X = np.concatenate([X, X[:pad_size]], axis=0)
+        Y = np.concatenate([Y, Y[:pad_size]], axis=0)
+        
     if shuffle:
         perm = np.random.permutation(len(X))
         X = X[perm]
         Y = Y[perm]
-    X_b = X[:num_batches * batch_size].astype(np.float32).reshape(num_batches, num_devices, per_device, *X.shape[1:])
-    Y_b = Y[:num_batches * batch_size].astype(np.int32).reshape(num_batches, num_devices, per_device)
-    return jax.device_put(X_b), jax.device_put(Y_b)
+        
+    X_b = X.astype(np.float32).reshape(num_batches, num_devices, per_device, *X.shape[1:])
+    Y_b = Y.astype(np.int32).reshape(num_batches, num_devices, per_device)
+    return jax.device_put(X_b), jax.device_put(Y_b), num_batches
 
 @jax.custom_vjp
 def spike_fn(x, alpha):
@@ -120,6 +138,20 @@ spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 class TrainState(train_state.TrainState):
     batch_stats: Any
 
+class SEBlock1D(nn.Module):
+    reduction: int = 16
+    @nn.compact
+    def __call__(self, x):
+        b, t, s, c = x.shape
+        y = jnp.mean(x, axis=(1, 2)) 
+        y = nn.Dense(max(c // self.reduction, 4), use_bias=False)(y)
+        y = jax.nn.relu(y)
+        y = nn.Dense(c, use_bias=False)(y)
+        y = jax.nn.sigmoid(y) 
+        y = jnp.reshape(y, (b, 1, 1, c))
+        return x * y
+
+# 🔥 [기본 콩나물 뉴런] Layer 1 (공간 압축)에만 사용
 class HR_HLIFLayer2D(nn.Module):
     @nn.compact
     def __call__(self, x, hp_v_m, hp_v_s, hp_d_m, hp_d_s, hp_alpha):
@@ -136,45 +168,90 @@ class HR_HLIFLayer2D(nn.Module):
         _, spikes = jax.lax.scan(scan_fn, jnp.zeros_like(x_seq[0]), x_seq)
         return jnp.moveaxis(spikes, 0, 1)
 
-class ALIFLayer2D(nn.Module):
+# 🔥 [피드백 장착 RSNN 뉴런 1] Layer 2에 이식 (기억력 강화)
+class Recurrent_HR_HLIFLayer2D(nn.Module):
+    @nn.compact
+    def __call__(self, x, hp_v_m, hp_v_s, hp_d_m, hp_d_s, hp_alpha):
+        x_seq = jnp.moveaxis(x, 1, 0)
+        shape = x.shape[2:]
+        raw_vth = self.param('vth_raw', nn.initializers.normal(stddev=1.0), shape)
+        raw_decay = self.param('decay_raw', nn.initializers.normal(stddev=1.0), shape)
+        
+        # 순환 가중치(Recurrent Weight) 추가: 자기들끼리 스파이크 통신
+        w_rec = self.param('w_rec', nn.initializers.normal(stddev=0.05), (shape[-1], shape[-1]))
+        
+        vth = jax.nn.softplus(raw_vth * hp_v_s + hp_v_m) + 0.5
+        decay = jnp.clip(jax.nn.sigmoid(raw_decay * hp_d_s + hp_d_m), 0.0, 0.99)
+        
+        def scan_fn(carry, x_t):
+            v, prev_s = carry
+            rec_input = jnp.dot(prev_s, w_rec) # 과거의 스파이크가 현재의 나를 자극
+            v = v * decay + x_t + rec_input
+            s = spike_fn(v - vth, hp_alpha)
+            v_next = v - jax.lax.stop_gradient(s) * vth
+            return (v_next, s), s
+            
+        init_carry = (jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]))
+        _, spikes = jax.lax.scan(scan_fn, init_carry, x_seq)
+        return jnp.moveaxis(spikes, 0, 1)
+
+# 🔥 [피드백 장착 RSNN 뉴런 2] Layer 3에 이식 (장기 기억 및 적응형 임계값)
+class Recurrent_ALIFLayer2D(nn.Module):
     @nn.compact
     def __call__(self, x, hp_alif_d, hp_alif_adp, hp_alif_beta, hp_alpha):
         x_seq = jnp.moveaxis(x, 1, 0)
+        shape = x.shape[2:]
+        
+        # 순환 가중치(Recurrent Weight)
+        w_rec = self.param('w_rec', nn.initializers.normal(stddev=0.05), (shape[-1], shape[-1]))
+        
         def scan_fn(carry, x_t):
             v, theta, prev_s = carry
             theta_next = theta * hp_alif_adp + prev_s * hp_alif_beta
-            v_next = v * hp_alif_d + x_t
+            rec_input = jnp.dot(prev_s, w_rec)
+            v_next = v * hp_alif_d + x_t + rec_input
             vth_t = 0.5 + theta_next
             s = spike_fn(v_next - vth_t, hp_alpha)
             v_next = v_next - jax.lax.stop_gradient(s) * vth_t
-            return (v_next, theta_next, jax.lax.stop_gradient(s)), s
+            return (v_next, theta_next, s), s
+            
         init_carry = (jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]))
         _, spikes = jax.lax.scan(scan_fn, init_carry, x_seq)
         return jnp.moveaxis(spikes, 0, 1)
 
-class RG_SNN_PureOriginal(nn.Module):
+class SE_RG_RSNN_Final(nn.Module):
     @nn.compact
-    def __call__(self, x, hp, train=True):
-        x1 = nn.Conv(64, kernel_size=(1, 64), padding='VALID', use_bias=False)(x)
-        x1 = nn.BatchNorm(use_running_average=not train)(x1)
-        if train:
-            x1 = x1 * jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop1'], shape=x1.shape) * (1.0 / (1.0 - hp['drop1'] + 1e-8))
+    def __call__(self, x, hp, train_bn=True, train_drop=True):
+        
+        # Layer 1: 공간 압축 (피드백 없이 순방향)
+        x1 = nn.Conv(128, kernel_size=(1, 64), padding='VALID', use_bias=False)(x)
+        x1 = SEBlock1D(reduction=16)(x1) 
+        x1 = nn.BatchNorm(use_running_average=not train_bn)(x1)
+        if train_drop: 
+            drop_mask1 = jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop1'], shape=(x1.shape[0], 1, 1, x1.shape[3]))
+            x1 = x1 * drop_mask1 * (1.0 / (1.0 - hp['drop1'] + 1e-8))
         spk1 = HR_HLIFLayer2D()(x1, hp['v1_m'], hp['v1_s'], hp['d1_m'], hp['d1_s'], hp['a1'])
 
-        x2 = nn.Conv(128, kernel_size=(32, 1), kernel_dilation=(4, 1), padding='SAME', use_bias=False)(spk1)
-        x2 = nn.BatchNorm(use_running_average=not train)(x2)
-        if train:
-            x2 = x2 * jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop2'], shape=x2.shape) * (1.0 / (1.0 - hp['drop2'] + 1e-8))
-        spk2 = HR_HLIFLayer2D()(x2, hp['v2_m'], hp['v2_s'], hp['d2_m'], hp['d2_s'], hp['a2'])
+        # Layer 2: RSNN 피드백 적용
+        x2 = nn.Conv(256, kernel_size=(32, 1), kernel_dilation=(4, 1), padding='SAME', use_bias=False)(spk1)
+        x2 = SEBlock1D(reduction=16)(x2) 
+        x2 = nn.BatchNorm(use_running_average=not train_bn)(x2)
+        if train_drop: 
+            drop_mask2 = jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop2'], shape=(x2.shape[0], 1, 1, x2.shape[3]))
+            x2 = x2 * drop_mask2 * (1.0 / (1.0 - hp['drop2'] + 1e-8))
+        spk2 = Recurrent_HR_HLIFLayer2D()(x2, hp['v2_m'], hp['v2_s'], hp['d2_m'], hp['d2_s'], hp['a2'])
 
-        x3 = nn.Conv(128, kernel_size=(32, 1), kernel_dilation=(12, 1), padding='SAME', use_bias=False)(spk2)
-        x3 = nn.BatchNorm(use_running_average=not train)(x3)
-        if train:
-            x3 = x3 * jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop3'], shape=x3.shape) * (1.0 / (1.0 - hp['drop3'] + 1e-8))
-        spk3 = ALIFLayer2D()(x3, hp['alif_d'], hp['alif_adp'], hp['alif_beta'], hp['a3'])
+        # Layer 3: RSNN + 적응형 임계값
+        x3 = nn.Conv(256, kernel_size=(32, 1), kernel_dilation=(12, 1), padding='SAME', use_bias=False)(spk2)
+        x3 = SEBlock1D(reduction=16)(x3) 
+        x3 = nn.BatchNorm(use_running_average=not train_bn)(x3)
+        if train_drop: 
+            drop_mask3 = jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop3'], shape=(x3.shape[0], 1, 1, x3.shape[3]))
+            x3 = x3 * drop_mask3 * (1.0 / (1.0 - hp['drop3'] + 1e-8))
+        spk3 = Recurrent_ALIFLayer2D()(x3, hp['alif_d'], hp['alif_adp'], hp['alif_beta'], hp['a3'])
         
         x_pool = jnp.mean(spk3, axis=2) 
-        dense_out = nn.Dense(4)(x_pool) 
+        dense_out = nn.Dense(4, name='class_dense')(x_pool) 
         
         def li_scan(v, x_t):
             decay = hp['decay_out']
@@ -187,16 +264,14 @@ class RG_SNN_PureOriginal(nn.Module):
         v_reshaped = jnp.reshape(v_seq, (v_seq.shape[0], 20, 24, 4))
         dp_features = jnp.mean(v_reshaped[:, :, -12:, :], axis=2) - jnp.mean(v_reshaped[:, :, :12, :], axis=2) 
         
-        attn_w = nn.Dense(1)(jax.nn.relu(nn.Dense(8)(dp_features)))
+        attn_w = nn.Dense(1, name='attn_dense2')(jax.nn.relu(nn.Dense(8, name='attn_dense1')(dp_features)))
         attn_w = jax.nn.softmax(attn_w, axis=1)
         out_logits = jnp.sum(dp_features * attn_w, axis=1)
         
         return out_logits, (spk1, spk2, spk3)
 
-# 🔥 타겟팅된 PBT 최적 범위
-# 🔥 숨통 틔워준 오리지널 PBT 최적 범위 (이 부분만 덮어쓰기)
 class PBTManager:
-    def __init__(self, num_workers=20, alpha=1.0):
+    def __init__(self, num_workers=8, alpha=1.0):
         self.num_workers = num_workers
         self.alpha = alpha
         self.worker_hps = []
@@ -214,7 +289,7 @@ class PBTManager:
                 'a2': np.random.uniform(2.0, 5.0),
                 'alif_d': np.random.uniform(0.7, 0.95),      
                 'alif_adp': np.random.uniform(0.9, 0.99),   
-                'alif_beta': np.random.uniform(0.01, 0.3),   
+                'alif_beta': np.random.uniform(0.01, 0.5),   
                 'a3': np.random.uniform(2.0, 5.0),           
                 'decay_out': np.random.uniform(0.5, 0.99),
                 'reg_spike': 10**np.random.uniform(-5, -4) 
@@ -231,7 +306,6 @@ class PBTManager:
                 mutation_factor = np.random.uniform(0.8, 1.2)
                 new_val = new_hp[k] * mutation_factor
                 
-                # 변이 범위는 넓게 허용해서 PBT가 만렙 수치까지 갈 수 있게 열어둠
                 if 'drop' in k: new_hp[k] = jnp.clip(new_val, 0.1, 0.55) 
                 elif k in ['decay_out', 'alif_d']: new_hp[k] = jnp.clip(new_val, 0.5, 0.999)
                 elif k == 'alif_adp': new_hp[k] = jnp.clip(new_val, 0.85, 0.999) 
@@ -246,7 +320,12 @@ class PBTManager:
             states[b] = states[t].replace(opt_state=new_opt_state)
             
         return states
-    
+
+def create_sstl_mask(params):
+    flat_params = flax.traverse_util.flatten_dict(params)
+    mask = {k: 'class_dense' in k for k, v in flat_params.items()}
+    return flax.traverse_util.unflatten_dict(mask)
+
 all_subjs = [f'S{i:03d}' for i in range(1, 110)]
 exclude = ['S088', 'S092', 'S100', 'S104'] 
 subjects = sorted([s for s in all_subjs if s not in exclude])
@@ -255,53 +334,41 @@ kf = KFold(n_splits=5, shuffle=True, random_state=42)
 splits = list(kf.split(subjects))
 
 for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
-    # 요청대로 FOLD 0만 재실행
     if FOLD_IDX != 0: continue
 
-    print(f"\n{'='*60}\n[FOLD {FOLD_IDX}/5] targeted PBT evo 시작 \n{'='*60}")
+    print(f"\n{'='*60}\n🚀 [PHASE 1] RSNN + PBT 글로벌 진화 훈련 (10 Generations)\n{'='*60}")
     
-    CACHE_FILE = f'/workspace/geo-snn/raw_eeg_cache_fold{FOLD_IDX}_tpu.npz'
-    save_path = f'/workspace/geo-snn/rg_snn_pure_fold{FOLD_IDX}_tpu_rerun.npz'
+    train_subjs = [subjects[i] for i in train_idx]
+    test_subjs = [subjects[i] for i in test_idx]
+    train_subjs, val_subjs = train_test_split(train_subjs, test_size=0.25, random_state=42)
     
+    X_tr_list, Y_tr_list = [], []
+    for s in train_subjs:
+        X, Y = load_balanced_data([s], verbose=False)
+        if len(X) > 0:
+            X_tr_list.append(apply_ra(X))
+            Y_tr_list.extend(Y)
+    X_tr = np.concatenate(X_tr_list) if X_tr_list else np.array([])
+    Y_tr = np.array(Y_tr_list)
+
     val_subject_data = []
+    for s in val_subjs:
+        X, Y = load_balanced_data([s], verbose=False)
+        if len(X) > 0:
+            val_subject_data.append((apply_ra(X), Y))
 
-    if os.path.exists(CACHE_FILE):
-        data = np.load(CACHE_FILE, allow_pickle=True)
-        X_tr, Y_tr = data['X_tr'], data['Y_tr']
-        X_test, Y_test = data['X_test'], data['Y_test']
-        val_subject_data = data['val_subject_data'].tolist()
-        print(f"-- 데이터 캐시 로딩 완료 (Val: {len(val_subject_data)}명)")
-    else:
-        print(f"-- 전체 데이터 로딩 및 전처리 시작...")
-        train_subjs_full = [subjects[i] for i in train_idx]
-        test_subjs = [subjects[i] for i in test_idx]
-        train_subjs, val_subjs = train_test_split(train_subjs_full, test_size=0.25, random_state=42)
-        
-        X_tr, Y_tr = load_balanced_ra_2d(train_subjs, f"Train Data")
-        X_test, Y_test = load_balanced_ra_2d(test_subjs, f"Test Data")
-        
-        print(f"-- Validation Data 로딩 시작...")
-        for s in val_subjs:
-            vx, vy = load_balanced_ra_2d([s], desc=f"Val Subj {s}", verbose=False)
-            if len(vx) > 0:
-                val_subject_data.append((vx, vy))
-        
-        np.savez_compressed(CACHE_FILE, X_tr=X_tr, Y_tr=Y_tr, X_test=X_test, Y_test=Y_test, val_subject_data=np.array(val_subject_data, dtype=object))
+    X_tr_gpu, Y_tr_gpu, num_train_batches = prepare_gpu_data(X_tr, Y_tr, batch_size, shuffle=True)
 
-    num_train_batches = len(X_tr) // batch_size
-    num_test_batches = len(X_test) // batch_size
-    X_test_gpu, Y_test_gpu = prepare_gpu_data(X_test, Y_test, num_test_batches, shuffle=False)
-
-    pbt = PBTManager(num_workers=20, alpha=1.0)
+    pbt = PBTManager(num_workers=8, alpha=1.0)
     rng = jrandom.PRNGKey(42 + FOLD_IDX)
-    global_model = RG_SNN_PureOriginal()
+    global_model = SE_RG_RSNN_Final()
     global_tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.001, weight_decay=0.001)
 
     population_states = []
     init_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in pbt.worker_hps[0].items()}
-    var = global_model.init(rng, jnp.ones((1, 480, 64, 1)), init_hp, train=False)
+    var = global_model.init(rng, jnp.ones((1, 480, 64, 1)), init_hp, train_bn=False, train_drop=False)
 
-    for i in range(20):
+    for i in range(8):
         hp = pbt.worker_hps[i]
         state = TrainState.create(
             apply_fn=global_model.apply, params=var['params'], tx=global_tx, batch_stats=var['batch_stats']
@@ -315,38 +382,32 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
         def loss_fn(params):
             (logits, (spk1, spk2, spk3)), new_vars = state.apply_fn(
                 {'params': params, 'batch_stats': state.batch_stats}, 
-                x, hp, train=True, rngs={'dropout': drop_rng}, mutable=['batch_stats']
+                x, hp, train_bn=True, train_drop=True, rngs={'dropout': drop_rng}, mutable=['batch_stats']
             )
             smooth_y = optax.smooth_labels(jax.nn.one_hot(y, 4), 0.1)
             ce_loss = jnp.mean(optax.softmax_cross_entropy(logits, smooth_y))
             spike_loss = hp['reg_spike'] * (jnp.mean(spk1) + jnp.mean(spk2) + jnp.mean(spk3))
             total_loss = ce_loss + spike_loss
-            acc = jnp.mean(jnp.argmax(logits, -1) == y)
-            return total_loss, (logits, new_vars['batch_stats'], acc, total_loss)
+            return total_loss, new_vars['batch_stats']
             
-        grads, (logits, new_bs, tr_acc, tr_loss) = jax.grad(loss_fn, has_aux=True)(state.params)
+        grads, new_bs = jax.grad(loss_fn, has_aux=True)(state.params)
         state = state.apply_gradients(grads=jax.lax.pmean(grads, 'batch'), batch_stats=jax.lax.pmean(new_bs, 'batch'))
-        return state, jax.lax.pmean(tr_acc, 'batch'), jax.lax.pmean(tr_loss, 'batch')
+        return state
 
     @jax.jit
     def eval_step_single(state, x, y, hp):
-        logits, _ = state.apply_fn({'params': state.params, 'batch_stats': state.batch_stats}, x, hp, train=False)
+        logits, _ = state.apply_fn(
+            {'params': state.params, 'batch_stats': state.batch_stats}, 
+            x, hp, train_bn=False, train_drop=False
+        )
         return jnp.mean(jnp.argmax(logits, -1) == y)
 
-    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, None))
-    def eval_step_pmap(state, x, y, hp):
-        logits, _ = state.apply_fn({'params': state.params, 'batch_stats': state.batch_stats}, x, hp, train=False)
-        return jnp.mean(jnp.argmax(logits, -1) == y)
-    
-    history_test_acc = []
-    
-    for gen in range(1, 31): 
-        print(f"Gen {gen:02d} | Fold {FOLD_IDX} Train 데이터 shuffle & TPU uploading...")
-        X_tr_gpu, Y_tr_gpu = prepare_gpu_data(X_tr, Y_tr, num_train_batches, shuffle=True)
+    # 딱 10세대만 돌림
+    for gen in range(1, 11): 
+        print(f"Gen {gen:02d} | Fold {FOLD_IDX} Train 데이터 학습 중...")
+        worker_fitnesses, worker_val_means = [], []
         
-        worker_fitnesses, worker_val_means, worker_val_stds = [], [], []
-        
-        for w_idx in range(20):
+        for w_idx in range(8):
             hp = pbt.worker_hps[w_idx]
             p_state = replicate(population_states[w_idx]) 
             dynamic_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in hp.items()}
@@ -355,7 +416,7 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
                 for b in range(num_train_batches):
                     rng, drop_rng = jrandom.split(rng)
                     drop_rngs = jrandom.split(drop_rng, num_devices)
-                    p_state, _, _ = train_step(p_state, X_tr_gpu[b], Y_tr_gpu[b], drop_rngs, dynamic_hp)
+                    p_state = train_step(p_state, X_tr_gpu[b], Y_tr_gpu[b], drop_rngs, dynamic_hp)
                     
             unrep_state = unreplicate(p_state)
             subj_accs = []
@@ -365,6 +426,7 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
                 for i in range(0, len(vx), 32):
                     bx = jnp.array(vx[i:i+32])
                     by = jnp.array(vy[i:i+32])
+                    if len(bx) == 0: continue
                     acc = eval_step_single(unrep_state, bx, by, dynamic_hp)
                     chunk_accs.append(acc)
                 if chunk_accs:
@@ -377,46 +439,111 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
             population_states[w_idx] = unrep_state
             worker_fitnesses.append(fitness)
             worker_val_means.append(val_acc_mean)
-            worker_val_stds.append(val_acc_std)
             
         population_fitnesses = np.array(worker_fitnesses)
         best_w_idx_gen = int(np.argmax(population_fitnesses))
-        best_hp_temp = pbt.worker_hps[best_w_idx_gen]
-        
-        print(f"* Gen {gen:02d} 완료 | 1st worker performance: [Mean: {worker_val_means[best_w_idx_gen]*100:.1f}% | Std: {worker_val_stds[best_w_idx_gen]*100:.1f}% | Fitness: {population_fitnesses[best_w_idx_gen]*100:.1f}]")
-        
-        best_state_gen = replicate(population_states[best_w_idx_gen])
-        best_hp_gen = {k: jnp.array(v, dtype=jnp.float32) for k, v in best_hp_temp.items()}
-        
-        test_accs_gen = []
-        for b in range(num_test_batches):
-            acc = eval_step_pmap(best_state_gen, X_test_gpu[b], Y_test_gpu[b], best_hp_gen)
-            test_accs_gen.append(np.mean(acc))
-            
-        history_test_acc.append(np.mean(test_accs_gen))
-        print(f"# [monitoring] 현재 1등 워커의 실시간 Test Acc: {np.mean(test_accs_gen)*100:.1f}%")
-
+        print(f"Gen {gen:02d} 완료 | 1st worker 성능 (Val): [Mean: {worker_val_means[best_w_idx_gen]*100:.1f}%]")
         population_states = pbt.exploit_and_explore(population_states, population_fitnesses)
 
-    best_w_idx = int(np.argmax(population_fitnesses))
-    best_final_state = replicate(population_states[best_w_idx])
-    best_final_hp = pbt.worker_hps[best_w_idx]
-    best_final_hp_jax = {k: jnp.array(v, dtype=jnp.float32) for k, v in best_final_hp.items()}
+    top_k = 3 
+    top_indices = np.argsort(population_fitnesses)[-top_k:]
+    top_states = [population_states[idx] for idx in top_indices]
+    top_hps = [pbt.worker_hps[idx] for idx in top_indices]
 
-    final_test_accs = []
-    for b in range(num_test_batches):
-        acc = eval_step_pmap(best_final_state, X_test_gpu[b], Y_test_gpu[b], best_final_hp_jax)
-        final_test_accs.append(np.mean(acc))
+    print(f"\n{'='*60}\n🔥 [PHASE 2] 논문 룰 기반 4-FOLD SSTL 평가\n{'='*60}")
+    
+    mask_tree = create_sstl_mask(top_states[0].params)
+    sstl_tx = optax.masked(optax.adamw(learning_rate=5e-4, weight_decay=0.001), mask_tree)
+    
+    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, 0, None))
+    def sstl_train_step(state, x, y, drop_rng, hp):
+        def loss_fn(params):
+            (logits, _ ) = state.apply_fn(
+                {'params': params, 'batch_stats': state.batch_stats}, 
+                x, hp, train_bn=False, train_drop=True, rngs={'dropout': drop_rng}
+            )
+            smooth_y = optax.smooth_labels(jax.nn.one_hot(y, 4), 0.1)
+            ce_loss = jnp.mean(optax.softmax_cross_entropy(logits, smooth_y))
+            return ce_loss
+            
+        grads = jax.grad(loss_fn)(state.params)
+        state = state.apply_gradients(grads=jax.lax.pmean(grads, 'batch'))
+        return state
+
+    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, None))
+    def get_logits_pmap(state, x, hp):
+        logits, _ = state.apply_fn(
+            {'params': state.params, 'batch_stats': state.batch_stats}, 
+            x, hp, train_bn=False, train_drop=False
+        )
+        return logits
+
+    sstl_accuracies = []
+    
+    for subj in test_subjs:
+        X_subj, Y_subj = load_balanced_data([subj], desc=f"SSTL Subj {subj}", verbose=False)
+        if len(X_subj) < 20: continue
         
-    final_test_score = np.mean(final_test_accs) * 100
-    print(f"\n[FOLD {FOLD_IDX} 최종 결과] RG-SNN Test Accuracy: {final_test_score:.2f}% 🎯\n")
-
-    final_params = unfreeze(best_final_state.params)
-
-    np.savez(save_path, 
-             final_test_score=final_test_score,
-             best_final_hp=best_final_hp, 
-             history_test_acc=history_test_acc,
-             model_params=np.array(final_params, dtype=object))
-             
-    print(f"Fold {FOLD_IDX} 저장 완료: {save_path}")
+        kf_sstl = KFold(n_splits=4, shuffle=True, random_state=42)
+        fold_accs = []
+        
+        for adapt_idx, eval_idx in kf_sstl.split(X_subj):
+            X_adapt_raw, X_eval_raw = X_subj[adapt_idx], X_subj[eval_idx]
+            Y_adapt, Y_eval = Y_subj[adapt_idx], Y_subj[eval_idx]
+            
+            X_adapt, X_eval = apply_ra(X_adapt_raw, X_eval_raw)
+            
+            X_adapt_gpu, Y_adapt_gpu, num_adapt_batches = prepare_gpu_data(X_adapt, Y_adapt, batch_size, shuffle=True)
+            X_test_gpu, Y_test_gpu, num_test_batches = prepare_gpu_data(X_eval, Y_eval, batch_size, shuffle=False)
+            
+            adapted_states = []
+            
+            for w_state, w_hp in zip(top_states, top_hps):
+                sstl_state = TrainState.create(
+                    apply_fn=global_model.apply, params=w_state.params, tx=sstl_tx, batch_stats=w_state.batch_stats
+                )
+                p_sstl_state = replicate(sstl_state)
+                dynamic_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in w_hp.items()}
+                
+                for _ in range(5):
+                    for b in range(num_adapt_batches):
+                        rng, drop_rng = jrandom.split(rng)
+                        drop_rngs = jrandom.split(drop_rng, num_devices)
+                        p_sstl_state = sstl_train_step(p_sstl_state, X_adapt_gpu[b], Y_adapt_gpu[b], drop_rngs, dynamic_hp)
+                
+                adapted_states.append(unreplicate(p_sstl_state))
+                
+            ensemble_correct = 0
+            
+            for b in range(num_test_batches):
+                batch_x = X_test_gpu[b]
+                batch_y = Y_test_gpu[b]
+                
+                summed_probs = 0
+                for a_state, w_hp in zip(adapted_states, top_hps):
+                    rep_a_state = replicate(a_state)
+                    dynamic_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in w_hp.items()}
+                    
+                    logits = get_logits_pmap(rep_a_state, batch_x, dynamic_hp) 
+                    probs = jax.nn.softmax(logits, axis=-1)
+                    summed_probs += probs
+                    
+                avg_probs = summed_probs / top_k
+                preds = jnp.argmax(avg_probs, axis=-1)
+                
+                actual_batch_size = len(Y_eval) - (b * batch_size) if b == num_test_batches - 1 else batch_size
+                if actual_batch_size <= 0: break
+                
+                preds = preds.flatten()[:actual_batch_size]
+                batch_y_flat = batch_y.flatten()[:actual_batch_size]
+                
+                ensemble_correct += jnp.sum(preds == batch_y_flat)
+                
+            fold_accs.append((ensemble_correct / len(Y_eval)) * 100)
+            
+        subj_mean_acc = np.mean(fold_accs)
+        sstl_accuracies.append(subj_mean_acc)
+        print(f"Subject {subj} | 4-Fold SSTL Test Acc: {subj_mean_acc:.2f}%")
+        
+    final_sstl_acc = np.mean(sstl_accuracies)
+    print(f"\n🏆 [최종 결과] 완전체 RSNN (PBT 10 Gen + 4-Fold SSTL) 평균 정확도: {final_sstl_acc:.2f}% 🚀\n")

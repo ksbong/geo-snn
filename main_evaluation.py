@@ -1,12 +1,8 @@
-
-
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import numpy as np
 import mne
-from pyriemann.estimation import Covariances
-from pyriemann.utils.mean import mean_covariance
-from pyriemann.utils.base import invsqrtm
+import time
 from sklearn.model_selection import KFold, train_test_split
 
 import jax
@@ -15,47 +11,40 @@ import jax.numpy as jnp
 try:
     import jax.tools.colab_tpu
     jax.tools.colab_tpu.setup_tpu()
-    print("✅ TPU 환경 감지")
+    print("TPU initialized.")
 except Exception as e:
-    print(f"✅ GPU/CPU 환경 가동 (디바이스 수: {jax.device_count()}) - RSNN 모드")
+    print(f"GPU/CPU initialized. Devices: {jax.device_count()}")
 
 from jax import random as jrandom
 import flax.linen as nn
 from flax.training import train_state
-import flax.traverse_util
 import optax
 from functools import partial
 from typing import Any
 from flax.jax_utils import replicate, unreplicate
-from flax.core import unfreeze
 
 mne.set_log_level('ERROR')
 DATA_DIR = './07_Data'
+all_subjs = [f'S{i:03d}' for i in range(1, 110)]
+exclude = ['S088', 'S092', 'S100', 'S104'] 
+subjects = sorted([s for s in all_subjs if s not in exclude])
+subj2idx = {s: i for i, s in enumerate(subjects)}
+NUM_SUBJECTS = len(subjects)
 
-def apply_ra(X_train, X_test=None):
-    # 🔥 lwf 적용: 퓨샷(Few-shot) 데이터 행렬 붕괴 원천 차단
-    covs = Covariances(estimator='lwf').fit_transform(X_train)
-    C_ref = mean_covariance(covs, metric='riemann')
-    whiten = invsqrtm(C_ref)
-    
-    X_train_ra = np.array([np.dot(whiten, trial) for trial in X_train])
-    X_train_out = np.transpose(X_train_ra, (0, 2, 1))[:, :, :, np.newaxis]
-    
-    if X_test is not None and len(X_test) > 0:
-        X_test_ra = np.array([np.dot(whiten, trial) for trial in X_test])
-        X_test_out = np.transpose(X_test_ra, (0, 2, 1))[:, :, :, np.newaxis]
-        return X_train_out, X_test_out
-    return X_train_out
-
-def load_balanced_data(subj_list, desc="Loading", verbose=False):
+# ==========================================
+# 1. Data Loading 
+# ==========================================
+def load_balanced_data(subj_list, verbose=False):
     if not os.path.exists(DATA_DIR):
-        raise FileNotFoundError(f"🚨 데이터 경로 오류!")
+        raise FileNotFoundError("Data path error.")
         
-    X_out, Y_out = [], []
+    X_out, Y_out, Y_subj_out = [], [], []
 
     for s in subj_list:
         subj_dir = os.path.join(DATA_DIR, s)
         subj_x, subj_y = [], []
+        s_idx = subj2idx[s]
+        
         for run in ['R04','R08','R12','R06','R10','R14']:
             path = os.path.join(subj_dir, f'{s}{run}.edf')
             if not os.path.exists(path): continue
@@ -82,6 +71,7 @@ def load_balanced_data(subj_list, desc="Loading", verbose=False):
         if not subj_x: continue
         X_raw = np.concatenate(subj_x, axis=0)[:, :, :480]
         Y_raw = np.array(subj_y)
+        Y_subj_raw = np.full(Y_raw.shape, s_idx)
         
         idx_0, idx_1 = np.where(Y_raw == 0)[0], np.where(Y_raw == 1)[0]
         idx_2, idx_3 = np.where(Y_raw == 2)[0], np.where(Y_raw == 3)[0]
@@ -95,34 +85,58 @@ def load_balanced_data(subj_list, desc="Loading", verbose=False):
         
         X_out.append(X_raw[bal_idx])
         Y_out.extend(Y_raw[bal_idx])
+        Y_subj_out.extend(Y_subj_raw[bal_idx])
         
-    if len(X_out) == 0: return np.array([]), np.array([])
-    return np.concatenate(X_out), np.array(Y_out)
+    if len(X_out) == 0: return np.array([]), np.array([]), np.array([])
+    return np.concatenate(X_out), np.array(Y_out), np.array(Y_subj_out)
 
 num_devices = jax.device_count() 
-batch_size = 32 
+batch_size = 64 
 per_device = max(1, batch_size // num_devices)
 batch_size = per_device * num_devices 
 
-def prepare_gpu_data(X, Y, batch_size, shuffle=True):
+def prepare_gpu_data(X, Y, Y_subj, batch_size, shuffle=True):
+    if len(X) == 0:
+        return jax.device_put(np.array([])), jax.device_put(np.array([])), jax.device_put(np.array([])), 0, 0
+        
     num_batches = int(np.ceil(len(X) / batch_size))
-    pad_size = (num_batches * batch_size) - len(X)
+    target_size = num_batches * batch_size
     
-    if pad_size > 0:
-        X = np.concatenate([X, X[:pad_size]], axis=0)
-        Y = np.concatenate([Y, Y[:pad_size]], axis=0)
+    if target_size > len(X):
+        indices = np.arange(target_size) % len(X)
+        X, Y, Y_subj = X[indices], Y[indices], Y_subj[indices]
         
     if shuffle:
         perm = np.random.permutation(len(X))
-        X = X[perm]
-        Y = Y[perm]
+        X, Y, Y_subj = X[perm], Y[perm], Y_subj[perm]
         
     X_b = X.astype(np.float32).reshape(num_batches, num_devices, per_device, *X.shape[1:])
     Y_b = Y.astype(np.int32).reshape(num_batches, num_devices, per_device)
-    return jax.device_put(X_b), jax.device_put(Y_b), num_batches
+    
+    unique_subjs = np.unique(Y_subj)
+    subj_map = {old: new for new, old in enumerate(unique_subjs)}
+    Y_subj_mapped = np.array([subj_map[s] for s in Y_subj])
+    Y_subj_b = Y_subj_mapped.astype(np.int32).reshape(num_batches, num_devices, per_device)
+    
+    return jax.device_put(X_b), jax.device_put(Y_b), jax.device_put(Y_subj_b), num_batches, len(unique_subjs)
+
+# ==========================================
+# 2. Fundamental Operations & Riemannian Math
+# ==========================================
+@jax.custom_vjp
+def grl(x, alpha):
+    return x
+
+def grl_fwd(x, alpha):
+    return x, alpha
+
+def grl_bwd(alpha, g):
+    return (-alpha * g, None)
+
+grl.defvjp(grl_fwd, grl_bwd)
 
 @jax.custom_vjp
-def spike_fn(x, alpha):
+def spike_fn(x, alpha=3.0):
     return jnp.where(x > 0, 1.0, 0.0)
 
 def spike_fn_fwd(x, alpha):
@@ -135,165 +149,297 @@ def spike_fn_bwd(res, g):
 
 spike_fn.defvjp(spike_fn_fwd, spike_fn_bwd)
 
-class TrainState(train_state.TrainState):
-    batch_stats: Any
+def get_synaptic_trace(spikes, decay=0.9):
+    spikes_seq = jnp.moveaxis(spikes, 1, 0) 
+    def scan_fn(tr, s_t):
+        tr_next = tr * decay + s_t
+        return tr_next, tr_next
+    # 🔥 [OOM FIX] jax.checkpoint 로 역전파 메모리 세이브
+    _, trace_seq = jax.lax.scan(jax.checkpoint(scan_fn), jnp.zeros_like(spikes_seq[0]), spikes_seq)
+    return jnp.moveaxis(trace_seq, 0, 1) 
 
-class SEBlock1D(nn.Module):
-    reduction: int = 16
+def log_euclidean_mapping(x_raw):
+    x_val = jnp.squeeze(x_raw, -1)
+    x_val = jnp.swapaxes(x_val, 1, 2)
+    
+    x_val = x_val - jnp.mean(x_val, axis=-1, keepdims=True)
+    
+    cov = jnp.matmul(x_val, jnp.swapaxes(x_val, 1, 2)) / (x_val.shape[-1] - 1.0)
+    cov = cov + jnp.eye(x_val.shape[1]) * 1e-4 
+    
+    eigvals, eigvecs = jnp.linalg.eigh(cov)
+    log_eigvals = jnp.log(jnp.clip(eigvals, a_min=1e-6))
+    
+    log_cov = jnp.matmul(eigvecs * jnp.expand_dims(log_eigvals, 1), jnp.swapaxes(eigvecs, 1, 2))
+    return log_cov 
+
+class TrainState(train_state.TrainState):
+    pass 
+
+class CausalConv2D(nn.Module):
+    features: int
+    kernel_size: tuple
+    dilation: tuple = (1, 1)
+
     @nn.compact
     def __call__(self, x):
-        b, t, s, c = x.shape
-        y = jnp.mean(x, axis=(1, 2)) 
-        y = nn.Dense(max(c // self.reduction, 4), use_bias=False)(y)
-        y = jax.nn.relu(y)
-        y = nn.Dense(c, use_bias=False)(y)
-        y = jax.nn.sigmoid(y) 
-        y = jnp.reshape(y, (b, 1, 1, c))
-        return x * y
+        pad_t = (self.kernel_size[0] - 1) * self.dilation[0]
+        x_pad = jnp.pad(x, ((0, 0), (pad_t, 0), (0, 0), (0, 0)))
+        return nn.Conv(
+            self.features, 
+            kernel_size=self.kernel_size, 
+            kernel_dilation=self.dilation, 
+            padding='VALID', 
+            use_bias=False
+        )(x_pad)
 
-# 🔥 [기본 콩나물 뉴런] Layer 1 (공간 압축)에만 사용
-class HR_HLIFLayer2D(nn.Module):
+class SpatialUnmixing(nn.Module):
+    num_sources: int
     @nn.compact
-    def __call__(self, x, hp_v_m, hp_v_s, hp_d_m, hp_d_s, hp_alpha):
-        x_seq = jnp.moveaxis(x, 1, 0)
-        shape = x.shape[2:]
-        raw_vth = self.param('vth_raw', nn.initializers.normal(stddev=1.0), shape)
-        raw_decay = self.param('decay_raw', nn.initializers.normal(stddev=1.0), shape)
-        vth = jax.nn.softplus(raw_vth * hp_v_s + hp_v_m) + 0.5
-        decay = jnp.clip(jax.nn.sigmoid(raw_decay * hp_d_s + hp_d_m), 0.0, 0.99)
-        def scan_fn(v, x_t):
-            v = v * decay + x_t
-            s = spike_fn(v - vth, hp_alpha)
-            return v - jax.lax.stop_gradient(s) * vth, s
-        _, spikes = jax.lax.scan(scan_fn, jnp.zeros_like(x_seq[0]), x_seq)
-        return jnp.moveaxis(spikes, 0, 1)
+    def __call__(self, x):
+        V = x.shape[2]
+        W = self.param('unmix_W', nn.initializers.normal(stddev=0.05), (V, self.num_sources))
+        return jnp.einsum('btvf, vs -> btsf', x, W)
 
-# 🔥 [피드백 장착 RSNN 뉴런 1] Layer 2에 이식 (기억력 강화)
-class Recurrent_HR_HLIFLayer2D(nn.Module):
+class Causal_ALIFLayer2D(nn.Module):
     @nn.compact
-    def __call__(self, x, hp_v_m, hp_v_s, hp_d_m, hp_d_s, hp_alpha):
-        x_seq = jnp.moveaxis(x, 1, 0)
-        shape = x.shape[2:]
-        raw_vth = self.param('vth_raw', nn.initializers.normal(stddev=1.0), shape)
-        raw_decay = self.param('decay_raw', nn.initializers.normal(stddev=1.0), shape)
-        
-        # 순환 가중치(Recurrent Weight) 추가: 자기들끼리 스파이크 통신
-        w_rec = self.param('w_rec', nn.initializers.normal(stddev=0.05), (shape[-1], shape[-1]))
-        
-        vth = jax.nn.softplus(raw_vth * hp_v_s + hp_v_m) + 0.5
-        decay = jnp.clip(jax.nn.sigmoid(raw_decay * hp_d_s + hp_d_m), 0.0, 0.99)
-        
-        def scan_fn(carry, x_t):
-            v, prev_s = carry
-            rec_input = jnp.dot(prev_s, w_rec) # 과거의 스파이크가 현재의 나를 자극
-            v = v * decay + x_t + rec_input
-            s = spike_fn(v - vth, hp_alpha)
-            v_next = v - jax.lax.stop_gradient(s) * vth
-            return (v_next, s), s
-            
-        init_carry = (jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]))
-        _, spikes = jax.lax.scan(scan_fn, init_carry, x_seq)
-        return jnp.moveaxis(spikes, 0, 1)
-
-# 🔥 [피드백 장착 RSNN 뉴런 2] Layer 3에 이식 (장기 기억 및 적응형 임계값)
-class Recurrent_ALIFLayer2D(nn.Module):
-    @nn.compact
-    def __call__(self, x, hp_alif_d, hp_alif_adp, hp_alif_beta, hp_alpha):
+    def __call__(self, x, hp_alpha, hp_base_step, hp_base_decay):
         x_seq = jnp.moveaxis(x, 1, 0)
         shape = x.shape[2:]
         
-        # 순환 가중치(Recurrent Weight)
-        w_rec = self.param('w_rec', nn.initializers.normal(stddev=0.05), (shape[-1], shape[-1]))
+        step_w = jax.nn.softplus(self.param('step_w', nn.initializers.ones, shape))
+        decay_w = jax.nn.sigmoid(self.param('decay_w', nn.initializers.normal(stddev=0.1), shape))
+        gamma = self.param('gamma', nn.initializers.ones, shape)
+        beta = self.param('beta', nn.initializers.zeros, shape)
         
-        def scan_fn(carry, x_t):
-            v, theta, prev_s = carry
-            theta_next = theta * hp_alif_adp + prev_s * hp_alif_beta
-            rec_input = jnp.dot(prev_s, w_rec)
-            v_next = v * hp_alif_d + x_t + rec_input
-            vth_t = 0.5 + theta_next
-            s = spike_fn(v_next - vth_t, hp_alpha)
-            v_next = v_next - jax.lax.stop_gradient(s) * vth_t
-            return (v_next, theta_next, s), s
-            
-        init_carry = (jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]))
-        _, spikes = jax.lax.scan(scan_fn, init_carry, x_seq)
-        return jnp.moveaxis(spikes, 0, 1)
+        decay_v = 0.8
+        vth_base = 0.5 
 
-class SE_RG_RSNN_Final(nn.Module):
+        def scan_fn(state, x_t):
+            v, vth_dyn = state
+            x_t_scaled = x_t * gamma + beta
+            v = v * decay_v + x_t_scaled
+            
+            step_eff = hp_base_step * step_w
+            decay_eff = hp_base_decay + (1.0 - hp_base_decay) * decay_w 
+            
+            vth_eff = vth_base + vth_dyn
+            s = spike_fn(v - vth_eff, hp_alpha)
+            
+            v_next = v - vth_eff * jax.lax.stop_gradient(s) 
+            vth_dyn_next = vth_dyn * decay_eff + jax.lax.stop_gradient(s) * step_eff
+            
+            return (v_next, vth_dyn_next), (s, v)
+            
+        init_state = (jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]))
+        # 🔥 [OOM FIX] jax.checkpoint 로 역전파 메모리 세이브
+        _, (spikes, voltages) = jax.lax.scan(jax.checkpoint(scan_fn), init_state, x_seq)
+        return jnp.moveaxis(spikes, 0, 1), jnp.moveaxis(voltages, 0, 1)
+
+class TemporalAttentionReadout(nn.Module):
     @nn.compact
-    def __call__(self, x, hp, train_bn=True, train_drop=True):
+    def __call__(self, x_g):
+        x_pool = jnp.mean(x_g, axis=3, keepdims=True) 
         
-        # Layer 1: 공간 압축 (피드백 없이 순방향)
-        x1 = nn.Conv(128, kernel_size=(1, 64), padding='VALID', use_bias=False)(x)
-        x1 = SEBlock1D(reduction=16)(x1) 
-        x1 = nn.BatchNorm(use_running_average=not train_bn)(x1)
-        if train_drop: 
-            drop_mask1 = jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop1'], shape=(x1.shape[0], 1, 1, x1.shape[3]))
-            x1 = x1 * drop_mask1 * (1.0 / (1.0 - hp['drop1'] + 1e-8))
-        spk1 = HR_HLIFLayer2D()(x1, hp['v1_m'], hp['v1_s'], hp['d1_m'], hp['d1_s'], hp['a1'])
+        kernel_size = 7
+        pad_t = kernel_size - 1
+        x_pool_pad = jnp.pad(x_pool, ((0, 0), (pad_t, 0), (0, 0), (0, 0)))
+        
+        score = nn.Conv(1, kernel_size=(kernel_size, 1), padding='VALID', name='temp_attn_conv')(x_pool_pad)
+        
+        attn_weights = jax.nn.softmax(score, axis=1) 
+        readout = jnp.sum(x_g * attn_weights, axis=1) 
+        return readout, attn_weights
 
-        # Layer 2: RSNN 피드백 적용
-        x2 = nn.Conv(256, kernel_size=(32, 1), kernel_dilation=(4, 1), padding='SAME', use_bias=False)(spk1)
-        x2 = SEBlock1D(reduction=16)(x2) 
-        x2 = nn.BatchNorm(use_running_average=not train_bn)(x2)
-        if train_drop: 
-            drop_mask2 = jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop2'], shape=(x2.shape[0], 1, 1, x2.shape[3]))
-            x2 = x2 * drop_mask2 * (1.0 / (1.0 - hp['drop2'] + 1e-8))
-        spk2 = Recurrent_HR_HLIFLayer2D()(x2, hp['v2_m'], hp['v2_s'], hp['d2_m'], hp['d2_s'], hp['a2'])
+class CausalMultiEdgeFunctionalGraph(nn.Module):
+    out_features: int
+    decay: float = 0.99 
 
-        # Layer 3: RSNN + 적응형 임계값
-        x3 = nn.Conv(256, kernel_size=(32, 1), kernel_dilation=(12, 1), padding='SAME', use_bias=False)(spk2)
-        x3 = SEBlock1D(reduction=16)(x3) 
-        x3 = nn.BatchNorm(use_running_average=not train_bn)(x3)
-        if train_drop: 
-            drop_mask3 = jrandom.bernoulli(self.make_rng('dropout'), p=1.0 - hp['drop3'], shape=(x3.shape[0], 1, 1, x3.shape[3]))
-            x3 = x3 * drop_mask3 * (1.0 / (1.0 - hp['drop3'] + 1e-8))
-        spk3 = Recurrent_ALIFLayer2D()(x3, hp['alif_d'], hp['alif_adp'], hp['alif_beta'], hp['a3'])
-        
-        x_pool = jnp.mean(spk3, axis=2) 
-        dense_out = nn.Dense(4, name='class_dense')(x_pool) 
-        
-        def li_scan(v, x_t):
-            decay = hp['decay_out']
-            v = v * decay + x_t * (1.0 - decay)
-            return v, v
+    @nn.compact
+    def __call__(self, x_sources):
+        B, T, S, F = x_sources.shape
+        x_seq = jnp.moveaxis(x_sources, 1, 0) 
+
+        init_mu = jnp.zeros((B, S, F))
+        init_cov = jnp.zeros((B, F, S, S)) 
+        init_t_step = jnp.array(0.0)
+
+        W_graph = self.param('graph_weight', nn.initializers.normal(stddev=0.05), (F, S, S))
+        W_sym = 0.5 * (W_graph + jnp.transpose(W_graph, (0, 2, 1)))
+
+        def scan_fn(state, x_t):
+            t_step, mu, cov = state
             
-        _, v_seq = jax.lax.scan(li_scan, jnp.zeros_like(dense_out[:, 0, :]), jnp.moveaxis(dense_out, 1, 0))
-        v_seq = jnp.moveaxis(v_seq, 0, 1) 
-        
-        v_reshaped = jnp.reshape(v_seq, (v_seq.shape[0], 20, 24, 4))
-        dp_features = jnp.mean(v_reshaped[:, :, -12:, :], axis=2) - jnp.mean(v_reshaped[:, :, :12, :], axis=2) 
-        
-        attn_w = nn.Dense(1, name='attn_dense2')(jax.nn.relu(nn.Dense(8, name='attn_dense1')(dp_features)))
-        attn_w = jax.nn.softmax(attn_w, axis=1)
-        out_logits = jnp.sum(dp_features * attn_w, axis=1)
-        
-        return out_logits, (spk1, spk2, spk3)
+            t_step = t_step + 1.0
+            bias_correction = 1.0 - jnp.power(self.decay, t_step)
+            
+            mu_next = self.decay * mu + (1.0 - self.decay) * x_t
+            mu_corrected = mu_next / bias_correction
+            
+            x_centered = x_t - mu_corrected
+            x_c_f = jnp.transpose(x_centered, (0, 2, 1)) 
+            
+            # 🔥 [OOM FIX] 브로드캐스팅(expand_dims) 대신 행렬 곱셈(matmul)으로 메모리 10배 다이어트
+            outer_prod = jnp.matmul(jnp.expand_dims(x_c_f, -1), jnp.expand_dims(x_c_f, -2))
+            
+            cov_next = self.decay * cov + (1.0 - self.decay) * outer_prod
+            cov_corrected = cov_next / bias_correction
 
+            std = jnp.sqrt(jnp.diagonal(cov_corrected, axis1=2, axis2=3) + 1e-8) 
+            std_matrix = jnp.expand_dims(std, 3) * jnp.expand_dims(std, 2) 
+            
+            corr = cov_corrected / (std_matrix + 1e-8)
+
+            A_eff = jax.nn.relu(corr * jnp.expand_dims(W_sym, 0))
+            D_hat = jnp.sum(A_eff, axis=3) + 1e-8
+            norm_matrix = jnp.sqrt(jnp.expand_dims(D_hat, 2) * jnp.expand_dims(D_hat, 3))
+            A_norm = A_eff / norm_matrix 
+
+            x_g_t = jnp.einsum('bfvw, bfw -> bfv', A_norm, x_c_f)
+            x_g_t = jnp.transpose(x_g_t, (0, 2, 1)) 
+
+            return (t_step, mu_next, cov_next), x_g_t
+
+        # 🔥 [OOM FIX] jax.checkpoint 로 역전파 영수증 메모리 폭발 완벽 방어
+        _, x_g_seq = jax.lax.scan(jax.checkpoint(scan_fn), (init_t_step, init_mu, init_cov), x_seq)
+        x_g = jnp.moveaxis(x_g_seq, 0, 1) 
+
+        x_out = nn.Dense(self.out_features, use_bias=False)(x_g)
+        return x_out
+
+# ==========================================
+# 3. Model Architecture
+# ==========================================
+class TrialBuffer_Hybrid_SNN_Final(nn.Module):
+    num_train_classes: int
+
+    @nn.compact
+    def __call__(self, x, hp, grl_alpha, train_bn=True, train_drop=True):
+        
+        mean = jnp.mean(x, axis=(2, 3), keepdims=True)
+        std = jnp.std(x, axis=(2, 3), keepdims=True) + 1e-8
+        x_norm = (x - mean) / std
+        
+        log_cov = log_euclidean_mapping(x_norm) 
+        log_cov = jax.lax.stop_gradient(log_cov)
+        
+        V = log_cov.shape[-1]
+        scaling_matrix = jnp.ones((V, V)) + (jnp.sqrt(2.0) - 1.0) * (jnp.ones((V, V)) - jnp.eye(V))
+        scaling_matrix_expanded = jnp.expand_dims(scaling_matrix, axis=0) 
+        scaled_log_cov = log_cov * scaling_matrix_expanded
+        
+        idx_triu = jnp.triu_indices(V)
+        tangent_feat = scaled_log_cov[:, idx_triu[0], idx_triu[1]] 
+
+        if train_drop:
+            sensor_mask = jrandom.bernoulli(self.make_rng('dropout_sensor'), p=1.0 - hp['drop_sensor'], shape=(x.shape[0], 1, x.shape[2], 1))
+            x_snn_input = x_norm * sensor_mask * (1.0 / (1.0 - hp['drop_sensor'] + 1e-8))
+        else:
+            x_snn_input = x_norm
+
+        x_mu_t = CausalConv2D(8, kernel_size=(32, 1))(x_snn_input) 
+        x_mu_t = nn.LayerNorm(reduction_axes=(-2, -1))(x_mu_t)
+        
+        x_beta_t = CausalConv2D(8, kernel_size=(16, 1))(x_snn_input) 
+        x_beta_t = nn.LayerNorm(reduction_axes=(-2, -1))(x_beta_t)
+        
+        num_sources = 24 
+        x_mu_s = SpatialUnmixing(num_sources)(x_mu_t)
+        x_mu_s = nn.LayerNorm(reduction_axes=(-2, -1))(x_mu_s)
+        
+        x_beta_s = SpatialUnmixing(num_sources)(x_beta_t)
+        x_beta_s = nn.LayerNorm(reduction_axes=(-2, -1))(x_beta_s)
+
+        x_sources = jnp.concatenate([x_mu_s, x_beta_s], axis=-1)
+
+        x2_current = CausalConv2D(128, kernel_size=(8, 1))(x_sources)
+        x2_current = nn.LayerNorm(reduction_axes=(-2, -1))(x2_current)
+        spk2, _ = Causal_ALIFLayer2D()(x2_current, hp['a2'], hp['step_th'], hp['decay_th'])
+
+        shared_class_mask = None
+
+        spk2_trace = get_synaptic_trace(spk2, decay=0.9)
+        x_g_spk2 = CausalMultiEdgeFunctionalGraph(128)(nn.Dense(16, use_bias=False)(spk2_trace))
+        
+        readout_spk2, attn_weights_spk2 = TemporalAttentionReadout()(x_g_spk2)
+        
+        if train_drop: 
+            drop_rng = self.make_rng('dropout')
+            shared_class_mask = jrandom.bernoulli(drop_rng, p=1.0 - hp['drop_class'], shape=(readout_spk2.shape[0], readout_spk2.shape[1], 1))
+            readout_spk2 = readout_spk2 * shared_class_mask * (1.0 / (1.0 - hp['drop_class'] + 1e-8))
+            
+        x_features_spk2_flat = readout_spk2.reshape((readout_spk2.shape[0], -1))
+        x_features_spk2_proj = nn.LayerNorm(name='spk2_norm')(nn.Dense(128)(x_features_spk2_flat))
+        aux_logits = nn.Dense(4, name='aux_class_dense')(x_features_spk2_proj)
+
+        x3_main_current = CausalConv2D(128, kernel_size=(4, 1), dilation=(2, 1))(spk2)
+        x3_current = nn.LayerNorm(reduction_axes=(-2, -1))(x3_main_current)
+        spk3, _ = Causal_ALIFLayer2D()(x3_current, hp['a2'], hp['step_th'], hp['decay_th'])
+
+        spk3_trace = get_synaptic_trace(spk3, decay=0.9)
+        spk3_reduced = nn.Dense(16, use_bias=False)(spk3_trace)
+
+        x_g_spk = CausalMultiEdgeFunctionalGraph(128)(spk3_reduced)
+
+        readout_spk, attn_weights_spk3 = TemporalAttentionReadout()(x_g_spk) 
+        
+        if train_drop and shared_class_mask is not None: 
+            readout_spk = readout_spk * shared_class_mask * (1.0 / (1.0 - hp['drop_class'] + 1e-8))
+
+        x_features_spk_flat = readout_spk.reshape((readout_spk.shape[0], -1)) 
+        x_features_spk_proj = nn.Dense(128, name='spk_proj')(x_features_spk_flat)
+        x_features_spk_proj = nn.LayerNorm(name='spk_norm')(x_features_spk_proj) 
+        
+        tangent_bias = nn.Dense(128, name='tangent_bias')(tangent_feat)
+        tangent_bias = nn.relu(tangent_bias)
+        tangent_bias = nn.LayerNorm(name='tangent_norm')(tangent_bias) 
+        
+        combined_feat = jnp.concatenate([x_features_spk_proj, tangent_bias], axis=-1) 
+        
+        out_logits = nn.Dense(4, name='class_dense')(combined_feat)
+        
+        domain_feats = grl(combined_feat, grl_alpha)
+        domain_hidden = nn.Dense(128, name='domain_hidden')(domain_feats)
+        domain_hidden = nn.relu(domain_hidden)
+        domain_logits = nn.Dense(self.num_train_classes, name='domain_out')(domain_hidden)
+        
+        xai_dict = {
+            'attn_weights_aux': attn_weights_spk2,
+            'attn_weights_main': attn_weights_spk3
+        }
+        
+        return out_logits, domain_logits, (spk2, spk3), aux_logits, xai_dict
+
+# ==========================================
+# 4. PBT Manager
+# ==========================================
 class PBTManager:
-    def __init__(self, num_workers=8, alpha=1.0):
+    def __init__(self, num_workers=20, alpha=1.0):
         self.num_workers = num_workers
         self.alpha = alpha
         self.worker_hps = []
-        for _ in range(num_workers):
-            self.worker_hps.append({
-                'lr': 10**np.random.uniform(-4.0, -2.5),
-                'drop1': np.random.uniform(0.2, 0.45),      
-                'drop2': np.random.uniform(0.2, 0.45),
-                'drop3': np.random.uniform(0.2, 0.45),
-                'v1_m': np.random.uniform(0.5, 1.5), 'v1_s': np.random.uniform(0.1, 0.5),
-                'd1_m': np.random.uniform(1.0, 3.0), 'd1_s': np.random.uniform(0.1, 0.5),
-                'a1': np.random.uniform(2.0, 5.0),
-                'v2_m': np.random.uniform(0.5, 1.5), 'v2_s': np.random.uniform(0.1, 0.5),
-                'd2_m': np.random.uniform(1.0, 3.0), 'd2_s': np.random.uniform(0.1, 0.5),
-                'a2': np.random.uniform(2.0, 5.0),
-                'alif_d': np.random.uniform(0.7, 0.95),      
-                'alif_adp': np.random.uniform(0.9, 0.99),   
-                'alif_beta': np.random.uniform(0.01, 0.5),   
-                'a3': np.random.uniform(2.0, 5.0),           
-                'decay_out': np.random.uniform(0.5, 0.99),
-                'reg_spike': 10**np.random.uniform(-5, -4) 
-            })
+        
+        golden_hp = {
+            'lr': 1.0e-3,
+            'drop_sensor': 0.1,   
+            'drop_class': 0.2, 
+            'noise_scale': 0.05,  
+            'a1': 3.0, 'a2': 3.0,
+            'step_th': 0.1, 'decay_th': 0.95 
+        } 
+        
+        for i in range(num_workers):
+            if i == 0:
+                self.worker_hps.append(golden_hp)
+            else:
+                self.worker_hps.append({
+                    'lr': 10**np.random.uniform(-4.0, -2.5),
+                    'drop_sensor': np.random.uniform(0.05, 0.15),
+                    'drop_class': np.random.uniform(0.1, 0.3), 
+                    'noise_scale': np.random.uniform(0.01, 0.08), 
+                    'a1': np.random.uniform(2.0, 5.0), 'a2': np.random.uniform(2.0, 5.0),
+                    'step_th': np.random.uniform(0.01, 0.3), 'decay_th': np.random.uniform(0.90, 0.99)
+                })
             
     def exploit_and_explore(self, states, fitness_scores):
         sorted_idx = np.argsort(fitness_scores)
@@ -303,32 +449,38 @@ class PBTManager:
         for b, t in zip(bottom_idx, top_idx):
             new_hp = self.worker_hps[t].copy()
             for k in new_hp:
-                mutation_factor = np.random.uniform(0.8, 1.2)
-                new_val = new_hp[k] * mutation_factor
-                
-                if 'drop' in k: new_hp[k] = jnp.clip(new_val, 0.1, 0.55) 
-                elif k in ['decay_out', 'alif_d']: new_hp[k] = jnp.clip(new_val, 0.5, 0.999)
-                elif k == 'alif_adp': new_hp[k] = jnp.clip(new_val, 0.85, 0.999) 
-                elif k == 'alif_beta': new_hp[k] = jnp.clip(new_val, 0.01, 1.5) 
-                elif 's' in k: new_hp[k] = jnp.clip(new_val, 0.01, 2.0) 
-                elif 'a' in k: new_hp[k] = jnp.clip(new_val, 1.0, 20.0) 
-                else: new_hp[k] = new_val
+                if k == 'lr':
+                    mutation_factor = np.random.choice([0.8, 1.2])
+                    new_hp[k] = jnp.clip(new_hp[k] * mutation_factor, 1e-5, 1e-2)
+                elif 'decay' in k:
+                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.99, 1.01), 0.90, 0.999)
+                elif 'step_th' in k:
+                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 0.01, 0.5)
+                elif 'drop' in k:
+                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 0.05, 0.3)
+                elif 'a' in k:
+                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 1.0, 20.0)
+                elif k == 'noise_scale':
+                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 0.0, 0.1)
+                else:
+                    new_hp[k] = new_hp[k] * np.random.uniform(0.95, 1.05)
             self.worker_hps[b] = new_hp
 
-            new_hyperparams = {'learning_rate': jnp.array(new_hp['lr'], dtype=jnp.float32)}
-            new_opt_state = states[t].opt_state._replace(hyperparams=new_hyperparams)
+            new_lr = jnp.array(new_hp['lr'], dtype=jnp.float32)
+            t_opt_state = states[t].opt_state
+            
+            new_hyperparams = {hk: (new_lr if hk == 'learning_rate' else hv) 
+                               for hk, hv in t_opt_state.hyperparams.items()}
+            
+            new_opt_state = t_opt_state.replace(hyperparams=new_hyperparams)
             states[b] = states[t].replace(opt_state=new_opt_state)
             
         return states
 
-def create_sstl_mask(params):
-    flat_params = flax.traverse_util.flatten_dict(params)
-    mask = {k: 'class_dense' in k for k, v in flat_params.items()}
-    return flax.traverse_util.unflatten_dict(mask)
-
-all_subjs = [f'S{i:03d}' for i in range(1, 110)]
-exclude = ['S088', 'S092', 'S100', 'S104'] 
-subjects = sorted([s for s in all_subjs if s not in exclude])
+# ==========================================
+# 5. Main Training Loop
+# ==========================================
+import time
 
 kf = KFold(n_splits=5, shuffle=True, random_state=42)
 splits = list(kf.split(subjects))
@@ -336,214 +488,256 @@ splits = list(kf.split(subjects))
 for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
     if FOLD_IDX != 0: continue
 
-    print(f"\n{'='*60}\n🚀 [PHASE 1] RSNN + PBT 글로벌 진화 훈련 (10 Generations)\n{'='*60}")
+    print(f"\n{'='*50}\n[PHASE 1] TrialBuffer Hybrid SNN (OOM Fixed, Final Check)\n{'='*50}")
     
     train_subjs = [subjects[i] for i in train_idx]
     test_subjs = [subjects[i] for i in test_idx]
-    train_subjs, val_subjs = train_test_split(train_subjs, test_size=0.25, random_state=42)
     
-    X_tr_list, Y_tr_list = [], []
-    for s in train_subjs:
-        X, Y = load_balanced_data([s], verbose=False)
-        if len(X) > 0:
-            X_tr_list.append(apply_ra(X))
-            Y_tr_list.extend(Y)
-    X_tr = np.concatenate(X_tr_list) if X_tr_list else np.array([])
-    Y_tr = np.array(Y_tr_list)
+    X_all, Y_all, Y_subj_all = load_balanced_data(train_subjs, verbose=False)
+    if len(X_all) > 0: X_all = np.transpose(X_all, (0, 2, 1))[:, :, :, np.newaxis]
 
-    val_subject_data = []
-    for s in val_subjs:
-        X, Y = load_balanced_data([s], verbose=False)
-        if len(X) > 0:
-            val_subject_data.append((apply_ra(X), Y))
+    unique_train_subjs = np.unique(Y_subj_all)
+    subj_map = {old: new for new, old in enumerate(unique_train_subjs)}
+    Y_subj_mapped = np.array([subj_map[s] for s in Y_subj_all])
+    num_train_classes = len(unique_train_subjs)
 
-    X_tr_gpu, Y_tr_gpu, num_train_batches = prepare_gpu_data(X_tr, Y_tr, batch_size, shuffle=True)
+    seed = int(time.time()) % 10000
+    X_tr, X_val, Y_tr, Y_val, Y_subj_tr, Y_subj_val = train_test_split(
+        X_all, Y_all, Y_subj_mapped, test_size=0.2, random_state=seed
+    )
 
-    pbt = PBTManager(num_workers=8, alpha=1.0)
-    rng = jrandom.PRNGKey(42 + FOLD_IDX)
-    global_model = SE_RG_RSNN_Final()
-    global_tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.001, weight_decay=0.001)
+    num_train_batches = int(np.ceil(len(X_tr) / batch_size))
+    target_size = num_train_batches * batch_size
+    if target_size > len(X_tr):
+        indices = np.arange(target_size) % len(X_tr)
+        X_tr, Y_tr, Y_subj_tr = X_tr[indices], Y_tr[indices], Y_subj_tr[indices]
+
+    perm = np.random.permutation(len(X_tr))
+    X_tr, Y_tr, Y_subj_tr = X_tr[perm], Y_tr[perm], Y_subj_tr[perm]
+
+    X_tr_gpu = jax.device_put(X_tr.astype(np.float32).reshape(num_train_batches, num_devices, per_device, *X_tr.shape[1:]))
+    Y_tr_gpu = jax.device_put(Y_tr.astype(np.int32).reshape(num_train_batches, num_devices, per_device))
+    Y_subj_tr_gpu = jax.device_put(Y_subj_tr.astype(np.int32).reshape(num_train_batches, num_devices, per_device))
+
+    X_val_gpu, Y_val_gpu, _, num_val_batches, _ = prepare_gpu_data(X_val, Y_val, np.zeros_like(Y_val), batch_size, shuffle=False)
+
+    pbt = PBTManager(num_workers=20, alpha=1.0)
+    rng = jrandom.PRNGKey(seed + FOLD_IDX)
+    
+    global_model = TrialBuffer_Hybrid_SNN_Final(num_train_classes=num_train_classes)
+    global_tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.001, weight_decay=0.001) 
 
     population_states = []
-    init_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in pbt.worker_hps[0].items()}
-    var = global_model.init(rng, jnp.ones((1, 480, 64, 1)), init_hp, train_bn=False, train_drop=False)
+    var = global_model.init(rng, jnp.ones((1, 480, 64, 1)), hp={k: jnp.array(v, dtype=jnp.float32) for k, v in pbt.worker_hps[0].items()}, grl_alpha=0.0, train_bn=False, train_drop=False)
+    params = var['params']
 
-    for i in range(8):
+    for i in range(20):
         hp = pbt.worker_hps[i]
         state = TrainState.create(
-            apply_fn=global_model.apply, params=var['params'], tx=global_tx, batch_stats=var['batch_stats']
+            apply_fn=global_model.apply, params=params, tx=global_tx
         )
         new_hyperparams = {'learning_rate': jnp.array(hp['lr'], dtype=jnp.float32)}
         state = state.replace(opt_state=state.opt_state._replace(hyperparams=new_hyperparams))
         population_states.append(state)
 
-    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, 0, None))
-    def train_step(state, x, y, drop_rng, hp):
+    # 🔥 [오타 수정] 0이 7개! pmap 인자 개수 완벽하게 맞춤
+    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, 0, 0, 0, 0, None, None))
+    def train_step(state, x, y, y_subj, drop_sensor_rng, drop_rng, noise_rng, hp, grl_alpha):
+        noise = jrandom.normal(noise_rng, x.shape) * hp['noise_scale']
+        x_aug = x + noise
+        
         def loss_fn(params):
-            (logits, (spk1, spk2, spk3)), new_vars = state.apply_fn(
-                {'params': params, 'batch_stats': state.batch_stats}, 
-                x, hp, train_bn=True, train_drop=True, rngs={'dropout': drop_rng}, mutable=['batch_stats']
+            (logits, domain_logits, (spk2, spk3), aux_logits, _) = state.apply_fn(
+                {'params': params}, 
+                x_aug, hp, grl_alpha, train_bn=True, train_drop=True, 
+                rngs={'dropout_sensor': drop_sensor_rng, 'dropout': drop_rng}
             )
             smooth_y = optax.smooth_labels(jax.nn.one_hot(y, 4), 0.1)
-            ce_loss = jnp.mean(optax.softmax_cross_entropy(logits, smooth_y))
-            spike_loss = hp['reg_spike'] * (jnp.mean(spk1) + jnp.mean(spk2) + jnp.mean(spk3))
-            total_loss = ce_loss + spike_loss
-            return total_loss, new_vars['batch_stats']
+            mi_loss = jnp.mean(optax.softmax_cross_entropy(logits, smooth_y))
             
-        grads, new_bs = jax.grad(loss_fn, has_aux=True)(state.params)
-        state = state.apply_gradients(grads=jax.lax.pmean(grads, 'batch'), batch_stats=jax.lax.pmean(new_bs, 'batch'))
-        return state
+            aux_loss = jnp.mean(optax.softmax_cross_entropy(aux_logits, smooth_y))
+            
+            domain_loss = jnp.mean(optax.softmax_cross_entropy(domain_logits, jax.nn.one_hot(y_subj, num_train_classes)))
+            
+            neuron_rates2_batch = jnp.mean(spk2, axis=(0, 1))
+            neuron_rates3_batch = jnp.mean(spk3, axis=(0, 1))
+            target_rate = 0.05
+            
+            rate_loss2 = jnp.mean(jnp.abs(neuron_rates2_batch - target_rate))
+            rate_loss3 = jnp.mean(jnp.abs(neuron_rates3_batch - target_rate))
+            
+            total_loss = mi_loss + (0.3 * aux_loss) + domain_loss + (10.0 * rate_loss2) + (20.0 * rate_loss3)
+            return total_loss, (total_loss, mi_loss, domain_loss, jnp.mean(spk2), jnp.mean(spk3))
+            
+        grads, (tr_loss, m_loss, d_loss, r2, r3) = jax.grad(loss_fn, has_aux=True)(state.params)
+        state = state.apply_gradients(grads=jax.lax.pmean(grads, 'batch'))
+        return state, jax.lax.pmean(tr_loss, 'batch'), jax.lax.pmean(d_loss, 'batch'), jax.lax.pmean(r2, 'batch'), jax.lax.pmean(r3, 'batch')
 
-    @jax.jit
-    def eval_step_single(state, x, y, hp):
-        logits, _ = state.apply_fn(
-            {'params': state.params, 'batch_stats': state.batch_stats}, 
-            x, hp, train_bn=False, train_drop=False
+    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, None, 0, 0))
+    def get_eval_data_pmap(state, x, hp, drop_sensor_rng, drop_rng):
+        logits, _, _, _, xai_dict = state.apply_fn(
+            {'params': state.params}, 
+            x, hp, 0.0, train_bn=False, train_drop=True, 
+            rngs={'dropout_sensor': drop_sensor_rng, 'dropout': drop_rng}
         )
-        return jnp.mean(jnp.argmax(logits, -1) == y)
+        return logits, xai_dict
 
-    # 딱 10세대만 돌림
-    for gen in range(1, 11): 
-        print(f"Gen {gen:02d} | Fold {FOLD_IDX} Train 데이터 학습 중...")
+    for gen in range(1, 31): 
+        p_gen = gen / 30.0
+        current_alpha = jnp.array((2.0 / (1.0 + jnp.exp(-10.0 * p_gen))) - 1.0, dtype=jnp.float32) 
+        
+        print(f"Gen {gen:02d} | Fold {FOLD_IDX} Training... (GRL Alpha: {current_alpha:.2f})")
         worker_fitnesses, worker_val_means = [], []
         
-        for w_idx in range(8):
+        for w_idx in range(20):
             hp = pbt.worker_hps[w_idx]
             p_state = replicate(population_states[w_idx]) 
             dynamic_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in hp.items()}
             
+            gen_losses, gen_d_losses, gen_r2, gen_r3 = [], [], [], []
             for _ in range(5): 
                 for b in range(num_train_batches):
-                    rng, drop_rng = jrandom.split(rng)
+                    rng, drop_sensor_rng, drop_rng, noise_rng = jrandom.split(rng, 4)
+                    drop_sensor_rngs = jrandom.split(drop_sensor_rng, num_devices)
                     drop_rngs = jrandom.split(drop_rng, num_devices)
-                    p_state = train_step(p_state, X_tr_gpu[b], Y_tr_gpu[b], drop_rngs, dynamic_hp)
+                    noise_rngs = jrandom.split(noise_rng, num_devices)
+                    
+                    p_state, p_loss, d_loss, p_r2, p_r3 = train_step(
+                        p_state, X_tr_gpu[b], Y_tr_gpu[b], Y_subj_tr_gpu[b], 
+                        drop_sensor_rngs, drop_rngs, noise_rngs, dynamic_hp, current_alpha
+                    )
+                    gen_losses.append(np.mean(p_loss))
+                    gen_d_losses.append(np.mean(d_loss))
+                    gen_r2.append(np.mean(p_r2))
+                    gen_r3.append(np.mean(p_r3))
                     
             unrep_state = unreplicate(p_state)
-            subj_accs = []
             
-            for vx, vy in val_subject_data:
-                chunk_accs = []
-                for i in range(0, len(vx), 32):
-                    bx = jnp.array(vx[i:i+32])
-                    by = jnp.array(vy[i:i+32])
-                    if len(bx) == 0: continue
-                    acc = eval_step_single(unrep_state, bx, by, dynamic_hp)
-                    chunk_accs.append(acc)
-                if chunk_accs:
-                    subj_accs.append(np.mean(chunk_accs))
+            ensemble_correct = 0
+            total_val_samples = len(Y_val)
+            batch_accs = []
+            
+            MC_PASSES_VAL = 3 
+            
+            for b in range(num_val_batches):
+                mc_val_probs = 0
+                for _ in range(MC_PASSES_VAL):
+                    rng, val_drop_sensor_rng, val_drop_rng = jrandom.split(rng, 3)
+                    val_drop_sensor_rngs = jrandom.split(val_drop_sensor_rng, num_devices)
+                    val_drop_rngs = jrandom.split(val_drop_rng, num_devices)
                     
-            val_acc_mean = np.mean(subj_accs)
-            val_acc_std = np.std(subj_accs)
+                    logits, _ = get_eval_data_pmap(p_state, X_val_gpu[b], dynamic_hp, val_drop_sensor_rngs, val_drop_rngs)
+                    mc_val_probs += jax.nn.softmax(logits, axis=-1)
+                
+                probs = mc_val_probs / MC_PASSES_VAL
+                preds = jnp.argmax(probs, axis=-1)
+                
+                actual_batch_size = total_val_samples - (b * batch_size) if b == num_val_batches - 1 else batch_size
+                if actual_batch_size <= 0: break
+                
+                preds = preds.flatten()[:actual_batch_size]
+                batch_y_flat = Y_val_gpu[b].flatten()[:actual_batch_size]
+                
+                correct_cnt = jnp.sum(preds == batch_y_flat)
+                ensemble_correct += correct_cnt
+                batch_accs.append(correct_cnt / actual_batch_size)
+                
+            val_acc_mean = ensemble_correct / total_val_samples
+            val_acc_std = np.std(batch_accs) if len(batch_accs) > 0 else 0.0
             fitness = val_acc_mean - (pbt.alpha * val_acc_std)
             
-            population_states[w_idx] = unrep_state
+            population_states[w_idx] = unrep_state 
             worker_fitnesses.append(fitness)
             worker_val_means.append(val_acc_mean)
             
+            if w_idx == 0:
+                print(f"  Worker 00 (Seed) -> Loss: {np.mean(gen_losses):.4f} | D_Loss: {np.mean(gen_d_losses):.4f} | Val Acc: {val_acc_mean*100:.1f}% | FR2: {np.mean(gen_r2):.3f} | FR3: {np.mean(gen_r3):.3f}")
+            
         population_fitnesses = np.array(worker_fitnesses)
         best_w_idx_gen = int(np.argmax(population_fitnesses))
-        print(f"Gen {gen:02d} 완료 | 1st worker 성능 (Val): [Mean: {worker_val_means[best_w_idx_gen]*100:.1f}%]")
+        print(f"Gen {gen:02d} Done | Best Val Acc: {worker_val_means[best_w_idx_gen]*100:.1f}%")
         population_states = pbt.exploit_and_explore(population_states, population_fitnesses)
 
-    top_k = 3 
+    top_k = 5 
     top_indices = np.argsort(population_fitnesses)[-top_k:]
     top_states = [population_states[idx] for idx in top_indices]
     top_hps = [pbt.worker_hps[idx] for idx in top_indices]
 
-    print(f"\n{'='*60}\n🔥 [PHASE 2] 논문 룰 기반 4-FOLD SSTL 평가\n{'='*60}")
+    print(f"\n{'='*50}\n[PHASE 2] Zero-Shot Evaluation (MC Dropout Ensemble & XAI Extract)\n{'='*50}")
     
-    mask_tree = create_sstl_mask(top_states[0].params)
-    sstl_tx = optax.masked(optax.adamw(learning_rate=5e-4, weight_decay=0.001), mask_tree)
+    zeroshot_accuracies = []
+    MC_PASSES = 10 
     
-    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, 0, None))
-    def sstl_train_step(state, x, y, drop_rng, hp):
-        def loss_fn(params):
-            (logits, _ ) = state.apply_fn(
-                {'params': params, 'batch_stats': state.batch_stats}, 
-                x, hp, train_bn=False, train_drop=True, rngs={'dropout': drop_rng}
-            )
-            smooth_y = optax.smooth_labels(jax.nn.one_hot(y, 4), 0.1)
-            ce_loss = jnp.mean(optax.softmax_cross_entropy(logits, smooth_y))
-            return ce_loss
-            
-        grads = jax.grad(loss_fn)(state.params)
-        state = state.apply_gradients(grads=jax.lax.pmean(grads, 'batch'))
-        return state
-
-    @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, None))
-    def get_logits_pmap(state, x, hp):
-        logits, _ = state.apply_fn(
-            {'params': state.params, 'batch_stats': state.batch_stats}, 
-            x, hp, train_bn=False, train_drop=False
-        )
-        return logits
-
-    sstl_accuracies = []
+    subject_xai_main = []
+    subject_xai_aux = []
     
     for subj in test_subjs:
-        X_subj, Y_subj = load_balanced_data([subj], desc=f"SSTL Subj {subj}", verbose=False)
-        if len(X_subj) < 20: continue
+        X_subj, Y_subj, _ = load_balanced_data([subj], verbose=False)
+        if len(X_subj) == 0: continue
         
-        kf_sstl = KFold(n_splits=4, shuffle=True, random_state=42)
-        fold_accs = []
+        X_subj = np.transpose(X_subj, (0, 2, 1))[:, :, :, np.newaxis] 
         
-        for adapt_idx, eval_idx in kf_sstl.split(X_subj):
-            X_adapt_raw, X_eval_raw = X_subj[adapt_idx], X_subj[eval_idx]
-            Y_adapt, Y_eval = Y_subj[adapt_idx], Y_subj[eval_idx]
+        num_test_batches = int(np.ceil(len(X_subj) / batch_size))
+        target_size = num_test_batches * batch_size
+        if target_size > len(X_subj):
+            indices = np.arange(target_size) % len(X_subj)
+            X_subj, Y_subj = X_subj[indices], Y_subj[indices]
+
+        X_test_gpu = jax.device_put(X_subj.astype(np.float32).reshape(num_test_batches, num_devices, per_device, *X_subj.shape[1:]))
+        Y_test_gpu = jax.device_put(Y_subj.astype(np.int32).reshape(num_test_batches, num_devices, per_device))
+        
+        ensemble_correct = 0
+        replicated_top_states = [replicate(w) for w in top_states]
+        
+        for b in range(num_test_batches):
+            batch_x = X_test_gpu[b]
+            batch_y = Y_test_gpu[b]
             
-            X_adapt, X_eval = apply_ra(X_adapt_raw, X_eval_raw)
+            summed_probs = 0
+            summed_xai_main = 0
+            summed_xai_aux = 0
             
-            X_adapt_gpu, Y_adapt_gpu, num_adapt_batches = prepare_gpu_data(X_adapt, Y_adapt, batch_size, shuffle=True)
-            X_test_gpu, Y_test_gpu, num_test_batches = prepare_gpu_data(X_eval, Y_eval, batch_size, shuffle=False)
-            
-            adapted_states = []
-            
-            for w_state, w_hp in zip(top_states, top_hps):
-                sstl_state = TrainState.create(
-                    apply_fn=global_model.apply, params=w_state.params, tx=sstl_tx, batch_stats=w_state.batch_stats
-                )
-                p_sstl_state = replicate(sstl_state)
+            for rep_a_state, w_hp in zip(replicated_top_states, top_hps):
                 dynamic_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in w_hp.items()}
                 
-                for _ in range(5):
-                    for b in range(num_adapt_batches):
-                        rng, drop_rng = jrandom.split(rng)
-                        drop_rngs = jrandom.split(drop_rng, num_devices)
-                        p_sstl_state = sstl_train_step(p_sstl_state, X_adapt_gpu[b], Y_adapt_gpu[b], drop_rngs, dynamic_hp)
+                mc_probs = 0
+                mc_xai_main = 0
+                mc_xai_aux = 0
                 
-                adapted_states.append(unreplicate(p_sstl_state))
-                
-            ensemble_correct = 0
-            
-            for b in range(num_test_batches):
-                batch_x = X_test_gpu[b]
-                batch_y = Y_test_gpu[b]
-                
-                summed_probs = 0
-                for a_state, w_hp in zip(adapted_states, top_hps):
-                    rep_a_state = replicate(a_state)
-                    dynamic_hp = {k: jnp.array(v, dtype=jnp.float32) for k, v in w_hp.items()}
+                for mc in range(MC_PASSES):
+                    rng, drop_sensor_rng, drop_rng = jrandom.split(rng, 3)
+                    drop_sensor_rngs = jrandom.split(drop_sensor_rng, num_devices)
+                    drop_rngs = jrandom.split(drop_rng, num_devices)
                     
-                    logits = get_logits_pmap(rep_a_state, batch_x, dynamic_hp) 
-                    probs = jax.nn.softmax(logits, axis=-1)
-                    summed_probs += probs
+                    logits, xai_dict = get_eval_data_pmap(rep_a_state, batch_x, dynamic_hp, drop_sensor_rngs, drop_rngs) 
+                    mc_probs += jax.nn.softmax(logits, axis=-1)
                     
-                avg_probs = summed_probs / top_k
-                preds = jnp.argmax(avg_probs, axis=-1)
+                    mc_xai_main += np.array(xai_dict['attn_weights_main'])
+                    mc_xai_aux += np.array(xai_dict['attn_weights_aux'])
                 
-                actual_batch_size = len(Y_eval) - (b * batch_size) if b == num_test_batches - 1 else batch_size
-                if actual_batch_size <= 0: break
+                probs = mc_probs / MC_PASSES
+                summed_probs += probs
                 
-                preds = preds.flatten()[:actual_batch_size]
-                batch_y_flat = batch_y.flatten()[:actual_batch_size]
+                summed_xai_main += (mc_xai_main / MC_PASSES)
+                summed_xai_aux += (mc_xai_aux / MC_PASSES)
                 
-                ensemble_correct += jnp.sum(preds == batch_y_flat)
-                
-            fold_accs.append((ensemble_correct / len(Y_eval)) * 100)
+            avg_probs = summed_probs / top_k
+            preds = jnp.argmax(avg_probs, axis=-1)
             
-        subj_mean_acc = np.mean(fold_accs)
-        sstl_accuracies.append(subj_mean_acc)
-        print(f"Subject {subj} | 4-Fold SSTL Test Acc: {subj_mean_acc:.2f}%")
+            actual_batch_size = len(Y_subj) - (b * batch_size) if b == num_test_batches - 1 else batch_size
+            if actual_batch_size <= 0: break
+            
+            preds = preds.flatten()[:actual_batch_size]
+            batch_y_flat = batch_y.flatten()[:actual_batch_size]
+            
+            ensemble_correct += jnp.sum(preds == batch_y_flat)
+            
+            subject_xai_main.append(summed_xai_main / top_k)
+            subject_xai_aux.append(summed_xai_aux / top_k)
+            
+        subj_acc = (ensemble_correct / len(Y_subj)) * 100
+        zeroshot_accuracies.append(subj_acc)
+        print(f"Subject {subj} | Zero-shot Test Acc: {subj_acc:.2f}%")
         
-    final_sstl_acc = np.mean(sstl_accuracies)
-    print(f"\n🏆 [최종 결과] 완전체 RSNN (PBT 10 Gen + 4-Fold SSTL) 평균 정확도: {final_sstl_acc:.2f}% 🚀\n")
+    final_zeroshot_acc = np.mean(zeroshot_accuracies)
+    print(f"\n[FINAL RESULT] Mean Zero-shot Accuracy: {final_zeroshot_acc:.2f}%\n")

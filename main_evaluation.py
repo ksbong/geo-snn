@@ -473,7 +473,7 @@ class PBTManager:
             new_hyperparams = {hk: (new_lr if hk == 'learning_rate' else hv) 
                                for hk, hv in t_opt_state.hyperparams.items()}
             
-            new_opt_state = t_opt_state.replace(hyperparams=new_hyperparams)
+            new_opt_state = t_opt_state._replace(hyperparams=new_hyperparams)
             states[b] = states[t].replace(opt_state=new_opt_state)
             
         return states

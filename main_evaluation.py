@@ -25,6 +25,7 @@ from flax.jax_utils import replicate, unreplicate
 
 mne.set_log_level('ERROR')
 DATA_DIR = './07_Data'
+
 all_subjs = [f'S{i:03d}' for i in range(1, 110)]
 exclude = ['S088', 'S092', 'S100', 'S104'] 
 subjects = sorted([s for s in all_subjs if s not in exclude])
@@ -606,10 +607,10 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
                         p_state, X_tr_gpu[b], Y_tr_gpu[b], Y_subj_tr_gpu[b], 
                         drop_sensor_rngs, drop_rngs, noise_rngs, dynamic_hp, current_alpha
                     )
-                    gen_losses.append(np.mean(p_loss))
-                    gen_d_losses.append(np.mean(d_loss))
-                    gen_r2.append(np.mean(p_r2))
-                    gen_r3.append(np.mean(p_r3))
+                    gen_losses.append(jnp.mean(p_loss))
+                    gen_d_losses.append(jnp.mean(d_loss))
+                    gen_r2.append(jnp.mean(p_r2))
+                    gen_r3.append(jnp.mean(p_r3))
                     
             unrep_state = unreplicate(p_state)
             
@@ -649,9 +650,10 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
             population_states[w_idx] = unrep_state 
             worker_fitnesses.append(fitness)
             worker_val_means.append(val_acc_mean)
-            
+
             if w_idx == 0:
-                print(f"  Worker 00 (Seed) -> Loss: {np.mean(gen_losses):.4f} | D_Loss: {np.mean(gen_d_losses):.4f} | Val Acc: {val_acc_mean*100:.1f}% | FR2: {np.mean(gen_r2):.3f} | FR3: {np.mean(gen_r3):.3f}")
+                print(f"  Worker 00 (Seed) -> Loss: {float(np.mean(gen_losses)):.4f} | D_Loss: {float(np.mean(gen_d_losses)):.4f} | Val Acc: {val_acc_mean*100:.1f}% | FR2: {float(np.mean(gen_r2)):.3f} | FR3: {float(np.mean(gen_r3)):.3f}")
+    
             
         population_fitnesses = np.array(worker_fitnesses)
         best_w_idx_gen = int(np.argmax(population_fitnesses))

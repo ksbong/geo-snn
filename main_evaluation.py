@@ -651,8 +651,7 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
             worker_fitnesses.append(fitness)
             worker_val_means.append(val_acc_mean)
 
-            if w_idx == 0:
-                print(f"  Worker 00 (Seed) -> Loss: {float(np.mean(gen_losses)):.4f} | D_Loss: {float(np.mean(gen_d_losses)):.4f} | Val Acc: {val_acc_mean*100:.1f}% | FR2: {float(np.mean(gen_r2)):.3f} | FR3: {float(np.mean(gen_r3)):.3f}")
+            print(f"  [Worker {w_idx:02d}] -> Loss: {float(np.mean(gen_losses)):.4f} | D_Loss: {float(np.mean(gen_d_losses)):.4f} | Val Acc: {val_acc_mean*100:.1f}% | FR2: {float(np.mean(gen_r2)):.3f} | FR3: {float(np.mean(gen_r3)):.3f}")
     
             
         population_fitnesses = np.array(worker_fitnesses)

@@ -155,7 +155,6 @@ def get_synaptic_trace(spikes, decay=0.9):
     def scan_fn(tr, s_t):
         tr_next = tr * decay + s_t
         return tr_next, tr_next
-    # 🔥 [OOM FIX] jax.checkpoint 로 역전파 메모리 세이브
     _, trace_seq = jax.lax.scan(jax.checkpoint(scan_fn), jnp.zeros_like(spikes_seq[0]), spikes_seq)
     return jnp.moveaxis(trace_seq, 0, 1) 
 
@@ -233,7 +232,6 @@ class Causal_ALIFLayer2D(nn.Module):
             return (v_next, vth_dyn_next), (s, v)
             
         init_state = (jnp.zeros_like(x_seq[0]), jnp.zeros_like(x_seq[0]))
-        # 🔥 [OOM FIX] jax.checkpoint 로 역전파 메모리 세이브
         _, (spikes, voltages) = jax.lax.scan(jax.checkpoint(scan_fn), init_state, x_seq)
         return jnp.moveaxis(spikes, 0, 1), jnp.moveaxis(voltages, 0, 1)
 
@@ -280,7 +278,6 @@ class CausalMultiEdgeFunctionalGraph(nn.Module):
             x_centered = x_t - mu_corrected
             x_c_f = jnp.transpose(x_centered, (0, 2, 1)) 
             
-            # 🔥 [OOM FIX] 브로드캐스팅(expand_dims) 대신 행렬 곱셈(matmul)으로 메모리 10배 다이어트
             outer_prod = jnp.matmul(jnp.expand_dims(x_c_f, -1), jnp.expand_dims(x_c_f, -2))
             
             cov_next = self.decay * cov + (1.0 - self.decay) * outer_prod
@@ -301,7 +298,6 @@ class CausalMultiEdgeFunctionalGraph(nn.Module):
 
             return (t_step, mu_next, cov_next), x_g_t
 
-        # 🔥 [OOM FIX] jax.checkpoint 로 역전파 영수증 메모리 폭발 완벽 방어
         _, x_g_seq = jax.lax.scan(jax.checkpoint(scan_fn), (init_t_step, init_mu, init_cov), x_seq)
         x_g = jnp.moveaxis(x_g_seq, 0, 1) 
 
@@ -412,7 +408,7 @@ class TrialBuffer_Hybrid_SNN_Final(nn.Module):
         return out_logits, domain_logits, (spk2, spk3), aux_logits, xai_dict
 
 # ==========================================
-# 4. PBT Manager
+# 4. PBT Manager (수정 완료)
 # ==========================================
 class PBTManager:
     def __init__(self, num_workers=20, alpha=1.0):
@@ -444,27 +440,31 @@ class PBTManager:
             
     def exploit_and_explore(self, states, fitness_scores):
         sorted_idx = np.argsort(fitness_scores)
-        bottom_idx = sorted_idx[:self.num_workers//4] 
-        top_idx = sorted_idx[-self.num_workers//4:]   
+        
+        # 🔥 [수정] 25% 학살 -> 하위 10%만 교체 (팔다리 보존)
+        num_to_replace = max(1, self.num_workers // 10)
+        bottom_idx = sorted_idx[:num_to_replace] 
+        top_idx = sorted_idx[-num_to_replace:]   
         
         for b, t in zip(bottom_idx, top_idx):
             new_hp = self.worker_hps[t].copy()
             for k in new_hp:
+                # 🔥 [수정] 돌연변이 변동폭 대폭 축소 (0.95 ~ 1.05)
+                mutation_factor = np.random.uniform(0.95, 1.05)
+                
                 if k == 'lr':
-                    mutation_factor = np.random.choice([0.8, 1.2])
-                    new_hp[k] = jnp.clip(new_hp[k] * mutation_factor, 1e-5, 1e-2)
-                elif 'decay' in k:
-                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.99, 1.01), 0.90, 0.999)
-                elif 'step_th' in k:
-                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 0.01, 0.5)
-                elif 'drop' in k:
-                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 0.05, 0.3)
+                    new_hp[k] = jnp.clip(new_hp[k] * mutation_factor, 5e-5, 5e-3)
+                elif 'decay' in k or 'drop' in k:
+                    new_hp[k] = jnp.clip(new_hp[k] * mutation_factor, 0.05, 0.99)
                 elif 'a' in k:
-                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 1.0, 20.0)
+                    new_hp[k] = jnp.clip(new_hp[k] * mutation_factor, 1.0, 20.0)
+                elif 'step_th' in k:
+                    new_hp[k] = jnp.clip(new_hp[k] * mutation_factor, 0.01, 0.5)
                 elif k == 'noise_scale':
-                    new_hp[k] = jnp.clip(new_hp[k] * np.random.uniform(0.90, 1.10), 0.0, 0.1)
+                    new_hp[k] = jnp.clip(new_hp[k] * mutation_factor, 0.0, 0.1)
                 else:
-                    new_hp[k] = new_hp[k] * np.random.uniform(0.95, 1.05)
+                    new_hp[k] = new_hp[k] * mutation_factor
+                    
             self.worker_hps[b] = new_hp
 
             new_lr = jnp.array(new_hp['lr'], dtype=jnp.float32)
@@ -541,7 +541,6 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
         state = state.replace(opt_state=state.opt_state._replace(hyperparams=new_hyperparams))
         population_states.append(state)
 
-    # 🔥 [오타 수정] 0이 7개! pmap 인자 개수 완벽하게 맞춤
     @partial(jax.pmap, axis_name='batch', in_axes=(0, 0, 0, 0, 0, 0, 0, None, None))
     def train_step(state, x, y, y_subj, drop_sensor_rng, drop_rng, noise_rng, hp, grl_alpha):
         noise = jrandom.normal(noise_rng, x.shape) * hp['noise_scale']
@@ -584,8 +583,9 @@ for FOLD_IDX, (train_idx, test_idx) in enumerate(splits):
         return logits, xai_dict
 
     for gen in range(1, 31): 
+        # 🔥 [수정] GRL Alpha 속도 대폭 하향. 2차 함수로 웜업 & 최고점 0.4 제한
         p_gen = gen / 30.0
-        current_alpha = jnp.array((2.0 / (1.0 + jnp.exp(-10.0 * p_gen))) - 1.0, dtype=jnp.float32) 
+        current_alpha = jnp.array(0.4 * (p_gen ** 2), dtype=jnp.float32) 
         
         print(f"Gen {gen:02d} | Fold {FOLD_IDX} Training... (GRL Alpha: {current_alpha:.2f})")
         worker_fitnesses, worker_val_means = [], []
